@@ -46,8 +46,12 @@ services:
       - UPDATE_GITHUB_TOKEN=${UPDATE_GITHUB_TOKEN:-}
 
       # =======================================================================
-      # Database Configuration (PostgreSQL) - Required
+      # Database Configuration
+      # DATABASE_TYPE=postgres (default) or sqlite
+      # When sqlite is used, DATABASE_HOST/PORT/USER/PASSWORD/DBNAME/SSLMODE
+      # are ignored and DATABASE_PATH selects the database file.
       # =======================================================================
+      - DATABASE_TYPE=${DATABASE_TYPE:-postgres}
       - DATABASE_HOST=${DATABASE_HOST:?DATABASE_HOST is required}
       - DATABASE_PORT=${DATABASE_PORT:-5432}
       - DATABASE_USER=${DATABASE_USER:-sub2api}
@@ -58,10 +62,14 @@ services:
       - DATABASE_MAX_IDLE_CONNS=${DATABASE_MAX_IDLE_CONNS:-10}
       - DATABASE_CONN_MAX_LIFETIME_MINUTES=${DATABASE_CONN_MAX_LIFETIME_MINUTES:-30}
       - DATABASE_CONN_MAX_IDLE_TIME_MINUTES=${DATABASE_CONN_MAX_IDLE_TIME_MINUTES:-5}
+      - DATABASE_PATH=${DATABASE_PATH:-data/sub2api.db}
 
       # =======================================================================
-      # Redis Configuration - Required
+      # Cache Configuration
+      # REDIS_TYPE=redis (default) or memory
+      # When memory is used, the Redis settings below are ignored.
       # =======================================================================
+      - REDIS_TYPE=${REDIS_TYPE:-redis}
       - REDIS_HOST=${REDIS_HOST:?REDIS_HOST is required}
       - REDIS_PORT=${REDIS_PORT:-6379}
       - REDIS_USERNAME=${REDIS_USERNAME:-}
@@ -70,6 +78,8 @@ services:
       - REDIS_POOL_SIZE=${REDIS_POOL_SIZE:-1024}
       - REDIS_MIN_IDLE_CONNS=${REDIS_MIN_IDLE_CONNS:-10}
       - REDIS_ENABLE_TLS=${REDIS_ENABLE_TLS:-false}
+      - REDIS_MEMORY_MAX_CAPACITY_MB=${REDIS_MEMORY_MAX_CAPACITY_MB:-512}
+      - REDIS_MEMORY_GC_INTERVAL_SECONDS=${REDIS_MEMORY_GC_INTERVAL_SECONDS:-60}
 
       # =======================================================================
       # Admin Account (auto-created on first run)

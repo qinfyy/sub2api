@@ -72,21 +72,44 @@
 
           <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
+              <label class="input-label">{{ t('setup.database.type') }}</label>
+              <Select
+                v-model="formData.database.type"
+                :options="[
+                  { value: 'postgres', label: t('setup.database.typePostgres') },
+                  { value: 'sqlite', label: t('setup.database.typeSqlite') }
+                ]"
+              />
+            </div>
+            <div>
+              <label v-if="isSQLite" class="input-label">{{ t('setup.database.path') }}</label>
+              <label v-else class="input-label">{{ t('setup.database.port') }}</label>
+              <input
+                v-if="isSQLite"
+                v-model="formData.database.path"
+                type="text"
+                class="input"
+                placeholder="data/sub2api.db"
+              />
+              <input
+                v-else
+                v-model.number="formData.database.port"
+                type="number"
+                class="input"
+                placeholder="5432"
+              />
+            </div>
+          </div>
+
+          <template v-if="!isSQLite">
+          <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div>
               <label class="input-label">{{ t('setup.database.host') }}</label>
               <input
                 v-model="formData.database.host"
                 type="text"
                 class="input"
                 placeholder="localhost"
-              />
-            </div>
-            <div>
-              <label class="input-label">{{ t('setup.database.port') }}</label>
-              <input
-                v-model.number="formData.database.port"
-                type="number"
-                class="input"
-                placeholder="5432"
               />
             </div>
           </div>
@@ -147,6 +170,7 @@
               />
             </div>
           </div>
+          </template>
 
           <button
             @click="testDatabaseConnection"
@@ -197,21 +221,44 @@
 
           <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
-              <label class="input-label">{{ t('setup.redis.host') }}</label>
-              <input
-                v-model="formData.redis.host"
-                type="text"
-                class="input"
-                placeholder="localhost"
+              <label class="input-label">{{ t('setup.redis.type') }}</label>
+              <Select
+                v-model="formData.redis.type"
+                :options="[
+                  { value: 'redis', label: t('setup.redis.typeRedis') },
+                  { value: 'memory', label: t('setup.redis.typeMemory') }
+                ]"
               />
             </div>
-            <div>
+            <div v-if="!isMemoryCache">
               <label class="input-label">{{ t('setup.redis.port') }}</label>
               <input
                 v-model.number="formData.redis.port"
                 type="number"
                 class="input"
                 placeholder="6379"
+              />
+            </div>
+            <div v-else>
+              <label class="input-label">{{ t('setup.redis.memory.maxCapacity') }}</label>
+              <input
+                v-model.number="formData.redis.memory.max_capacity_mb"
+                type="number"
+                class="input"
+                placeholder="512"
+              />
+            </div>
+          </div>
+
+          <template v-if="!isMemoryCache">
+          <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div>
+              <label class="input-label">{{ t('setup.redis.host') }}</label>
+              <input
+                v-model="formData.redis.host"
+                type="text"
+                class="input"
+                placeholder="localhost"
               />
             </div>
           </div>
@@ -257,6 +304,7 @@
             </div>
             <Toggle v-model="formData.redis.enable_tls" />
           </div>
+          </template>
 
           <button
             @click="testRedisConnection"
@@ -365,9 +413,14 @@
                 {{ t('setup.ready.database') }}
               </h3>
               <p class="text-gray-900 dark:text-white">
-                {{ formData.database.user }}@{{ formData.database.host }}:{{
-                  formData.database.port
-                }}/{{ formData.database.dbname }}
+                <template v-if="isSQLite">
+                  {{ formData.database.path }}
+                </template>
+                <template v-else>
+                  {{ formData.database.user }}@{{ formData.database.host }}:{{
+                    formData.database.port
+                  }}/{{ formData.database.dbname }}
+                </template>
               </p>
             </div>
 
@@ -376,7 +429,12 @@
                 {{ t('setup.ready.redis') }}
               </h3>
               <p class="text-gray-900 dark:text-white">
-                {{ formData.redis.host }}:{{ formData.redis.port }}
+                <template v-if="isMemoryCache">
+                  {{ t('setup.redis.typeMemory') }}
+                </template>
+                <template v-else>
+                  {{ formData.redis.host }}:{{ formData.redis.port }}
+                </template>
               </p>
             </div>
 
@@ -499,7 +557,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed } from 'vue'
+import { ref, reactive, computed, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { testDatabase, testRedis, install, type InstallRequest } from '@/api/setup'
 import { buildGatewayUrl } from '@/api/client'
@@ -541,20 +599,27 @@ const getCurrentPort = (): number => {
 
 const formData = reactive<InstallRequest>({
   database: {
+    type: 'postgres',
     host: 'localhost',
     port: 5432,
     user: 'postgres',
     password: '',
     dbname: 'sub2api',
-    sslmode: 'disable'
+    sslmode: 'disable',
+    path: 'data/sub2api.db'
   },
   redis: {
+    type: 'redis',
     host: 'localhost',
     port: 6379,
     username: '',
     password: '',
     db: 0,
-    enable_tls: false
+    enable_tls: false,
+    memory: {
+      max_capacity_mb: 512,
+      gc_interval_seconds: 60
+    }
   },
   admin: {
     email: '',
@@ -566,6 +631,30 @@ const formData = reactive<InstallRequest>({
     mode: 'release'
   }
 })
+
+// Switching backend resets the connection state so the wizard re-validates.
+watch(
+  () => formData.database.type,
+  (next, previous) => {
+    if (next !== previous) {
+      dbConnected.value = false
+      errorMessage.value = ''
+    }
+  }
+)
+
+watch(
+  () => formData.redis.type,
+  (next, previous) => {
+    if (next !== previous) {
+      redisConnected.value = false
+      errorMessage.value = ''
+    }
+  }
+)
+
+const isSQLite = computed(() => formData.database.type === 'sqlite')
+const isMemoryCache = computed(() => formData.redis.type === 'memory')
 
 const canProceed = computed(() => {
   switch (currentStep.value) {

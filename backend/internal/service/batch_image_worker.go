@@ -142,6 +142,7 @@ func (w *BatchImageWorker) RunOnce(ctx context.Context) error {
 		return err
 	}
 
+	ctx = WithBatchImageReservation(ctx, reserved)
 	lock, ok, err := w.queue.TryAcquireJobLock(ctx, reserved.BatchID, w.opts.JobLockTTL)
 	if err != nil {
 		if requeueErr := w.queue.RequeueAfter(ctx, reserved.BatchID, w.opts.LockConflictDelay); requeueErr != nil {

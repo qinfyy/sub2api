@@ -196,7 +196,11 @@ export default {
     description: 'Configure your Sub2API instance',
     database: {
       title: 'Database Configuration',
-      description: 'Connect to your PostgreSQL database',
+      description: 'Choose PostgreSQL or an embedded SQLite file',
+      type: 'Database Type',
+      typePostgres: 'PostgreSQL',
+      typeSqlite: 'SQLite (embedded)',
+      path: 'Database File',
       host: 'Host',
       port: 'Port',
       username: 'Username',
@@ -212,8 +216,11 @@ export default {
       }
     },
     redis: {
-      title: 'Redis Configuration',
-      description: 'Connect to your Redis server',
+      title: 'Cache Configuration',
+      description: 'Use an external Redis server or an in-process cache',
+      type: 'Cache Type',
+      typeRedis: 'Redis',
+      typeMemory: 'In-memory (single instance)',
       host: 'Host',
       port: 'Port',
       username: 'Username (optional)',
@@ -222,7 +229,10 @@ export default {
       usernamePlaceholder: 'Leave empty for default user',
       passwordPlaceholder: 'Password',
       enableTls: 'Enable TLS',
-      enableTlsHint: 'Use TLS when connecting to Redis (public CA certs)'
+      enableTlsHint: 'Use TLS when connecting to Redis (public CA certs)',
+      memory: {
+        maxCapacity: 'Max Capacity (MB)'
+      }
     },
     admin: {
       title: 'Admin Account',

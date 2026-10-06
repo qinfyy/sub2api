@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/sysutil"
 
@@ -115,12 +116,14 @@ func validateSSLMode(mode string) bool {
 
 // TestDatabaseRequest represents database test request
 type TestDatabaseRequest struct {
+	Type     string `json:"type"`
 	Host     string `json:"host" binding:"required"`
 	Port     int    `json:"port" binding:"required"`
 	User     string `json:"user" binding:"required"`
 	Password string `json:"password"`
 	DBName   string `json:"dbname" binding:"required"`
 	SSLMode  string `json:"sslmode"`
+	Path     string `json:"path"`
 }
 
 // testDatabase tests database connection
@@ -128,6 +131,15 @@ func testDatabase(c *gin.Context) {
 	var req TestDatabaseRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Error(c, http.StatusBadRequest, "Invalid request: "+err.Error())
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(req.Type), "sqlite") {
+		cfg := &DatabaseConfig{Type: req.Type, Path: strings.TrimSpace(req.Path)}
+		if err := TestDatabaseConnection(cfg); err != nil {
+			response.Error(c, http.StatusBadRequest, "Connection failed: "+err.Error())
+			return
+		}
+		response.Success(c, gin.H{"message": "Connection successful"})
 		return
 	}
 
@@ -176,6 +188,7 @@ func testDatabase(c *gin.Context) {
 
 // TestRedisRequest represents Redis test request
 type TestRedisRequest struct {
+	Type      string `json:"type"`
 	Host      string `json:"host" binding:"required"`
 	Port      int    `json:"port" binding:"required"`
 	Username  string `json:"username"`
@@ -189,6 +202,10 @@ func testRedis(c *gin.Context) {
 	var req TestRedisRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.Error(c, http.StatusBadRequest, "Invalid request: "+err.Error())
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(req.Type), "memory") {
+		response.Success(c, gin.H{"message": "In-memory cache requires no external service"})
 		return
 	}
 
@@ -255,6 +272,15 @@ func install(c *gin.Context) {
 	}
 
 	req.Admin.Email = strings.TrimSpace(req.Admin.Email)
+	req.Database.Type = strings.ToLower(strings.TrimSpace(req.Database.Type))
+	if req.Database.Type == "" {
+		req.Database.Type = config.DatabaseTypePostgres
+	}
+	req.Database.Path = strings.TrimSpace(req.Database.Path)
+	req.Redis.Type = strings.ToLower(strings.TrimSpace(req.Redis.Type))
+	if req.Redis.Type == "" {
+		req.Redis.Type = config.CacheTypeRedis
+	}
 	req.Database.Host = strings.TrimSpace(req.Database.Host)
 	req.Database.User = strings.TrimSpace(req.Database.User)
 	req.Database.DBName = strings.TrimSpace(req.Database.DBName)
@@ -263,38 +289,60 @@ func install(c *gin.Context) {
 
 	// ========== COMPREHENSIVE INPUT VALIDATION ==========
 	// Database validation
-	if !validateHostname(req.Database.Host) {
-		response.Error(c, http.StatusBadRequest, "Invalid database hostname")
-		return
-	}
-	if !validatePort(req.Database.Port) {
-		response.Error(c, http.StatusBadRequest, "Invalid database port")
-		return
-	}
-	if !validateUsername(req.Database.User) {
-		response.Error(c, http.StatusBadRequest, "Invalid database username")
-		return
-	}
-	if !validateDBName(req.Database.DBName) {
-		response.Error(c, http.StatusBadRequest, "Invalid database name")
+	if req.Database.Type == config.DatabaseTypeSQLite {
+		if req.Database.Path == "" {
+			response.Error(c, http.StatusBadRequest, "SQLite database path is required")
+			return
+		}
+	} else if req.Database.Type == config.DatabaseTypePostgres {
+		if !validateHostname(req.Database.Host) {
+			response.Error(c, http.StatusBadRequest, "Invalid database hostname")
+			return
+		}
+		if !validatePort(req.Database.Port) {
+			response.Error(c, http.StatusBadRequest, "Invalid database port")
+			return
+		}
+		if !validateUsername(req.Database.User) {
+			response.Error(c, http.StatusBadRequest, "Invalid database username")
+			return
+		}
+		if !validateDBName(req.Database.DBName) {
+			response.Error(c, http.StatusBadRequest, "Invalid database name")
+			return
+		}
+	} else {
+		response.Error(c, http.StatusBadRequest, "Invalid database type (must be 'postgres' or 'sqlite')")
 		return
 	}
 
 	// Redis validation
-	if !validateHostname(req.Redis.Host) {
-		response.Error(c, http.StatusBadRequest, "Invalid Redis hostname")
-		return
-	}
-	if !validatePort(req.Redis.Port) {
-		response.Error(c, http.StatusBadRequest, "Invalid Redis port")
-		return
-	}
-	if req.Redis.DB < 0 || req.Redis.DB > 15 {
-		response.Error(c, http.StatusBadRequest, "Invalid Redis database number")
-		return
-	}
-	if len(req.Redis.Username) > 128 {
-		response.Error(c, http.StatusBadRequest, "Invalid Redis username")
+	if req.Redis.Type == config.CacheTypeMemory {
+		if req.Redis.Memory.MaxCapacityMB <= 0 {
+			req.Redis.Memory.MaxCapacityMB = 512
+		}
+		if req.Redis.Memory.GCIntervalSeconds <= 0 {
+			req.Redis.Memory.GCIntervalSeconds = 60
+		}
+	} else if req.Redis.Type == config.CacheTypeRedis {
+		if !validateHostname(req.Redis.Host) {
+			response.Error(c, http.StatusBadRequest, "Invalid Redis hostname")
+			return
+		}
+		if !validatePort(req.Redis.Port) {
+			response.Error(c, http.StatusBadRequest, "Invalid Redis port")
+			return
+		}
+		if req.Redis.DB < 0 || req.Redis.DB > 15 {
+			response.Error(c, http.StatusBadRequest, "Invalid Redis database number")
+			return
+		}
+		if len(req.Redis.Username) > 128 {
+			response.Error(c, http.StatusBadRequest, "Invalid Redis username")
+			return
+		}
+	} else {
+		response.Error(c, http.StatusBadRequest, "Invalid cache type (must be 'redis' or 'memory')")
 		return
 	}
 
@@ -315,12 +363,15 @@ func install(c *gin.Context) {
 	}
 
 	// ========== SET DEFAULTS ==========
-	if req.Database.SSLMode == "" {
+	if req.Database.SSLMode == "" && req.Database.Type == config.DatabaseTypePostgres {
 		req.Database.SSLMode = "disable"
 	}
-	if !validateSSLMode(req.Database.SSLMode) {
+	if req.Database.Type == config.DatabaseTypePostgres && !validateSSLMode(req.Database.SSLMode) {
 		response.Error(c, http.StatusBadRequest, "Invalid SSL mode")
 		return
+	}
+	if req.Database.Type == config.DatabaseTypeSQLite && req.Database.Path == "" {
+		req.Database.Path = "data/sub2api.db"
 	}
 	if req.Server.Host == "" {
 		req.Server.Host = "0.0.0.0"

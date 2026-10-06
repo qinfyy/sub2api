@@ -19,21 +19,28 @@ export interface SetupStatus {
 }
 
 export interface DatabaseConfig {
+  type: 'postgres' | 'sqlite'
   host: string
   port: number
   user: string
   password: string
   dbname: string
   sslmode: string
+  path: string
 }
 
 export interface RedisConfig {
+  type: 'redis' | 'memory'
   host: string
   port: number
   username: string
   password: string
   db: number
   enable_tls: boolean
+  memory: {
+    max_capacity_mb: number
+    gc_interval_seconds: number
+  }
 }
 
 export interface AdminConfig {

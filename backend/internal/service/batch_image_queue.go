@@ -18,6 +18,21 @@ var (
 
 type ReservedBatchImageJob struct {
 	BatchID string
+	Receipt string
+}
+
+type batchImageReservationContextKey struct{}
+
+func WithBatchImageReservation(ctx context.Context, job ReservedBatchImageJob) context.Context {
+	return context.WithValue(ctx, batchImageReservationContextKey{}, job)
+}
+
+func BatchImageReservationReceipt(ctx context.Context, batchID string) string {
+	job, _ := ctx.Value(batchImageReservationContextKey{}).(ReservedBatchImageJob)
+	if job.BatchID != batchID {
+		return ""
+	}
+	return job.Receipt
 }
 
 type BatchImageJobLock interface {

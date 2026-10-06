@@ -15,7 +15,7 @@ import (
 
 // ProvideConcurrencyCache 创建并发控制缓存，从配置读取 TTL 参数
 // 性能优化：TTL 可配置，支持长时间运行的 LLM 请求场景
-func ProvideConcurrencyCache(rdb *redis.Client, cfg *config.Config) service.ConcurrencyCache {
+func ProvideConcurrencyCache(r *BackendResources, cfg *config.Config) service.ConcurrencyCache {
 	waitTTLSeconds := int(cfg.Gateway.Scheduling.StickySessionWaitTimeout.Seconds())
 	if cfg.Gateway.Scheduling.FallbackWaitTimeout > cfg.Gateway.Scheduling.StickySessionWaitTimeout {
 		waitTTLSeconds = int(cfg.Gateway.Scheduling.FallbackWaitTimeout.Seconds())
@@ -23,7 +23,10 @@ func ProvideConcurrencyCache(rdb *redis.Client, cfg *config.Config) service.Conc
 	if waitTTLSeconds <= 0 {
 		waitTTLSeconds = cfg.Gateway.ConcurrencySlotTTLMinutes * 60
 	}
-	return NewConcurrencyCache(rdb, cfg.Gateway.ConcurrencySlotTTLMinutes, waitTTLSeconds)
+	if r.memory != nil {
+		return NewMemoryConcurrencyCache(r.memory, cfg.Gateway.ConcurrencySlotTTLMinutes, waitTTLSeconds)
+	}
+	return NewConcurrencyCache(r.Redis, cfg.Gateway.ConcurrencySlotTTLMinutes, waitTTLSeconds)
 }
 
 // ProvideGitHubReleaseClient 创建 GitHub Release 客户端
@@ -40,16 +43,22 @@ func ProvidePricingRemoteClient(cfg *config.Config) service.PricingRemoteClient 
 
 // ProvideSessionLimitCache 创建会话限制缓存
 // 用于 Anthropic OAuth/SetupToken 账号的并发会话数量控制
-func ProvideSessionLimitCache(rdb *redis.Client, cfg *config.Config) service.SessionLimitCache {
+func ProvideSessionLimitCache(r *BackendResources, cfg *config.Config) service.SessionLimitCache {
 	defaultIdleTimeoutMinutes := 5 // 默认 5 分钟空闲超时
 	if cfg != nil && cfg.Gateway.SessionIdleTimeoutMinutes > 0 {
 		defaultIdleTimeoutMinutes = cfg.Gateway.SessionIdleTimeoutMinutes
 	}
-	return NewSessionLimitCache(rdb, defaultIdleTimeoutMinutes)
+	if r.memory != nil {
+		return NewMemorySessionLimitCache(r.memory, defaultIdleTimeoutMinutes)
+	}
+	return NewSessionLimitCache(r.Redis, defaultIdleTimeoutMinutes)
 }
 
 // ProvideSchedulerCache 创建调度快照缓存，并注入快照分块参数。
-func ProvideSchedulerCache(rdb *redis.Client, cfg *config.Config) service.SchedulerCache {
+func ProvideSchedulerCache(r *BackendResources, cfg *config.Config) service.SchedulerCache {
+	if r.memory != nil {
+		return NewMemorySchedulerCache(r.memory, r.State.DB)
+	}
 	mgetChunkSize := defaultSchedulerSnapshotMGetChunkSize
 	writeChunkSize := defaultSchedulerSnapshotWriteChunkSize
 	if cfg != nil {
@@ -60,11 +69,13 @@ func ProvideSchedulerCache(rdb *redis.Client, cfg *config.Config) service.Schedu
 			writeChunkSize = cfg.Gateway.Scheduling.SnapshotWriteChunkSize
 		}
 	}
-	return newSchedulerCacheWithChunkSizes(rdb, mgetChunkSize, writeChunkSize)
+	return newSchedulerCacheWithChunkSizes(r.Redis, mgetChunkSize, writeChunkSize)
 }
 
 // ProviderSet is the Wire provider set for all repositories
 var ProviderSet = wire.NewSet(
+	ProvideBackendResources,
+	ProvideHTTPRateLimiter,
 	NewUserRepository,
 	NewAPIKeyRepository,
 	NewGroupRepository,
@@ -89,7 +100,7 @@ var ProviderSet = wire.NewSet(
 	NewOpsRepository,
 	NewAuditLogRepository,
 	NewPasskeyRepository,
-	NewPasskeySessionStore,
+	ProvidePasskeySessionStore,
 	NewUserSubscriptionRepository,
 	NewUserAttributeDefinitionRepository,
 	NewUserAttributeValueRepository,
@@ -97,7 +108,7 @@ var ProviderSet = wire.NewSet(
 	NewErrorPassthroughRepository,
 	NewTLSFingerprintProfileRepository,
 	NewPluginRepository,
-	NewPluginKVStore,
+	ProvidePluginKVStore,
 	NewChannelRepository,
 	NewChannelMonitorRepository,
 	NewChannelMonitorV2Repository,
@@ -108,38 +119,38 @@ var ProviderSet = wire.NewSet(
 	NewUserPlatformQuotaServiceAdapter, // T14: adapter → service.UserPlatformQuotaRepository
 
 	// Cache implementations
-	NewGatewayCache,
-	NewBillingCache,
-	NewAPIKeyCache,
-	NewTempUnschedCache,
-	NewTimeoutCounterCache,
-	NewOpenAI403CounterCache,
-	NewInternal500CounterCache,
+	ProvideGatewayCache,
+	ProvideBillingCache,
+	ProvideAPIKeyCache,
+	ProvideTempUnschedCache,
+	ProvideTimeoutCounterCache,
+	ProvideOpenAI403CounterCache,
+	ProvideInternal500CounterCache,
 	ProvideConcurrencyCache,
 	ProvideSessionLimitCache,
-	NewRPMCache,
-	NewUserRPMCache,
-	NewUserMsgQueueCache,
-	NewDashboardCache,
-	NewEmailCache,
-	NewIdentityCache,
-	NewRedeemCache,
-	NewUpdateCache,
-	NewGeminiTokenCache,
-	NewImageTaskStore,
-	NewBatchImageQueue,
-	NewBatchImageDownloadLimiter,
-	NewLeaderLockCache,
+	ProvideRPMCache,
+	ProvideUserRPMCache,
+	ProvideUserMsgQueueCache,
+	ProvideDashboardCache,
+	ProvideEmailCache,
+	ProvideIdentityCache,
+	ProvideRedeemCache,
+	ProvideUpdateCache,
+	ProvideGeminiTokenCache,
+	ProvideImageTaskStore,
+	ProvideBatchImageQueue,
+	ProvideBatchImageDownloadLimiter,
+	ProvideLeaderLockCache,
 	ProvideSchedulerCache,
 	NewSchedulerOutboxRepository,
 	NewAuthCacheInvalidationOutboxRepository,
-	NewProxyLatencyCache,
-	NewTotpCache,
-	NewRefreshTokenCache,
-	NewErrorPassthroughCache,
-	NewTLSFingerprintProfileCache,
-	NewChannelCache,
-	NewContentModerationHashCache,
+	ProvideProxyLatencyCache,
+	ProvideTotpCache,
+	ProvideRefreshTokenCache,
+	ProvideErrorPassthroughCache,
+	ProvideTLSFingerprintProfileCache,
+	ProvideChannelCache,
+	ProvideContentModerationHashCache,
 
 	// Encryptors
 	NewAESEncryptor,
@@ -180,9 +191,8 @@ var ProviderSet = wire.NewSet(
 //
 // 依赖：config.Config
 // 提供：*ent.Client
-func ProvideEnt(cfg *config.Config) (*ent.Client, error) {
-	client, _, err := InitEnt(cfg)
-	return client, err
+func ProvideEnt(r *BackendResources) *ent.Client {
+	return r.Ent
 }
 
 // ProvideImageStorageFactory 提供按需构造对象存储客户端的工厂。
@@ -229,6 +239,6 @@ func ProvideSQLDB(client *ent.Client) (*sql.DB, error) {
 //
 // 依赖：config.Config
 // 提供：*redis.Client
-func ProvideRedis(cfg *config.Config) *redis.Client {
-	return InitRedis(cfg)
+func ProvideRedis(r *BackendResources) *redis.Client {
+	return r.Redis
 }

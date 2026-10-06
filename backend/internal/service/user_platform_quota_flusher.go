@@ -210,6 +210,15 @@ func (s *UserPlatformQuotaUsageFlusher) flushOneBatch(parentCtx context.Context)
 	}
 
 	// 6. 成功
+	if durable, ok := s.cache.(interface {
+		AckDirtyUserPlatformQuotaKeys(context.Context, []UserPlatformQuotaKey, []*UserPlatformQuotaCacheEntry) error
+	}); ok {
+		if err := durable.AckDirtyUserPlatformQuotaKeys(ctx, keys, entries); err != nil {
+			s.metrics.FlushErrorTotal.Add(1)
+			logger.LegacyPrintf("quota_flusher", "[QuotaFlusher] durable acknowledgement failed: %v", err)
+			return false
+		}
+	}
 	s.metrics.FlushSuccessTotal.Add(1)
 	s.metrics.FlushBatchSizeTotal.Add(int64(len(snaps)))
 

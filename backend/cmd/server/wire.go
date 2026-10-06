@@ -25,13 +25,14 @@ import (
 )
 
 type Application struct {
+	Backends      *repository.BackendResources
 	Server        *http.Server
 	PromptAudit   *securityaudit.PromptService
 	PluginManager *service.PluginManager
 	Cleanup       func()
 }
 
-func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
+func initializeApplication(buildInfo handler.BuildInfo) (*Application, func(), error) {
 	wire.Build(
 		// Infrastructure layer ProviderSets
 		config.ProviderSet,
@@ -58,9 +59,9 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 		provideCleanup,
 
 		// Application struct
-		wire.Struct(new(Application), "Server", "PromptAudit", "PluginManager", "Cleanup"),
+		wire.Struct(new(Application), "Server", "PromptAudit", "PluginManager", "Cleanup", "Backends"),
 	)
-	return nil, nil
+	return nil, nil, nil
 }
 
 func providePrivacyClientFactory() service.PrivacyClientFactory {
@@ -394,21 +395,6 @@ func provideCleanup(
 			}},
 		}
 
-		infraSteps := []cleanupStep{
-			{"Redis", func() error {
-				if rdb == nil {
-					return nil
-				}
-				return rdb.Close()
-			}},
-			{"Ent", func() error {
-				if entClient == nil {
-					return nil
-				}
-				return entClient.Close()
-			}},
-		}
-
 		runParallel := func(steps []cleanupStep) {
 			var wg sync.WaitGroup
 			for i := range steps {
@@ -426,19 +412,7 @@ func provideCleanup(
 			wg.Wait()
 		}
 
-		runSequential := func(steps []cleanupStep) {
-			for i := range steps {
-				step := steps[i]
-				if err := step.fn(); err != nil {
-					log.Printf("[Cleanup] %s failed: %v", step.name, err)
-					continue
-				}
-				log.Printf("[Cleanup] %s succeeded", step.name)
-			}
-		}
-
 		runParallel(parallelSteps)
-		runSequential(infraSteps)
 
 		// Check if context timed out
 		select {

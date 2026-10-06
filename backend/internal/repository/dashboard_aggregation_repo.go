@@ -568,6 +568,12 @@ func (r *dashboardAggregationRepository) upsertDailyAggregates(ctx context.Conte
 }
 
 func (r *dashboardAggregationRepository) isUsageLogsPartitioned(ctx context.Context) (bool, error) {
+	// SQLite 没有声明式分区（PARTITION BY / ATTACH 维护），相关的建表、
+	// 清理与滚动维护代码路径整体不适用。
+	if db, ok := r.sql.(*sql.DB); ok && isSQLiteDB(db) {
+		return false, nil
+	}
+
 	query := `
 		SELECT EXISTS(
 			SELECT 1

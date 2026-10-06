@@ -21,9 +21,13 @@ func RegisterAuthRoutes(
 	redisClient *redis.Client,
 	settingService *service.SettingService,
 	panelRateLimiter *servermiddleware.PanelRateLimiter,
+	limiters ...*middleware.RateLimiter,
 ) {
 	// 创建速率限制器
 	rateLimiter := middleware.NewRateLimiter(redisClient)
+	if len(limiters) > 0 && limiters[0] != nil {
+		rateLimiter = limiters[0]
+	}
 
 	// 公开接口
 	auth := v1.Group("/auth")

@@ -10,6 +10,7 @@ import (
 	"net/textproto"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -1543,12 +1544,17 @@ func (s *ServerConfig) Address() string {
 // DatabaseConfig 数据库连接配置
 // 性能优化：新增连接池参数，避免频繁创建/销毁连接
 type DatabaseConfig struct {
+	// Type selects the persistence backend. Supported values: postgres, sqlite.
+	Type     string `mapstructure:"type" yaml:"type"`
 	Host     string `mapstructure:"host"`
 	Port     int    `mapstructure:"port"`
 	User     string `mapstructure:"user"`
 	Password string `mapstructure:"password"`
 	DBName   string `mapstructure:"dbname"`
 	SSLMode  string `mapstructure:"sslmode"`
+	// Path is the SQLite database file location. Relative paths resolve from
+	// the configuration file directory (or working directory without a config file).
+	Path string `mapstructure:"path" yaml:"path"`
 	// 连接池配置（性能优化：可配置化连接池参数）
 	// MaxOpenConns: 最大打开连接数，控制数据库连接上限，防止资源耗尽
 	MaxOpenConns int `mapstructure:"max_open_conns"`
@@ -1565,6 +1571,70 @@ type DatabaseConfig struct {
 	// UserPlatformQuotaFlushBatchSize: flusher 单批最大条数
 	// 建议 ≤ 6000（单条 UPSERT 原子上限）
 	UserPlatformQuotaFlushBatchSize int `mapstructure:"user_platform_quota_flush_batch_size"`
+}
+
+// DatabaseTypePostgres and DatabaseTypeSQLite are the supported database backends.
+const (
+	DatabaseTypePostgres = "postgres"
+	DatabaseTypeSQLite   = "sqlite"
+)
+
+// NormalizeDatabaseType canonicalizes the configured database type and falls
+// back to PostgreSQL only for an empty value; validation rejects unknown types.
+func (d *DatabaseConfig) NormalizeType() {
+	d.Type = strings.ToLower(strings.TrimSpace(d.Type))
+	if d.Type == "" {
+		d.Type = DatabaseTypePostgres
+	}
+}
+
+// IsSQLite reports whether the SQLite backend is selected.
+func (d *DatabaseConfig) IsSQLite() bool {
+	return d != nil && d.Type == DatabaseTypeSQLite
+}
+
+// IsPostgres reports whether the PostgreSQL backend is selected.
+func (d *DatabaseConfig) IsPostgres() bool {
+	return d != nil && d.Type == DatabaseTypePostgres
+}
+
+// SQLiteDSN builds the modernc.org/sqlite DSN with the pragmas the application
+// depends on: WAL for read/write concurrency, foreign key enforcement, and a
+// busy timeout so short write contention waits instead of failing.
+func (d *DatabaseConfig) SQLiteDSN() string {
+	path := strings.TrimSpace(d.Path)
+	if path == "" {
+		path = "data/sub2api.db"
+	}
+	// Path is a filename, not a DSN. Escape reserved characters so filenames
+	// cannot accidentally inject URI options or be truncated at '#' or '?'.
+	u := url.URL{Scheme: "file", Path: filepath.ToSlash(path), OmitHost: true}
+	q := url.Values{}
+	q.Add("_pragma", "busy_timeout(10000)")
+	q.Add("_pragma", "journal_mode(WAL)")
+	q.Add("_pragma", "foreign_keys(1)")
+	q.Set("_txlock", "immediate")
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func (d *DatabaseConfig) ResolveSQLitePath(baseDir string) error {
+	if !d.IsSQLite() {
+		return nil
+	}
+	path := strings.TrimSpace(d.Path)
+	if path == "" {
+		return fmt.Errorf("database.path must not be empty when database.type is sqlite")
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(baseDir, path)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("resolve sqlite database path: %w", err)
+	}
+	d.Path = abs
+	return nil
 }
 
 func (d *DatabaseConfig) DSN() string {
@@ -1602,6 +1672,8 @@ func (d *DatabaseConfig) DSNWithTimezone(tz string) string {
 // RedisConfig Redis 连接配置
 // 性能优化：新增连接池和超时参数，提升高并发场景下的吞吐量
 type RedisConfig struct {
+	// Type selects the cache backend. Supported values: redis, memory.
+	Type     string `mapstructure:"type" yaml:"type"`
 	Host     string `mapstructure:"host"`
 	Port     int    `mapstructure:"port"`
 	Username string `mapstructure:"username"`
@@ -1620,10 +1692,55 @@ type RedisConfig struct {
 	MinIdleConns int `mapstructure:"min_idle_conns"`
 	// EnableTLS: 是否启用 TLS/SSL 连接
 	EnableTLS bool `mapstructure:"enable_tls"`
+	// Memory configures the in-process cache backend used when Type is memory.
+	Memory MemoryCacheConfig `mapstructure:"memory" yaml:"memory"`
 }
 
 func (r *RedisConfig) Address() string {
 	return fmt.Sprintf("%s:%d", r.Host, r.Port)
+}
+
+// CacheTypeRedis and CacheTypeMemory are the supported cache backends.
+const (
+	CacheTypeRedis  = "redis"
+	CacheTypeMemory = "memory"
+)
+
+// MemoryCacheConfig bounds the in-process cache so a long-running gateway
+// cannot grow without limit.
+type MemoryCacheConfig struct {
+	PersistencePath string `mapstructure:"persistence_path" yaml:"persistence_path"`
+	// MaxCapacityMB is the estimated memory budget for cached values.
+	MaxCapacityMB int `mapstructure:"max_capacity_mb" yaml:"max_capacity_mb"`
+	// GCIntervalSeconds controls how often expired entries are purged.
+	GCIntervalSeconds int `mapstructure:"gc_interval_seconds" yaml:"gc_interval_seconds"`
+}
+
+// ResolvePersistencePath uses the same base directory as the main SQLite file.
+func (m *MemoryCacheConfig) ResolvePersistencePath(baseDir string) error {
+	path := strings.TrimSpace(m.PersistencePath)
+	if path == "" {
+		path = "data/cache-state.db"
+	}
+	db := DatabaseConfig{Type: DatabaseTypeSQLite, Path: path}
+	if err := db.ResolveSQLitePath(baseDir); err != nil {
+		return fmt.Errorf("resolve memory persistence path: %w", err)
+	}
+	m.PersistencePath = db.Path
+	return nil
+}
+
+// NormalizeType canonicalizes the configured cache type.
+func (r *RedisConfig) NormalizeType() {
+	r.Type = strings.ToLower(strings.TrimSpace(r.Type))
+	if r.Type == "" {
+		r.Type = CacheTypeRedis
+	}
+}
+
+// IsMemory reports whether the in-process cache backend is selected.
+func (r *RedisConfig) IsMemory() bool {
+	return r != nil && r.Type == CacheTypeMemory
 }
 
 type OpsConfig struct {
@@ -1826,6 +1943,40 @@ func LoadForBootstrap() (*Config, error) {
 	return load(true)
 }
 
+// NewDefaultConfig 返回一份只含默认值的配置，不读取配置文件、不绑定环境变量、
+// 也不触碰全局 viper 实例。
+//
+// 存在的意义：InitEnt 在返回客户端前会执行一次完整 Validate()，所以任何只想
+// 借助它建表或迁移的调用方（例如安装向导的 SQLite 分支）都必须先拿到一份
+// 字段齐全的配置，否则会因插件上传上限、网关参数等零值而校验失败。
+// 用独立的 viper 实例承载默认值，可避免把默认值写进全局 viper 之后与随后的
+// 真实配置加载相互干扰。
+func NewDefaultConfig() *Config {
+	defaults := viper.New()
+	defaults.SetConfigType("yaml")
+	applyDefaults(defaults)
+
+	var cfg Config
+	if err := defaults.Unmarshal(&cfg); err != nil {
+		// 默认值全部来自本包内的字面量，结构体与 mapstructure 标签同源，
+		// 这里解析失败说明代码自身不一致，不能静默返回半成品。
+		panic(fmt.Sprintf("config: unmarshal built-in defaults: %v", err))
+	}
+	cfg.Database.NormalizeType()
+	cfg.Redis.NormalizeType()
+	if cfg.Gateway.OpenAIScheduler.StickyEscapeTTFTMs == 0 {
+		cfg.Gateway.OpenAIScheduler.StickyEscapeTTFTMs = 15000
+	}
+	if cfg.Gateway.OpenAIScheduler.StickyEscapeErrorRate == 0 {
+		cfg.Gateway.OpenAIScheduler.StickyEscapeErrorRate = 0.5
+	}
+	cfg.Server.Mode = strings.ToLower(strings.TrimSpace(cfg.Server.Mode))
+	if cfg.Server.Mode == "" {
+		cfg.Server.Mode = "debug"
+	}
+	return &cfg
+}
+
 func load(allowMissingJWTSecret bool) (*Config, error) {
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
@@ -1881,6 +2032,22 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	}
 
 	cfg.RunMode = NormalizeRunMode(cfg.RunMode)
+	cfg.Database.NormalizeType()
+	cfg.Redis.NormalizeType()
+	baseDir := "."
+	if configFile := viper.ConfigFileUsed(); configFile != "" {
+		baseDir = filepath.Dir(configFile)
+	} else if dataDir := strings.TrimSpace(os.Getenv("DATA_DIR")); dataDir != "" {
+		baseDir = dataDir
+	}
+	if err := cfg.Database.ResolveSQLitePath(baseDir); err != nil {
+		return nil, err
+	}
+	if cfg.Redis.IsMemory() {
+		if err := cfg.Redis.Memory.ResolvePersistencePath(baseDir); err != nil {
+			return nil, err
+		}
+	}
 	cfg.Server.Mode = strings.ToLower(strings.TrimSpace(cfg.Server.Mode))
 	if cfg.Server.Mode == "" {
 		cfg.Server.Mode = "debug"
@@ -2032,61 +2199,67 @@ func configureConfigSource(setConfigFile, addConfigPath func(string)) {
 }
 
 func setDefaults() {
-	viper.SetDefault("run_mode", RunModeStandard)
-	viper.SetDefault("simple_mode.auto_create_default_groups", true)
-	viper.SetDefault("simple_mode_key_rate_limit_enabled", false)
+	applyDefaults(viper.GetViper())
+}
+
+// applyDefaults 把全部配置默认值写入传入的 viper 实例。
+// 拆出参数是为了让 NewDefaultConfig 能在隔离实例上复用同一份默认值定义。
+func applyDefaults(v *viper.Viper) {
+	v.SetDefault("run_mode", RunModeStandard)
+	v.SetDefault("simple_mode.auto_create_default_groups", true)
+	v.SetDefault("simple_mode_key_rate_limit_enabled", false)
 
 	// Server
-	viper.SetDefault("server.host", "0.0.0.0")
-	viper.SetDefault("server.port", 8080)
-	viper.SetDefault("server.mode", "release")
-	viper.SetDefault("server.enable_server_timing", false)
-	viper.SetDefault("server.frontend_url", "")
-	viper.SetDefault("server.read_header_timeout", 10) // 10秒读取请求头
-	viper.SetDefault("server.max_header_bytes", 64*1024)
-	viper.SetDefault("server.idle_timeout", 120) // 120秒空闲超时
-	viper.SetDefault("server.max_request_body_size", int64(256*1024*1024))
+	v.SetDefault("server.host", "0.0.0.0")
+	v.SetDefault("server.port", 8080)
+	v.SetDefault("server.mode", "release")
+	v.SetDefault("server.enable_server_timing", false)
+	v.SetDefault("server.frontend_url", "")
+	v.SetDefault("server.read_header_timeout", 10) // 10秒读取请求头
+	v.SetDefault("server.max_header_bytes", 64*1024)
+	v.SetDefault("server.idle_timeout", 120) // 120秒空闲超时
+	v.SetDefault("server.max_request_body_size", int64(256*1024*1024))
 	// H2C 默认配置
-	viper.SetDefault("server.h2c.enabled", false)
-	viper.SetDefault("server.h2c.max_concurrent_streams", uint32(50))      // 50 个并发流
-	viper.SetDefault("server.h2c.idle_timeout", 75)                        // 75 秒
-	viper.SetDefault("server.h2c.max_read_frame_size", 1<<20)              // 1MB（够用）
-	viper.SetDefault("server.h2c.max_upload_buffer_per_connection", 2<<20) // 2MB
-	viper.SetDefault("server.h2c.max_upload_buffer_per_stream", 512<<10)   // 512KB
+	v.SetDefault("server.h2c.enabled", false)
+	v.SetDefault("server.h2c.max_concurrent_streams", uint32(50))      // 50 个并发流
+	v.SetDefault("server.h2c.idle_timeout", 75)                        // 75 秒
+	v.SetDefault("server.h2c.max_read_frame_size", 1<<20)              // 1MB（够用）
+	v.SetDefault("server.h2c.max_upload_buffer_per_connection", 2<<20) // 2MB
+	v.SetDefault("server.h2c.max_upload_buffer_per_stream", 512<<10)   // 512KB
 
 	// Log
-	viper.SetDefault("log.level", "info")
-	viper.SetDefault("log.format", "console")
-	viper.SetDefault("log.service_name", "sub2api")
-	viper.SetDefault("log.env", "production")
-	viper.SetDefault("log.caller", true)
-	viper.SetDefault("log.stacktrace_level", "error")
-	viper.SetDefault("log.output.to_stdout", true)
-	viper.SetDefault("log.output.to_file", true)
-	viper.SetDefault("log.output.file_path", "")
-	viper.SetDefault("log.rotation.max_size_mb", 100)
-	viper.SetDefault("log.rotation.max_backups", 10)
-	viper.SetDefault("log.rotation.max_age_days", 7)
-	viper.SetDefault("log.rotation.compress", true)
-	viper.SetDefault("log.rotation.local_time", true)
-	viper.SetDefault("log.sampling.enabled", false)
-	viper.SetDefault("log.sampling.initial", 100)
-	viper.SetDefault("log.sampling.thereafter", 100)
+	v.SetDefault("log.level", "info")
+	v.SetDefault("log.format", "console")
+	v.SetDefault("log.service_name", "sub2api")
+	v.SetDefault("log.env", "production")
+	v.SetDefault("log.caller", true)
+	v.SetDefault("log.stacktrace_level", "error")
+	v.SetDefault("log.output.to_stdout", true)
+	v.SetDefault("log.output.to_file", true)
+	v.SetDefault("log.output.file_path", "")
+	v.SetDefault("log.rotation.max_size_mb", 100)
+	v.SetDefault("log.rotation.max_backups", 10)
+	v.SetDefault("log.rotation.max_age_days", 7)
+	v.SetDefault("log.rotation.compress", true)
+	v.SetDefault("log.rotation.local_time", true)
+	v.SetDefault("log.sampling.enabled", false)
+	v.SetDefault("log.sampling.initial", 100)
+	v.SetDefault("log.sampling.thereafter", 100)
 
 	// CORS
-	viper.SetDefault("cors.allowed_origins", []string{})
-	viper.SetDefault("cors.allow_credentials", true)
+	v.SetDefault("cors.allowed_origins", []string{})
+	v.SetDefault("cors.allow_credentials", true)
 
 	// WebAuthn / Passkeys are opt-in because every deployment must explicitly
 	// declare its relying-party domain and trusted browser origins.
-	viper.SetDefault("webauthn.enabled", false)
-	viper.SetDefault("webauthn.rp_display_name", "Sub2API")
-	viper.SetDefault("webauthn.rp_id", "")
-	viper.SetDefault("webauthn.rp_origins", []string{})
+	v.SetDefault("webauthn.enabled", false)
+	v.SetDefault("webauthn.rp_display_name", "Sub2API")
+	v.SetDefault("webauthn.rp_id", "")
+	v.SetDefault("webauthn.rp_origins", []string{})
 
 	// Security
-	viper.SetDefault("security.url_allowlist.enabled", false)
-	viper.SetDefault("security.url_allowlist.upstream_hosts", []string{
+	v.SetDefault("security.url_allowlist.enabled", false)
+	v.SetDefault("security.url_allowlist.upstream_hosts", []string{
 		"api.openai.com",
 		"api.anthropic.com",
 		"api.kimi.com",
@@ -2100,525 +2273,531 @@ func setDefaults() {
 		"cloudcode-pa.googleapis.com",
 		"*.openai.azure.com",
 	})
-	viper.SetDefault("security.url_allowlist.pricing_hosts", []string{
+	v.SetDefault("security.url_allowlist.pricing_hosts", []string{
 		"raw.githubusercontent.com",
 	})
-	viper.SetDefault("security.url_allowlist.crs_hosts", []string{})
-	viper.SetDefault("security.url_allowlist.allow_private_hosts", true)
-	viper.SetDefault("security.url_allowlist.allow_insecure_http", true)
-	viper.SetDefault("security.response_headers.enabled", true)
-	viper.SetDefault("security.response_headers.additional_allowed", []string{})
-	viper.SetDefault("security.response_headers.force_remove", []string{})
-	viper.SetDefault("security.csp.enabled", true)
-	viper.SetDefault("security.csp.policy", DefaultCSPPolicy)
-	viper.SetDefault("security.proxy_probe.insecure_skip_verify", false)
-	viper.SetDefault("security.trust_forwarded_ip_for_api_key_acl", true)
+	v.SetDefault("security.url_allowlist.crs_hosts", []string{})
+	v.SetDefault("security.url_allowlist.allow_private_hosts", true)
+	v.SetDefault("security.url_allowlist.allow_insecure_http", true)
+	v.SetDefault("security.response_headers.enabled", true)
+	v.SetDefault("security.response_headers.additional_allowed", []string{})
+	v.SetDefault("security.response_headers.force_remove", []string{})
+	v.SetDefault("security.csp.enabled", true)
+	v.SetDefault("security.csp.policy", DefaultCSPPolicy)
+	v.SetDefault("security.proxy_probe.insecure_skip_verify", false)
+	v.SetDefault("security.trust_forwarded_ip_for_api_key_acl", true)
 
 	// Security - disable direct fallback on proxy error
-	viper.SetDefault("security.proxy_fallback.allow_direct_on_error", false)
+	v.SetDefault("security.proxy_fallback.allow_direct_on_error", false)
 
 	// Billing
-	viper.SetDefault("billing.circuit_breaker.enabled", true)
-	viper.SetDefault("billing.circuit_breaker.failure_threshold", 5)
-	viper.SetDefault("billing.circuit_breaker.reset_timeout_seconds", 30)
-	viper.SetDefault("billing.circuit_breaker.half_open_requests", 3)
-	viper.SetDefault("billing.minimum_balance_reserve", 0.000001)
-	viper.SetDefault("billing.user_platform_quota_cache_ttl_seconds", 86400)
-	viper.SetDefault("billing.user_platform_quota_sentinel_ttl_seconds", 3600)
-	viper.SetDefault("billing.inflight_reservation.enabled", true)
-	viper.SetDefault("billing.inflight_reservation.ttl_seconds", 900)
-	viper.SetDefault("billing.inflight_reservation.default_max_tokens", 8192)
-	viper.SetDefault("billing.inflight_reservation.max_output_tokens", 128000)
-	viper.SetDefault("billing.inflight_reservation.max_input_tokens", 200000)
-	viper.SetDefault("billing.inflight_reservation.max_reservation_usd", 0)
-	viper.SetDefault("billing.inflight_reservation.fail_closed_on_unpriced", false)
+	v.SetDefault("billing.circuit_breaker.enabled", true)
+	v.SetDefault("billing.circuit_breaker.failure_threshold", 5)
+	v.SetDefault("billing.circuit_breaker.reset_timeout_seconds", 30)
+	v.SetDefault("billing.circuit_breaker.half_open_requests", 3)
+	v.SetDefault("billing.minimum_balance_reserve", 0.000001)
+	v.SetDefault("billing.user_platform_quota_cache_ttl_seconds", 86400)
+	v.SetDefault("billing.user_platform_quota_sentinel_ttl_seconds", 3600)
+	v.SetDefault("billing.inflight_reservation.enabled", true)
+	v.SetDefault("billing.inflight_reservation.ttl_seconds", 900)
+	v.SetDefault("billing.inflight_reservation.default_max_tokens", 8192)
+	v.SetDefault("billing.inflight_reservation.max_output_tokens", 128000)
+	v.SetDefault("billing.inflight_reservation.max_input_tokens", 200000)
+	v.SetDefault("billing.inflight_reservation.max_reservation_usd", 0)
+	v.SetDefault("billing.inflight_reservation.fail_closed_on_unpriced", false)
 
 	// Turnstile
-	viper.SetDefault("turnstile.required", false)
+	v.SetDefault("turnstile.required", false)
 
 	// LinuxDo Connect OAuth 登录
-	viper.SetDefault("linuxdo_connect.enabled", false)
-	viper.SetDefault("linuxdo_connect.client_id", "")
-	viper.SetDefault("linuxdo_connect.client_secret", "")
-	viper.SetDefault("linuxdo_connect.authorize_url", "https://connect.linux.do/oauth2/authorize")
-	viper.SetDefault("linuxdo_connect.token_url", "https://connect.linux.do/oauth2/token")
-	viper.SetDefault("linuxdo_connect.userinfo_url", "https://connect.linux.do/api/user")
-	viper.SetDefault("linuxdo_connect.scopes", "user")
-	viper.SetDefault("linuxdo_connect.redirect_url", "")
-	viper.SetDefault("linuxdo_connect.frontend_redirect_url", "/auth/linuxdo/callback")
-	viper.SetDefault("linuxdo_connect.token_auth_method", "client_secret_post")
-	viper.SetDefault("linuxdo_connect.use_pkce", false)
-	viper.SetDefault("linuxdo_connect.userinfo_email_path", "")
-	viper.SetDefault("linuxdo_connect.userinfo_id_path", "")
-	viper.SetDefault("linuxdo_connect.userinfo_username_path", "")
+	v.SetDefault("linuxdo_connect.enabled", false)
+	v.SetDefault("linuxdo_connect.client_id", "")
+	v.SetDefault("linuxdo_connect.client_secret", "")
+	v.SetDefault("linuxdo_connect.authorize_url", "https://connect.linux.do/oauth2/authorize")
+	v.SetDefault("linuxdo_connect.token_url", "https://connect.linux.do/oauth2/token")
+	v.SetDefault("linuxdo_connect.userinfo_url", "https://connect.linux.do/api/user")
+	v.SetDefault("linuxdo_connect.scopes", "user")
+	v.SetDefault("linuxdo_connect.redirect_url", "")
+	v.SetDefault("linuxdo_connect.frontend_redirect_url", "/auth/linuxdo/callback")
+	v.SetDefault("linuxdo_connect.token_auth_method", "client_secret_post")
+	v.SetDefault("linuxdo_connect.use_pkce", false)
+	v.SetDefault("linuxdo_connect.userinfo_email_path", "")
+	v.SetDefault("linuxdo_connect.userinfo_id_path", "")
+	v.SetDefault("linuxdo_connect.userinfo_username_path", "")
 
 	// WeChat Connect OAuth 登录
-	viper.SetDefault("wechat_connect.enabled", false)
-	viper.SetDefault("wechat_connect.app_id", "")
-	viper.SetDefault("wechat_connect.app_secret", "")
-	viper.SetDefault("wechat_connect.open_app_id", "")
-	viper.SetDefault("wechat_connect.open_app_secret", "")
-	viper.SetDefault("wechat_connect.mp_app_id", "")
-	viper.SetDefault("wechat_connect.mp_app_secret", "")
-	viper.SetDefault("wechat_connect.mobile_app_id", "")
-	viper.SetDefault("wechat_connect.mobile_app_secret", "")
-	viper.SetDefault("wechat_connect.open_enabled", false)
-	viper.SetDefault("wechat_connect.mp_enabled", false)
-	viper.SetDefault("wechat_connect.mobile_enabled", false)
-	viper.SetDefault("wechat_connect.mode", defaultWeChatConnectMode)
-	viper.SetDefault("wechat_connect.scopes", defaultWeChatConnectScopes)
-	viper.SetDefault("wechat_connect.redirect_url", "")
-	viper.SetDefault("wechat_connect.frontend_redirect_url", defaultWeChatConnectFrontendRedirect)
+	v.SetDefault("wechat_connect.enabled", false)
+	v.SetDefault("wechat_connect.app_id", "")
+	v.SetDefault("wechat_connect.app_secret", "")
+	v.SetDefault("wechat_connect.open_app_id", "")
+	v.SetDefault("wechat_connect.open_app_secret", "")
+	v.SetDefault("wechat_connect.mp_app_id", "")
+	v.SetDefault("wechat_connect.mp_app_secret", "")
+	v.SetDefault("wechat_connect.mobile_app_id", "")
+	v.SetDefault("wechat_connect.mobile_app_secret", "")
+	v.SetDefault("wechat_connect.open_enabled", false)
+	v.SetDefault("wechat_connect.mp_enabled", false)
+	v.SetDefault("wechat_connect.mobile_enabled", false)
+	v.SetDefault("wechat_connect.mode", defaultWeChatConnectMode)
+	v.SetDefault("wechat_connect.scopes", defaultWeChatConnectScopes)
+	v.SetDefault("wechat_connect.redirect_url", "")
+	v.SetDefault("wechat_connect.frontend_redirect_url", defaultWeChatConnectFrontendRedirect)
 
 	// Generic OIDC OAuth 登录
-	viper.SetDefault("oidc_connect.enabled", false)
-	viper.SetDefault("oidc_connect.provider_name", "OIDC")
-	viper.SetDefault("oidc_connect.client_id", "")
-	viper.SetDefault("oidc_connect.client_secret", "")
-	viper.SetDefault("oidc_connect.issuer_url", "")
-	viper.SetDefault("oidc_connect.discovery_url", "")
-	viper.SetDefault("oidc_connect.authorize_url", "")
-	viper.SetDefault("oidc_connect.token_url", "")
-	viper.SetDefault("oidc_connect.userinfo_url", "")
-	viper.SetDefault("oidc_connect.jwks_url", "")
-	viper.SetDefault("oidc_connect.scopes", "openid email profile")
-	viper.SetDefault("oidc_connect.redirect_url", "")
-	viper.SetDefault("oidc_connect.frontend_redirect_url", "/auth/oidc/callback")
-	viper.SetDefault("oidc_connect.token_auth_method", "client_secret_post")
-	viper.SetDefault("oidc_connect.use_pkce", true)
-	viper.SetDefault("oidc_connect.validate_id_token", true)
-	viper.SetDefault("oidc_connect.allowed_signing_algs", "RS256,ES256,PS256")
-	viper.SetDefault("oidc_connect.clock_skew_seconds", 120)
-	viper.SetDefault("oidc_connect.require_email_verified", false)
-	viper.SetDefault("oidc_connect.userinfo_email_path", "")
-	viper.SetDefault("oidc_connect.userinfo_id_path", "")
-	viper.SetDefault("oidc_connect.userinfo_username_path", "")
+	v.SetDefault("oidc_connect.enabled", false)
+	v.SetDefault("oidc_connect.provider_name", "OIDC")
+	v.SetDefault("oidc_connect.client_id", "")
+	v.SetDefault("oidc_connect.client_secret", "")
+	v.SetDefault("oidc_connect.issuer_url", "")
+	v.SetDefault("oidc_connect.discovery_url", "")
+	v.SetDefault("oidc_connect.authorize_url", "")
+	v.SetDefault("oidc_connect.token_url", "")
+	v.SetDefault("oidc_connect.userinfo_url", "")
+	v.SetDefault("oidc_connect.jwks_url", "")
+	v.SetDefault("oidc_connect.scopes", "openid email profile")
+	v.SetDefault("oidc_connect.redirect_url", "")
+	v.SetDefault("oidc_connect.frontend_redirect_url", "/auth/oidc/callback")
+	v.SetDefault("oidc_connect.token_auth_method", "client_secret_post")
+	v.SetDefault("oidc_connect.use_pkce", true)
+	v.SetDefault("oidc_connect.validate_id_token", true)
+	v.SetDefault("oidc_connect.allowed_signing_algs", "RS256,ES256,PS256")
+	v.SetDefault("oidc_connect.clock_skew_seconds", 120)
+	v.SetDefault("oidc_connect.require_email_verified", false)
+	v.SetDefault("oidc_connect.userinfo_email_path", "")
+	v.SetDefault("oidc_connect.userinfo_id_path", "")
+	v.SetDefault("oidc_connect.userinfo_username_path", "")
 
 	// DingTalk Connect OAuth 登录
-	viper.SetDefault("dingtalk_connect.enabled", false)
-	viper.SetDefault("dingtalk_connect.authorize_url", "https://login.dingtalk.com/oauth2/auth")
-	viper.SetDefault("dingtalk_connect.token_url", "https://api.dingtalk.com/v1.0/oauth2/userAccessToken")
-	viper.SetDefault("dingtalk_connect.userinfo_url", "https://api.dingtalk.com/v1.0/contact/users/me")
-	viper.SetDefault("dingtalk_connect.scopes", "openid")
-	viper.SetDefault("dingtalk_connect.frontend_redirect_url", "/auth/dingtalk/callback")
-	viper.SetDefault("dingtalk_connect.dingtalk_app_kind", "internal_app")
-	viper.SetDefault("dingtalk_connect.app_type", "public")
-	viper.SetDefault("dingtalk_connect.corp_restriction_policy", "none")
-	viper.SetDefault("dingtalk_connect.require_email", true)
-	viper.SetDefault("dingtalk_connect.username_overwrite_policy", "if_empty")
+	v.SetDefault("dingtalk_connect.enabled", false)
+	v.SetDefault("dingtalk_connect.authorize_url", "https://login.dingtalk.com/oauth2/auth")
+	v.SetDefault("dingtalk_connect.token_url", "https://api.dingtalk.com/v1.0/oauth2/userAccessToken")
+	v.SetDefault("dingtalk_connect.userinfo_url", "https://api.dingtalk.com/v1.0/contact/users/me")
+	v.SetDefault("dingtalk_connect.scopes", "openid")
+	v.SetDefault("dingtalk_connect.frontend_redirect_url", "/auth/dingtalk/callback")
+	v.SetDefault("dingtalk_connect.dingtalk_app_kind", "internal_app")
+	v.SetDefault("dingtalk_connect.app_type", "public")
+	v.SetDefault("dingtalk_connect.corp_restriction_policy", "none")
+	v.SetDefault("dingtalk_connect.require_email", true)
+	v.SetDefault("dingtalk_connect.username_overwrite_policy", "if_empty")
 
 	// Database
-	viper.SetDefault("database.host", "localhost")
-	viper.SetDefault("database.port", 5432)
-	viper.SetDefault("database.user", "postgres")
-	viper.SetDefault("database.password", "postgres")
-	viper.SetDefault("database.dbname", "sub2api")
-	viper.SetDefault("database.sslmode", "prefer")
-	viper.SetDefault("database.max_open_conns", 256)
-	viper.SetDefault("database.max_idle_conns", 128)
-	viper.SetDefault("database.conn_max_lifetime_minutes", 30)
-	viper.SetDefault("database.conn_max_idle_time_minutes", 5)
-	viper.SetDefault("database.user_platform_quota_flusher_enabled", false)
-	viper.SetDefault("database.user_platform_quota_flush_interval_ms", 2000)
-	viper.SetDefault("database.user_platform_quota_flush_batch_size", 1000)
+	v.SetDefault("database.type", DatabaseTypePostgres)
+	v.SetDefault("database.host", "localhost")
+	v.SetDefault("database.port", 5432)
+	v.SetDefault("database.user", "postgres")
+	v.SetDefault("database.password", "postgres")
+	v.SetDefault("database.dbname", "sub2api")
+	v.SetDefault("database.sslmode", "prefer")
+	v.SetDefault("database.path", "data/sub2api.db")
+	v.SetDefault("database.max_open_conns", 256)
+	v.SetDefault("database.max_idle_conns", 128)
+	v.SetDefault("database.conn_max_lifetime_minutes", 30)
+	v.SetDefault("database.conn_max_idle_time_minutes", 5)
+	v.SetDefault("database.user_platform_quota_flusher_enabled", false)
+	v.SetDefault("database.user_platform_quota_flush_interval_ms", 2000)
+	v.SetDefault("database.user_platform_quota_flush_batch_size", 1000)
 
 	// Redis
-	viper.SetDefault("redis.host", "localhost")
-	viper.SetDefault("redis.port", 6379)
-	viper.SetDefault("redis.username", "")
-	viper.SetDefault("redis.password", "")
-	viper.SetDefault("redis.db", 0)
-	viper.SetDefault("redis.dial_timeout_seconds", 5)
-	viper.SetDefault("redis.read_timeout_seconds", 3)
-	viper.SetDefault("redis.write_timeout_seconds", 3)
-	viper.SetDefault("redis.pool_size", 1024)
-	viper.SetDefault("redis.min_idle_conns", 128)
-	viper.SetDefault("redis.enable_tls", false)
+	v.SetDefault("redis.type", CacheTypeRedis)
+	v.SetDefault("redis.host", "localhost")
+	v.SetDefault("redis.port", 6379)
+	v.SetDefault("redis.username", "")
+	v.SetDefault("redis.password", "")
+	v.SetDefault("redis.db", 0)
+	v.SetDefault("redis.dial_timeout_seconds", 5)
+	v.SetDefault("redis.read_timeout_seconds", 3)
+	v.SetDefault("redis.write_timeout_seconds", 3)
+	v.SetDefault("redis.pool_size", 1024)
+	v.SetDefault("redis.min_idle_conns", 128)
+	v.SetDefault("redis.enable_tls", false)
+	v.SetDefault("redis.memory.max_capacity_mb", 512)
+	v.SetDefault("redis.memory.persistence_path", "data/cache-state.db")
+	v.SetDefault("redis.memory.gc_interval_seconds", 60)
 
 	// Batch Image queue
-	viper.SetDefault("batch_image.enabled", false)
-	viper.SetDefault("batch_image.max_items_per_job_default", 200)
-	viper.SetDefault("batch_image.max_items_per_job_trial", 50)
-	viper.SetDefault("batch_image.max_output_images_per_job", 200)
-	viper.SetDefault("batch_image.max_output_images_per_item", 4)
-	viper.SetDefault("batch_image.max_prompt_chars_per_item", 8000)
-	viper.SetDefault("batch_image.max_reference_images_per_job", 1000)
-	viper.SetDefault("batch_image.max_reference_inline_bytes_per_job", 134217728)
-	viper.SetDefault("batch_image.default_response_mime_type", "image/png")
-	viper.SetDefault("batch_image.default_image_size", "1K")
-	viper.SetDefault("batch_image.max_download_items_zip", 200)
-	viper.SetDefault("batch_image.max_download_bytes_per_request", 536870912)
-	viper.SetDefault("batch_image.max_download_duration_seconds", 600)
-	viper.SetDefault("batch_image.max_download_concurrency_per_user", 1)
-	viper.SetDefault("batch_image.input_retention_after_terminal_hours", 24)
-	viper.SetDefault("batch_image.output_retention_after_terminal_hours", 72)
-	viper.SetDefault("batch_image.output_retention_max_days", 7)
-	viper.SetDefault("batch_image.cleanup_interval_minutes", 30)
-	viper.SetDefault("batch_image.cleanup_batch_size", 100)
-	viper.SetDefault("batch_image.queue_enabled", false)
-	viper.SetDefault("batch_image.queue_ready_key", "batch_image:queue:ready")
-	viper.SetDefault("batch_image.queue_delayed_key", "batch_image:queue:delayed")
-	viper.SetDefault("batch_image.queue_active_key", "batch_image:queue:active")
-	viper.SetDefault("batch_image.inflight_key_prefix", "batch_image:queue:inflight:")
-	viper.SetDefault("batch_image.lock_key_prefix", "batch_image:queue:lock:")
-	viper.SetDefault("batch_image.idempotency_key_prefix", "batch_image:queue:idem:")
-	viper.SetDefault("batch_image.inflight_ttl_seconds", 604800)
-	viper.SetDefault("batch_image.job_lock_ttl_seconds", 300)
-	viper.SetDefault("batch_image.default_requeue_delay_seconds", 30)
-	viper.SetDefault("batch_image.error_retry_delay_seconds", 60)
-	viper.SetDefault("batch_image.lock_conflict_delay_seconds", 5)
-	viper.SetDefault("batch_image.stale_active_after_seconds", 600)
-	viper.SetDefault("batch_image.delayed_mover_interval_seconds", 5)
-	viper.SetDefault("batch_image.recovery_interval_seconds", 300)
-	viper.SetDefault("batch_image.delayed_move_limit", 100)
-	viper.SetDefault("batch_image.recover_limit", 100)
-	viper.SetDefault("batch_image.vertex_enabled", false)
-	viper.SetDefault("batch_image.vertex_project_id", "")
-	viper.SetDefault("batch_image.vertex_location", "global")
-	viper.SetDefault("batch_image.vertex_managed_gcs_bucket", "")
-	viper.SetDefault("batch_image.vertex_managed_gcs_prefix", "batch-image/{env}/{batch_id}")
-	viper.SetDefault("batch_image.vertex_input_retention_hours", 24)
-	viper.SetDefault("batch_image.vertex_output_retention_hours", 72)
-	viper.SetDefault("batch_image.vertex_batch_prediction_base_url", "")
-	viper.SetDefault("batch_image.vertex_gcs_base_url", "")
+	v.SetDefault("batch_image.enabled", false)
+	v.SetDefault("batch_image.max_items_per_job_default", 200)
+	v.SetDefault("batch_image.max_items_per_job_trial", 50)
+	v.SetDefault("batch_image.max_output_images_per_job", 200)
+	v.SetDefault("batch_image.max_output_images_per_item", 4)
+	v.SetDefault("batch_image.max_prompt_chars_per_item", 8000)
+	v.SetDefault("batch_image.max_reference_images_per_job", 1000)
+	v.SetDefault("batch_image.max_reference_inline_bytes_per_job", 134217728)
+	v.SetDefault("batch_image.default_response_mime_type", "image/png")
+	v.SetDefault("batch_image.default_image_size", "1K")
+	v.SetDefault("batch_image.max_download_items_zip", 200)
+	v.SetDefault("batch_image.max_download_bytes_per_request", 536870912)
+	v.SetDefault("batch_image.max_download_duration_seconds", 600)
+	v.SetDefault("batch_image.max_download_concurrency_per_user", 1)
+	v.SetDefault("batch_image.input_retention_after_terminal_hours", 24)
+	v.SetDefault("batch_image.output_retention_after_terminal_hours", 72)
+	v.SetDefault("batch_image.output_retention_max_days", 7)
+	v.SetDefault("batch_image.cleanup_interval_minutes", 30)
+	v.SetDefault("batch_image.cleanup_batch_size", 100)
+	v.SetDefault("batch_image.queue_enabled", false)
+	v.SetDefault("batch_image.queue_ready_key", "batch_image:queue:ready")
+	v.SetDefault("batch_image.queue_delayed_key", "batch_image:queue:delayed")
+	v.SetDefault("batch_image.queue_active_key", "batch_image:queue:active")
+	v.SetDefault("batch_image.inflight_key_prefix", "batch_image:queue:inflight:")
+	v.SetDefault("batch_image.lock_key_prefix", "batch_image:queue:lock:")
+	v.SetDefault("batch_image.idempotency_key_prefix", "batch_image:queue:idem:")
+	v.SetDefault("batch_image.inflight_ttl_seconds", 604800)
+	v.SetDefault("batch_image.job_lock_ttl_seconds", 300)
+	v.SetDefault("batch_image.default_requeue_delay_seconds", 30)
+	v.SetDefault("batch_image.error_retry_delay_seconds", 60)
+	v.SetDefault("batch_image.lock_conflict_delay_seconds", 5)
+	v.SetDefault("batch_image.stale_active_after_seconds", 600)
+	v.SetDefault("batch_image.delayed_mover_interval_seconds", 5)
+	v.SetDefault("batch_image.recovery_interval_seconds", 300)
+	v.SetDefault("batch_image.delayed_move_limit", 100)
+	v.SetDefault("batch_image.recover_limit", 100)
+	v.SetDefault("batch_image.vertex_enabled", false)
+	v.SetDefault("batch_image.vertex_project_id", "")
+	v.SetDefault("batch_image.vertex_location", "global")
+	v.SetDefault("batch_image.vertex_managed_gcs_bucket", "")
+	v.SetDefault("batch_image.vertex_managed_gcs_prefix", "batch-image/{env}/{batch_id}")
+	v.SetDefault("batch_image.vertex_input_retention_hours", 24)
+	v.SetDefault("batch_image.vertex_output_retention_hours", 72)
+	v.SetDefault("batch_image.vertex_batch_prediction_base_url", "")
+	v.SetDefault("batch_image.vertex_gcs_base_url", "")
 
 	// Image storage (async image task result offload to S3-compatible object storage)
-	viper.SetDefault("image_storage.enabled", false)
-	viper.SetDefault("image_storage.region", "auto")
-	viper.SetDefault("image_storage.prefix", "images/")
-	viper.SetDefault("image_storage.force_path_style", false)
-	viper.SetDefault("image_storage.presign_expiry_hours", 24)
-	viper.SetDefault("image_storage.max_download_bytes", 33554432)
+	v.SetDefault("image_storage.enabled", false)
+	v.SetDefault("image_storage.region", "auto")
+	v.SetDefault("image_storage.prefix", "images/")
+	v.SetDefault("image_storage.force_path_style", false)
+	v.SetDefault("image_storage.presign_expiry_hours", 24)
+	v.SetDefault("image_storage.max_download_bytes", 33554432)
 	// Registered with empty defaults so AutomaticEnv can reach them: viper only
 	// decodes keys present in AllKeys(), so a credential that is supplied purely
 	// via IMAGE_STORAGE_* and never appears in config.yaml would be dropped and
 	// silently disable the whole async image feature.
-	viper.SetDefault("image_storage.endpoint", "")
-	viper.SetDefault("image_storage.bucket", "")
-	viper.SetDefault("image_storage.access_key_id", "")
-	viper.SetDefault("image_storage.secret_access_key", "")
-	viper.SetDefault("image_storage.public_base_url", "")
+	v.SetDefault("image_storage.endpoint", "")
+	v.SetDefault("image_storage.bucket", "")
+	v.SetDefault("image_storage.access_key_id", "")
+	v.SetDefault("image_storage.secret_access_key", "")
+	v.SetDefault("image_storage.public_base_url", "")
 
 	// Ops (vNext)
-	viper.SetDefault("ops.enabled", true)
-	viper.SetDefault("ops.use_preaggregated_tables", true)
-	viper.SetDefault("ops.cleanup.enabled", true)
-	viper.SetDefault("ops.cleanup.schedule", "0 2 * * *")
+	v.SetDefault("ops.enabled", true)
+	v.SetDefault("ops.use_preaggregated_tables", true)
+	v.SetDefault("ops.cleanup.enabled", true)
+	v.SetDefault("ops.cleanup.schedule", "0 2 * * *")
 	// Retention days: vNext defaults to 30 days across ops datasets.
-	viper.SetDefault("ops.cleanup.error_log_retention_days", 30)
-	viper.SetDefault("ops.cleanup.system_log_retention_days", 30)
-	viper.SetDefault("ops.cleanup.minute_metrics_retention_days", 30)
-	viper.SetDefault("ops.cleanup.hourly_metrics_retention_days", 30)
-	viper.SetDefault("ops.aggregation.enabled", true)
-	viper.SetDefault("ops.metrics_collector_cache.enabled", true)
+	v.SetDefault("ops.cleanup.error_log_retention_days", 30)
+	v.SetDefault("ops.cleanup.system_log_retention_days", 30)
+	v.SetDefault("ops.cleanup.minute_metrics_retention_days", 30)
+	v.SetDefault("ops.cleanup.hourly_metrics_retention_days", 30)
+	v.SetDefault("ops.aggregation.enabled", true)
+	v.SetDefault("ops.metrics_collector_cache.enabled", true)
 	// TTL should be slightly larger than collection interval (1m) to maximize cross-replica cache hits.
-	viper.SetDefault("ops.metrics_collector_cache.ttl", 65*time.Second)
+	v.SetDefault("ops.metrics_collector_cache.ttl", 65*time.Second)
 
 	// JWT
-	viper.SetDefault("jwt.secret", "")
-	viper.SetDefault("jwt.expire_hour", 24)
-	viper.SetDefault("jwt.access_token_expire_minutes", 0) // 0 表示回退到 expire_hour
-	viper.SetDefault("jwt.refresh_token_expire_days", 30)  // 30天Refresh Token有效期
-	viper.SetDefault("jwt.refresh_window_minutes", 2)      // 过期前2分钟开始允许刷新
+	v.SetDefault("jwt.secret", "")
+	v.SetDefault("jwt.expire_hour", 24)
+	v.SetDefault("jwt.access_token_expire_minutes", 0) // 0 表示回退到 expire_hour
+	v.SetDefault("jwt.refresh_token_expire_days", 30)  // 30天Refresh Token有效期
+	v.SetDefault("jwt.refresh_window_minutes", 2)      // 过期前2分钟开始允许刷新
 
 	// TOTP
-	viper.SetDefault("totp.encryption_key", "")
+	v.SetDefault("totp.encryption_key", "")
 
 	// Default
 	// Admin credentials are created via the setup flow (web wizard / CLI / AUTO_SETUP).
 	// Do not ship fixed defaults here to avoid insecure "known credentials" in production.
-	viper.SetDefault("default.admin_email", "")
-	viper.SetDefault("default.admin_password", "")
-	viper.SetDefault("default.user_concurrency", 5)
-	viper.SetDefault("default.user_balance", 0)
-	viper.SetDefault("default.api_key_prefix", "sk-")
-	viper.SetDefault("default.rate_multiplier", 1.0)
+	v.SetDefault("default.admin_email", "")
+	v.SetDefault("default.admin_password", "")
+	v.SetDefault("default.user_concurrency", 5)
+	v.SetDefault("default.user_balance", 0)
+	v.SetDefault("default.api_key_prefix", "sk-")
+	v.SetDefault("default.rate_multiplier", 1.0)
 
 	// RateLimit
-	viper.SetDefault("rate_limit.overload_cooldown_minutes", 10)
-	viper.SetDefault("rate_limit.oauth_401_cooldown_minutes", 10)
+	v.SetDefault("rate_limit.overload_cooldown_minutes", 10)
+	v.SetDefault("rate_limit.oauth_401_cooldown_minutes", 10)
 
 	// Pricing - 从 model-price-repo main 分支同步模型定价和上下文窗口数据
-	viper.SetDefault("pricing.remote_url", "https://raw.githubusercontent.com/Wei-Shaw/model-price-repo/main/model_prices_and_context_window.json")
-	viper.SetDefault("pricing.hash_url", "https://raw.githubusercontent.com/Wei-Shaw/model-price-repo/main/model_prices_and_context_window.sha256")
-	viper.SetDefault("pricing.data_dir", "./data")
-	viper.SetDefault("pricing.fallback_file", "./resources/model-pricing/model_prices_and_context_window.json")
-	viper.SetDefault("pricing.override_file", "")
-	viper.SetDefault("pricing.update_interval_hours", 24)
-	viper.SetDefault("pricing.hash_check_interval_minutes", 10)
+	v.SetDefault("pricing.remote_url", "https://raw.githubusercontent.com/Wei-Shaw/model-price-repo/main/model_prices_and_context_window.json")
+	v.SetDefault("pricing.hash_url", "https://raw.githubusercontent.com/Wei-Shaw/model-price-repo/main/model_prices_and_context_window.sha256")
+	v.SetDefault("pricing.data_dir", "./data")
+	v.SetDefault("pricing.fallback_file", "./resources/model-pricing/model_prices_and_context_window.json")
+	v.SetDefault("pricing.override_file", "")
+	v.SetDefault("pricing.update_interval_hours", 24)
+	v.SetDefault("pricing.hash_check_interval_minutes", 10)
 
 	// 本地进程插件。插件必须由管理员手动上传，项目默认不携带任何插件能力。
-	viper.SetDefault("plugins.data_dir", "")
-	viper.SetDefault("plugins.allow_unsigned", false)
-	viper.SetDefault("plugins.trusted_publishers", map[string]string{})
-	viper.SetDefault("plugins.max_upload_bytes", int64(128*1024*1024))
-	viper.SetDefault("plugins.max_uncompressed_bytes", int64(256*1024*1024))
-	viper.SetDefault("plugins.start_timeout_seconds", 15)
+	v.SetDefault("plugins.data_dir", "")
+	v.SetDefault("plugins.allow_unsigned", false)
+	v.SetDefault("plugins.trusted_publishers", map[string]string{})
+	v.SetDefault("plugins.max_upload_bytes", int64(128*1024*1024))
+	v.SetDefault("plugins.max_uncompressed_bytes", int64(256*1024*1024))
+	v.SetDefault("plugins.start_timeout_seconds", 15)
 
 	// Timezone (default to Asia/Shanghai for Chinese users)
-	viper.SetDefault("timezone", "Asia/Shanghai")
+	v.SetDefault("timezone", "Asia/Shanghai")
 
 	// API Key auth cache
-	viper.SetDefault("api_key_auth_cache.l1_size", 65535)
-	viper.SetDefault("api_key_auth_cache.l1_ttl_seconds", 15)
-	viper.SetDefault("api_key_auth_cache.l2_ttl_seconds", 300)
-	viper.SetDefault("api_key_auth_cache.negative_ttl_seconds", 30)
-	viper.SetDefault("api_key_auth_cache.jitter_percent", 10)
-	viper.SetDefault("api_key_auth_cache.singleflight", true)
-	viper.SetDefault("api_key_auth_cache.lookup_concurrency", 64)
-	viper.SetDefault("api_key_auth_cache.invalid_abuse.enabled", true)
-	viper.SetDefault("api_key_auth_cache.invalid_abuse.threshold", 120)
-	viper.SetDefault("api_key_auth_cache.invalid_abuse.window_seconds", 60)
-	viper.SetDefault("api_key_auth_cache.invalid_abuse.block_seconds", 60)
-	viper.SetDefault("api_key_auth_cache.invalid_abuse.capacity", 16384)
-	viper.SetDefault("api_key_create.max_active_per_user", 200)
-	viper.SetDefault("api_key_create.max_per_user_per_hour", 60)
+	v.SetDefault("api_key_auth_cache.l1_size", 65535)
+	v.SetDefault("api_key_auth_cache.l1_ttl_seconds", 15)
+	v.SetDefault("api_key_auth_cache.l2_ttl_seconds", 300)
+	v.SetDefault("api_key_auth_cache.negative_ttl_seconds", 30)
+	v.SetDefault("api_key_auth_cache.jitter_percent", 10)
+	v.SetDefault("api_key_auth_cache.singleflight", true)
+	v.SetDefault("api_key_auth_cache.lookup_concurrency", 64)
+	v.SetDefault("api_key_auth_cache.invalid_abuse.enabled", true)
+	v.SetDefault("api_key_auth_cache.invalid_abuse.threshold", 120)
+	v.SetDefault("api_key_auth_cache.invalid_abuse.window_seconds", 60)
+	v.SetDefault("api_key_auth_cache.invalid_abuse.block_seconds", 60)
+	v.SetDefault("api_key_auth_cache.invalid_abuse.capacity", 16384)
+	v.SetDefault("api_key_create.max_active_per_user", 200)
+	v.SetDefault("api_key_create.max_per_user_per_hour", 60)
 
 	// Subscription auth L1 cache
-	viper.SetDefault("subscription_cache.l1_size", 16384)
-	viper.SetDefault("subscription_cache.l1_ttl_seconds", 10)
-	viper.SetDefault("subscription_cache.jitter_percent", 10)
+	v.SetDefault("subscription_cache.l1_size", 16384)
+	v.SetDefault("subscription_cache.l1_ttl_seconds", 10)
+	v.SetDefault("subscription_cache.jitter_percent", 10)
 
 	// Dashboard cache
-	viper.SetDefault("dashboard_cache.enabled", true)
-	viper.SetDefault("dashboard_cache.key_prefix", "sub2api:")
-	viper.SetDefault("dashboard_cache.stats_fresh_ttl_seconds", 15)
-	viper.SetDefault("dashboard_cache.stats_ttl_seconds", 30)
-	viper.SetDefault("dashboard_cache.stats_refresh_timeout_seconds", 30)
+	v.SetDefault("dashboard_cache.enabled", true)
+	v.SetDefault("dashboard_cache.key_prefix", "sub2api:")
+	v.SetDefault("dashboard_cache.stats_fresh_ttl_seconds", 15)
+	v.SetDefault("dashboard_cache.stats_ttl_seconds", 30)
+	v.SetDefault("dashboard_cache.stats_refresh_timeout_seconds", 30)
 
 	// Dashboard aggregation
-	viper.SetDefault("dashboard_aggregation.enabled", true)
-	viper.SetDefault("dashboard_aggregation.interval_seconds", 60)
-	viper.SetDefault("dashboard_aggregation.lookback_seconds", 120)
-	viper.SetDefault("dashboard_aggregation.backfill_enabled", false)
-	viper.SetDefault("dashboard_aggregation.backfill_max_days", 31)
-	viper.SetDefault("dashboard_aggregation.retention.usage_logs_days", 90)
-	viper.SetDefault("dashboard_aggregation.retention.usage_billing_dedup_days", 365)
-	viper.SetDefault("dashboard_aggregation.retention.hourly_days", 180)
-	viper.SetDefault("dashboard_aggregation.retention.daily_days", 730)
-	viper.SetDefault("dashboard_aggregation.recompute_days", 2)
+	v.SetDefault("dashboard_aggregation.enabled", true)
+	v.SetDefault("dashboard_aggregation.interval_seconds", 60)
+	v.SetDefault("dashboard_aggregation.lookback_seconds", 120)
+	v.SetDefault("dashboard_aggregation.backfill_enabled", false)
+	v.SetDefault("dashboard_aggregation.backfill_max_days", 31)
+	v.SetDefault("dashboard_aggregation.retention.usage_logs_days", 90)
+	v.SetDefault("dashboard_aggregation.retention.usage_billing_dedup_days", 365)
+	v.SetDefault("dashboard_aggregation.retention.hourly_days", 180)
+	v.SetDefault("dashboard_aggregation.retention.daily_days", 730)
+	v.SetDefault("dashboard_aggregation.recompute_days", 2)
 
 	// Usage cleanup task
-	viper.SetDefault("usage_cleanup.enabled", true)
-	viper.SetDefault("usage_cleanup.max_range_days", 31)
-	viper.SetDefault("usage_cleanup.batch_size", 5000)
-	viper.SetDefault("usage_cleanup.worker_interval_seconds", 10)
-	viper.SetDefault("usage_cleanup.task_timeout_seconds", 1800)
+	v.SetDefault("usage_cleanup.enabled", true)
+	v.SetDefault("usage_cleanup.max_range_days", 31)
+	v.SetDefault("usage_cleanup.batch_size", 5000)
+	v.SetDefault("usage_cleanup.worker_interval_seconds", 10)
+	v.SetDefault("usage_cleanup.task_timeout_seconds", 1800)
 
 	// Idempotency
-	viper.SetDefault("idempotency.observe_only", true)
-	viper.SetDefault("idempotency.default_ttl_seconds", 86400)
-	viper.SetDefault("idempotency.system_operation_ttl_seconds", 3600)
-	viper.SetDefault("idempotency.processing_timeout_seconds", 30)
-	viper.SetDefault("idempotency.failed_retry_backoff_seconds", 5)
-	viper.SetDefault("idempotency.max_stored_response_len", 64*1024)
-	viper.SetDefault("idempotency.cleanup_interval_seconds", 60)
-	viper.SetDefault("idempotency.cleanup_batch_size", 500)
+	v.SetDefault("idempotency.observe_only", true)
+	v.SetDefault("idempotency.default_ttl_seconds", 86400)
+	v.SetDefault("idempotency.system_operation_ttl_seconds", 3600)
+	v.SetDefault("idempotency.processing_timeout_seconds", 30)
+	v.SetDefault("idempotency.failed_retry_backoff_seconds", 5)
+	v.SetDefault("idempotency.max_stored_response_len", 64*1024)
+	v.SetDefault("idempotency.cleanup_interval_seconds", 60)
+	v.SetDefault("idempotency.cleanup_batch_size", 500)
 
 	// Gateway
-	viper.SetDefault("gateway.response_header_timeout", 600) // 600秒(10分钟)等待上游响应头，LLM高负载时可能排队较久
-	viper.SetDefault("gateway.openai_response_header_timeout", 0)
-	viper.SetDefault("gateway.grok_response_header_timeout", 120)
-	viper.SetDefault("gateway.openai_first_output_timeout_seconds", 0)
-	viper.SetDefault("gateway.openai_high_effort_first_output_timeout_seconds", 0)
-	viper.SetDefault("gateway.log_upstream_error_body", true)
-	viper.SetDefault("gateway.log_upstream_error_body_max_bytes", 2048)
-	viper.SetDefault("gateway.inject_beta_for_apikey", false)
-	viper.SetDefault("gateway.failover_on_400", false)
-	viper.SetDefault("gateway.max_account_switches", 10)
-	viper.SetDefault("gateway.max_account_switches_gemini", 3)
-	viper.SetDefault("gateway.force_codex_cli", false)
-	viper.SetDefault("gateway.disable_codex_identity_enforcement", false)
-	viper.SetDefault("gateway.disable_codex_originator_normalization", false)
-	viper.SetDefault("gateway.codex_image_generation_bridge_enabled", false)
-	viper.SetDefault("gateway.openai_passthrough_allow_timeout_headers", false)
-	viper.SetDefault("gateway.openai_compact_model", "gpt-5.5")
-	viper.SetDefault("gateway.live.max_session_duration_seconds", 3600)
+	v.SetDefault("gateway.response_header_timeout", 600) // 600秒(10分钟)等待上游响应头，LLM高负载时可能排队较久
+	v.SetDefault("gateway.openai_response_header_timeout", 0)
+	v.SetDefault("gateway.grok_response_header_timeout", 120)
+	v.SetDefault("gateway.openai_first_output_timeout_seconds", 0)
+	v.SetDefault("gateway.openai_high_effort_first_output_timeout_seconds", 0)
+	v.SetDefault("gateway.log_upstream_error_body", true)
+	v.SetDefault("gateway.log_upstream_error_body_max_bytes", 2048)
+	v.SetDefault("gateway.inject_beta_for_apikey", false)
+	v.SetDefault("gateway.failover_on_400", false)
+	v.SetDefault("gateway.max_account_switches", 10)
+	v.SetDefault("gateway.max_account_switches_gemini", 3)
+	v.SetDefault("gateway.force_codex_cli", false)
+	v.SetDefault("gateway.disable_codex_identity_enforcement", false)
+	v.SetDefault("gateway.disable_codex_originator_normalization", false)
+	v.SetDefault("gateway.codex_image_generation_bridge_enabled", false)
+	v.SetDefault("gateway.openai_passthrough_allow_timeout_headers", false)
+	v.SetDefault("gateway.openai_compact_model", "gpt-5.5")
+	v.SetDefault("gateway.live.max_session_duration_seconds", 3600)
 	// OpenAI Responses WebSocket（默认开启；可通过 force_http 紧急回滚）
-	viper.SetDefault("gateway.openai_ws.enabled", true)
-	viper.SetDefault("gateway.openai_ws.mode_router_v2_enabled", false)
-	viper.SetDefault("gateway.openai_ws.ingress_mode_default", "ctx_pool")
-	viper.SetDefault("gateway.openai_ws.client_first_message_timeout_seconds", DefaultOpenAIWSClientFirstMessageTimeoutSeconds)
-	viper.SetDefault("gateway.openai_ws.ingress_inter_turn_idle_timeout_seconds", 300)
-	viper.SetDefault("gateway.openai_ws.max_ingress_connections_per_api_key", 64)
-	viper.SetDefault("gateway.openai_ws.oauth_enabled", true)
-	viper.SetDefault("gateway.openai_ws.apikey_enabled", true)
-	viper.SetDefault("gateway.openai_ws.force_http", false)
-	viper.SetDefault("gateway.openai_ws.allow_store_recovery", false)
-	viper.SetDefault("gateway.openai_ws.ingress_previous_response_recovery_enabled", true)
-	viper.SetDefault("gateway.openai_ws.store_disabled_conn_mode", "strict")
-	viper.SetDefault("gateway.openai_ws.store_disabled_force_new_conn", true)
-	viper.SetDefault("gateway.openai_ws.prewarm_generate_enabled", false)
-	viper.SetDefault("gateway.openai_ws.client_read_limit_bytes", 64*1024*1024)
-	viper.SetDefault("gateway.openai_ws.http_bridge_enabled", true)
-	viper.SetDefault("gateway.openai_ws.http_bridge_threshold_bytes", 15*1024*1024)
-	viper.SetDefault("gateway.openai_ws.responses_websockets", false)
-	viper.SetDefault("gateway.openai_ws.responses_websockets_v2", true)
-	viper.SetDefault("gateway.openai_ws.max_conns_per_account", 128)
-	viper.SetDefault("gateway.openai_ws.min_idle_per_account", 4)
-	viper.SetDefault("gateway.openai_ws.max_idle_per_account", 12)
-	viper.SetDefault("gateway.openai_ws.dynamic_max_conns_by_account_concurrency_enabled", true)
-	viper.SetDefault("gateway.openai_ws.oauth_max_conns_factor", 5.0)
-	viper.SetDefault("gateway.openai_ws.apikey_max_conns_factor", 5.0)
-	viper.SetDefault("gateway.openai_ws.dial_timeout_seconds", 10)
-	viper.SetDefault("gateway.openai_ws.read_timeout_seconds", 900)
-	viper.SetDefault("gateway.openai_ws.write_timeout_seconds", 120)
-	viper.SetDefault("gateway.openai_ws.pool_target_utilization", 0.7)
-	viper.SetDefault("gateway.openai_ws.queue_limit_per_conn", 64)
-	viper.SetDefault("gateway.openai_ws.event_flush_batch_size", 1)
-	viper.SetDefault("gateway.openai_ws.event_flush_interval_ms", 10)
-	viper.SetDefault("gateway.openai_ws.prewarm_cooldown_ms", 300)
-	viper.SetDefault("gateway.openai_ws.fallback_cooldown_seconds", 30)
-	viper.SetDefault("gateway.openai_ws.retry_backoff_initial_ms", 120)
-	viper.SetDefault("gateway.openai_ws.retry_backoff_max_ms", 2000)
-	viper.SetDefault("gateway.openai_ws.retry_jitter_ratio", 0.2)
-	viper.SetDefault("gateway.openai_ws.retry_total_budget_ms", 5000)
-	viper.SetDefault("gateway.openai_ws.payload_log_sample_rate", 0.2)
-	viper.SetDefault("gateway.openai_ws.lb_top_k", 7)
-	viper.SetDefault("gateway.openai_ws.sticky_session_ttl_seconds", 3600)
-	viper.SetDefault("gateway.openai_ws.session_hash_read_old_fallback", true)
-	viper.SetDefault("gateway.openai_ws.session_hash_dual_write_old", true)
-	viper.SetDefault("gateway.openai_ws.metadata_bridge_enabled", true)
-	viper.SetDefault("gateway.openai_ws.sticky_response_id_ttl_seconds", 3600)
-	viper.SetDefault("gateway.openai_ws.sticky_previous_response_ttl_seconds", 3600)
-	viper.SetDefault("gateway.openai_ws.scheduler_score_weights.priority", 1.0)
-	viper.SetDefault("gateway.openai_ws.scheduler_score_weights.load", 1.0)
-	viper.SetDefault("gateway.openai_ws.scheduler_score_weights.queue", 0.7)
-	viper.SetDefault("gateway.openai_ws.scheduler_score_weights.error_rate", 0.8)
-	viper.SetDefault("gateway.openai_ws.scheduler_score_weights.ttft", 0.5)
-	viper.SetDefault("gateway.openai_ws.scheduler_score_weights.reset", 0.0)
-	viper.SetDefault("gateway.openai_ws.scheduler_score_weights.quota_headroom", 0.0)
-	viper.SetDefault("gateway.openai_ws.scheduler_score_weights.upstream_cost", 0.0)
-	viper.SetDefault("gateway.openai_ws.scheduler_score_weights.previous_response", 5.0)
-	viper.SetDefault("gateway.openai_ws.scheduler_score_weights.session_sticky", 3.0)
+	v.SetDefault("gateway.openai_ws.enabled", true)
+	v.SetDefault("gateway.openai_ws.mode_router_v2_enabled", false)
+	v.SetDefault("gateway.openai_ws.ingress_mode_default", "ctx_pool")
+	v.SetDefault("gateway.openai_ws.client_first_message_timeout_seconds", DefaultOpenAIWSClientFirstMessageTimeoutSeconds)
+	v.SetDefault("gateway.openai_ws.ingress_inter_turn_idle_timeout_seconds", 300)
+	v.SetDefault("gateway.openai_ws.max_ingress_connections_per_api_key", 64)
+	v.SetDefault("gateway.openai_ws.oauth_enabled", true)
+	v.SetDefault("gateway.openai_ws.apikey_enabled", true)
+	v.SetDefault("gateway.openai_ws.force_http", false)
+	v.SetDefault("gateway.openai_ws.allow_store_recovery", false)
+	v.SetDefault("gateway.openai_ws.ingress_previous_response_recovery_enabled", true)
+	v.SetDefault("gateway.openai_ws.store_disabled_conn_mode", "strict")
+	v.SetDefault("gateway.openai_ws.store_disabled_force_new_conn", true)
+	v.SetDefault("gateway.openai_ws.prewarm_generate_enabled", false)
+	v.SetDefault("gateway.openai_ws.client_read_limit_bytes", 64*1024*1024)
+	v.SetDefault("gateway.openai_ws.http_bridge_enabled", true)
+	v.SetDefault("gateway.openai_ws.http_bridge_threshold_bytes", 15*1024*1024)
+	v.SetDefault("gateway.openai_ws.responses_websockets", false)
+	v.SetDefault("gateway.openai_ws.responses_websockets_v2", true)
+	v.SetDefault("gateway.openai_ws.max_conns_per_account", 128)
+	v.SetDefault("gateway.openai_ws.min_idle_per_account", 4)
+	v.SetDefault("gateway.openai_ws.max_idle_per_account", 12)
+	v.SetDefault("gateway.openai_ws.dynamic_max_conns_by_account_concurrency_enabled", true)
+	v.SetDefault("gateway.openai_ws.oauth_max_conns_factor", 5.0)
+	v.SetDefault("gateway.openai_ws.apikey_max_conns_factor", 5.0)
+	v.SetDefault("gateway.openai_ws.dial_timeout_seconds", 10)
+	v.SetDefault("gateway.openai_ws.read_timeout_seconds", 900)
+	v.SetDefault("gateway.openai_ws.write_timeout_seconds", 120)
+	v.SetDefault("gateway.openai_ws.pool_target_utilization", 0.7)
+	v.SetDefault("gateway.openai_ws.queue_limit_per_conn", 64)
+	v.SetDefault("gateway.openai_ws.event_flush_batch_size", 1)
+	v.SetDefault("gateway.openai_ws.event_flush_interval_ms", 10)
+	v.SetDefault("gateway.openai_ws.prewarm_cooldown_ms", 300)
+	v.SetDefault("gateway.openai_ws.fallback_cooldown_seconds", 30)
+	v.SetDefault("gateway.openai_ws.retry_backoff_initial_ms", 120)
+	v.SetDefault("gateway.openai_ws.retry_backoff_max_ms", 2000)
+	v.SetDefault("gateway.openai_ws.retry_jitter_ratio", 0.2)
+	v.SetDefault("gateway.openai_ws.retry_total_budget_ms", 5000)
+	v.SetDefault("gateway.openai_ws.payload_log_sample_rate", 0.2)
+	v.SetDefault("gateway.openai_ws.lb_top_k", 7)
+	v.SetDefault("gateway.openai_ws.sticky_session_ttl_seconds", 3600)
+	v.SetDefault("gateway.openai_ws.session_hash_read_old_fallback", true)
+	v.SetDefault("gateway.openai_ws.session_hash_dual_write_old", true)
+	v.SetDefault("gateway.openai_ws.metadata_bridge_enabled", true)
+	v.SetDefault("gateway.openai_ws.sticky_response_id_ttl_seconds", 3600)
+	v.SetDefault("gateway.openai_ws.sticky_previous_response_ttl_seconds", 3600)
+	v.SetDefault("gateway.openai_ws.scheduler_score_weights.priority", 1.0)
+	v.SetDefault("gateway.openai_ws.scheduler_score_weights.load", 1.0)
+	v.SetDefault("gateway.openai_ws.scheduler_score_weights.queue", 0.7)
+	v.SetDefault("gateway.openai_ws.scheduler_score_weights.error_rate", 0.8)
+	v.SetDefault("gateway.openai_ws.scheduler_score_weights.ttft", 0.5)
+	v.SetDefault("gateway.openai_ws.scheduler_score_weights.reset", 0.0)
+	v.SetDefault("gateway.openai_ws.scheduler_score_weights.quota_headroom", 0.0)
+	v.SetDefault("gateway.openai_ws.scheduler_score_weights.upstream_cost", 0.0)
+	v.SetDefault("gateway.openai_ws.scheduler_score_weights.previous_response", 5.0)
+	v.SetDefault("gateway.openai_ws.scheduler_score_weights.session_sticky", 3.0)
 	// OpenAI HTTP upstream protocol strategy
-	viper.SetDefault("gateway.openai_http2.enabled", true)
-	viper.SetDefault("gateway.openai_http2.allow_proxy_fallback_to_http1", true)
-	viper.SetDefault("gateway.openai_http2.fallback_error_threshold", 2)
-	viper.SetDefault("gateway.openai_http2.fallback_window_seconds", 60)
-	viper.SetDefault("gateway.openai_http2.fallback_ttl_seconds", 600)
-	viper.SetDefault("gateway.openai_proxy_stream_circuit.disabled", false)
-	viper.SetDefault("gateway.openai_proxy_stream_circuit.failure_threshold", 2)
-	viper.SetDefault("gateway.openai_proxy_stream_circuit.window_seconds", 60)
-	viper.SetDefault("gateway.openai_proxy_stream_circuit.ttl_seconds", 600)
+	v.SetDefault("gateway.openai_http2.enabled", true)
+	v.SetDefault("gateway.openai_http2.allow_proxy_fallback_to_http1", true)
+	v.SetDefault("gateway.openai_http2.fallback_error_threshold", 2)
+	v.SetDefault("gateway.openai_http2.fallback_window_seconds", 60)
+	v.SetDefault("gateway.openai_http2.fallback_ttl_seconds", 600)
+	v.SetDefault("gateway.openai_proxy_stream_circuit.disabled", false)
+	v.SetDefault("gateway.openai_proxy_stream_circuit.failure_threshold", 2)
+	v.SetDefault("gateway.openai_proxy_stream_circuit.window_seconds", 60)
+	v.SetDefault("gateway.openai_proxy_stream_circuit.ttl_seconds", 600)
 	// Grok free-tier local soft gate (scheduler-only; admin QueryQuota does not use this).
 	// Enabled by default because free detection requires an explicit free tier marker.
-	viper.SetDefault("gateway.grok.free_quota_soft_gate_enabled", true)
-	viper.SetDefault("gateway.grok.password_auth_enabled", false)
+	v.SetDefault("gateway.grok.free_quota_soft_gate_enabled", true)
+	v.SetDefault("gateway.grok.password_auth_enabled", false)
 	// Free soft-gate nominal limit: 500k tokens / rolling 24h (operator policy).
-	viper.SetDefault("gateway.grok.free_quota_token_limit", int64(500_000))
-	viper.SetDefault("gateway.grok.free_quota_soft_gate_percent", 95)
-	viper.SetDefault("gateway.grok.free_quota_window_hours", 24)
-	viper.SetDefault("gateway.grok.free_quota_stats_cache_seconds", 60)
+	v.SetDefault("gateway.grok.free_quota_token_limit", int64(500_000))
+	v.SetDefault("gateway.grok.free_quota_soft_gate_percent", 95)
+	v.SetDefault("gateway.grok.free_quota_window_hours", 24)
+	v.SetDefault("gateway.grok.free_quota_stats_cache_seconds", 60)
 	// 国产供应商余额检测（kimi/deepseek payg；zhipu 无余额端点，仅靠响应式 429/402）。
-	viper.SetDefault("gateway.cn_providers.balance_check_enabled", true)
-	viper.SetDefault("gateway.cn_providers.balance_threshold", 0.5)
-	viper.SetDefault("gateway.cn_providers.balance_check_interval_minutes", 10)
-	viper.SetDefault("gateway.image_concurrency.enabled", false)
-	viper.SetDefault("gateway.image_concurrency.max_concurrent_requests", 0)
-	viper.SetDefault("gateway.image_concurrency.overflow_mode", ImageConcurrencyOverflowModeReject)
-	viper.SetDefault("gateway.image_concurrency.wait_timeout_seconds", 30)
-	viper.SetDefault("gateway.image_concurrency.max_waiting_requests", 100)
-	viper.SetDefault("gateway.antigravity_fallback_cooldown_minutes", 1)
-	viper.SetDefault("gateway.antigravity_extra_retries", 10)
-	viper.SetDefault("gateway.max_body_size", int64(256*1024*1024))
-	viper.SetDefault("gateway.text_max_body_size", int64(32*1024*1024))
-	viper.SetDefault("gateway.upstream_response_read_max_bytes", DefaultUpstreamResponseReadMaxBytes)
-	viper.SetDefault("gateway.models_list_read_max_bytes", DefaultModelsListReadMaxBytes)
-	viper.SetDefault("gateway.proxy_probe_response_read_max_bytes", int64(1024*1024))
-	viper.SetDefault("gateway.gemini_debug_response_headers", false)
-	viper.SetDefault("gateway.connection_pool_isolation", ConnectionPoolIsolationAccountProxy)
+	v.SetDefault("gateway.cn_providers.balance_check_enabled", true)
+	v.SetDefault("gateway.cn_providers.balance_threshold", 0.5)
+	v.SetDefault("gateway.cn_providers.balance_check_interval_minutes", 10)
+	v.SetDefault("gateway.image_concurrency.enabled", false)
+	v.SetDefault("gateway.image_concurrency.max_concurrent_requests", 0)
+	v.SetDefault("gateway.image_concurrency.overflow_mode", ImageConcurrencyOverflowModeReject)
+	v.SetDefault("gateway.image_concurrency.wait_timeout_seconds", 30)
+	v.SetDefault("gateway.image_concurrency.max_waiting_requests", 100)
+	v.SetDefault("gateway.antigravity_fallback_cooldown_minutes", 1)
+	v.SetDefault("gateway.antigravity_extra_retries", 10)
+	v.SetDefault("gateway.max_body_size", int64(256*1024*1024))
+	v.SetDefault("gateway.text_max_body_size", int64(32*1024*1024))
+	v.SetDefault("gateway.upstream_response_read_max_bytes", DefaultUpstreamResponseReadMaxBytes)
+	v.SetDefault("gateway.models_list_read_max_bytes", DefaultModelsListReadMaxBytes)
+	v.SetDefault("gateway.proxy_probe_response_read_max_bytes", int64(1024*1024))
+	v.SetDefault("gateway.gemini_debug_response_headers", false)
+	v.SetDefault("gateway.connection_pool_isolation", ConnectionPoolIsolationAccountProxy)
 	// HTTP 上游连接池配置（针对 5000+ 并发用户优化）
-	viper.SetDefault("gateway.max_idle_conns", 2560)          // 最大空闲连接总数（高并发场景可调大）
-	viper.SetDefault("gateway.max_idle_conns_per_host", 120)  // 每主机最大空闲连接（HTTP/2 场景默认）
-	viper.SetDefault("gateway.max_conns_per_host", 1024)      // 每主机最大连接数（含活跃；流式/HTTP1.1 场景可调大，如 2400+）
-	viper.SetDefault("gateway.idle_conn_timeout_seconds", 90) // 空闲连接超时（秒）
-	viper.SetDefault("gateway.max_upstream_clients", 5000)
-	viper.SetDefault("gateway.client_idle_ttl_seconds", 900)
-	viper.SetDefault("gateway.concurrency_slot_ttl_minutes", 30) // 并发槽位过期时间（支持超长请求）
-	viper.SetDefault("gateway.stream_data_interval_timeout", 180)
-	viper.SetDefault("gateway.stream_keepalive_interval", 10)
-	viper.SetDefault("gateway.image_stream_data_interval_timeout", 900)
-	viper.SetDefault("gateway.image_stream_keepalive_interval", 10)
-	viper.SetDefault("gateway.image_nonstream_keepalive_interval", 0)
-	viper.SetDefault("gateway.max_line_size", 500*1024*1024)
-	viper.SetDefault("gateway.scheduling.sticky_session_max_waiting", 3)
-	viper.SetDefault("gateway.scheduling.sticky_session_wait_timeout", 120*time.Second)
-	viper.SetDefault("gateway.scheduling.fallback_wait_timeout", 30*time.Second)
-	viper.SetDefault("gateway.scheduling.fallback_max_waiting", 100)
-	viper.SetDefault("gateway.scheduling.fallback_selection_mode", "last_used")
-	viper.SetDefault("gateway.scheduling.prefer_soonest_reset", false)
-	viper.SetDefault("gateway.scheduling.load_batch_enabled", true)
-	viper.SetDefault("gateway.scheduling.load_batch_cache_ttl_ms", 200)
-	viper.SetDefault("gateway.scheduling.snapshot_mget_chunk_size", 128)
-	viper.SetDefault("gateway.scheduling.snapshot_write_chunk_size", 256)
-	viper.SetDefault("gateway.scheduling.slot_cleanup_interval", 30*time.Second)
-	viper.SetDefault("gateway.scheduling.db_fallback_enabled", true)
-	viper.SetDefault("gateway.scheduling.db_fallback_timeout_seconds", 0)
-	viper.SetDefault("gateway.scheduling.db_fallback_max_qps", 0)
-	viper.SetDefault("gateway.scheduling.outbox_poll_interval_seconds", 1)
-	viper.SetDefault("gateway.scheduling.outbox_lag_warn_seconds", 5)
-	viper.SetDefault("gateway.scheduling.outbox_lag_rebuild_seconds", 10)
-	viper.SetDefault("gateway.scheduling.outbox_lag_rebuild_failures", 3)
-	viper.SetDefault("gateway.scheduling.outbox_backlog_rebuild_rows", 10000)
-	viper.SetDefault("gateway.scheduling.full_rebuild_interval_seconds", 300)
-	viper.SetDefault("gateway.usage_record.worker_count", 128)
-	viper.SetDefault("gateway.usage_record.queue_size", 16384)
-	viper.SetDefault("gateway.usage_record.task_timeout_seconds", 5)
+	v.SetDefault("gateway.max_idle_conns", 2560)          // 最大空闲连接总数（高并发场景可调大）
+	v.SetDefault("gateway.max_idle_conns_per_host", 120)  // 每主机最大空闲连接（HTTP/2 场景默认）
+	v.SetDefault("gateway.max_conns_per_host", 1024)      // 每主机最大连接数（含活跃；流式/HTTP1.1 场景可调大，如 2400+）
+	v.SetDefault("gateway.idle_conn_timeout_seconds", 90) // 空闲连接超时（秒）
+	v.SetDefault("gateway.max_upstream_clients", 5000)
+	v.SetDefault("gateway.client_idle_ttl_seconds", 900)
+	v.SetDefault("gateway.concurrency_slot_ttl_minutes", 30) // 并发槽位过期时间（支持超长请求）
+	v.SetDefault("gateway.stream_data_interval_timeout", 180)
+	v.SetDefault("gateway.stream_keepalive_interval", 10)
+	v.SetDefault("gateway.image_stream_data_interval_timeout", 900)
+	v.SetDefault("gateway.image_stream_keepalive_interval", 10)
+	v.SetDefault("gateway.image_nonstream_keepalive_interval", 0)
+	v.SetDefault("gateway.max_line_size", 500*1024*1024)
+	v.SetDefault("gateway.scheduling.sticky_session_max_waiting", 3)
+	v.SetDefault("gateway.scheduling.sticky_session_wait_timeout", 120*time.Second)
+	v.SetDefault("gateway.scheduling.fallback_wait_timeout", 30*time.Second)
+	v.SetDefault("gateway.scheduling.fallback_max_waiting", 100)
+	v.SetDefault("gateway.scheduling.fallback_selection_mode", "last_used")
+	v.SetDefault("gateway.scheduling.prefer_soonest_reset", false)
+	v.SetDefault("gateway.scheduling.load_batch_enabled", true)
+	v.SetDefault("gateway.scheduling.load_batch_cache_ttl_ms", 200)
+	v.SetDefault("gateway.scheduling.snapshot_mget_chunk_size", 128)
+	v.SetDefault("gateway.scheduling.snapshot_write_chunk_size", 256)
+	v.SetDefault("gateway.scheduling.slot_cleanup_interval", 30*time.Second)
+	v.SetDefault("gateway.scheduling.db_fallback_enabled", true)
+	v.SetDefault("gateway.scheduling.db_fallback_timeout_seconds", 0)
+	v.SetDefault("gateway.scheduling.db_fallback_max_qps", 0)
+	v.SetDefault("gateway.scheduling.outbox_poll_interval_seconds", 1)
+	v.SetDefault("gateway.scheduling.outbox_lag_warn_seconds", 5)
+	v.SetDefault("gateway.scheduling.outbox_lag_rebuild_seconds", 10)
+	v.SetDefault("gateway.scheduling.outbox_lag_rebuild_failures", 3)
+	v.SetDefault("gateway.scheduling.outbox_backlog_rebuild_rows", 10000)
+	v.SetDefault("gateway.scheduling.full_rebuild_interval_seconds", 300)
+	v.SetDefault("gateway.usage_record.worker_count", 128)
+	v.SetDefault("gateway.usage_record.queue_size", 16384)
+	v.SetDefault("gateway.usage_record.task_timeout_seconds", 5)
 	// 默认 sync：队列满时由提交方内联执行（提交点在响应写出之后，不阻塞客户端）。
 	// sample/drop 会在溢出时静默丢弃计费任务，造成扣费与 usage_logs 对账缺口（issue #3656），
 	// 仅供显式配置的运维场景使用。
-	viper.SetDefault("gateway.usage_record.overflow_policy", UsageRecordOverflowPolicySync)
-	viper.SetDefault("gateway.usage_record.overflow_sample_percent", 10)
-	viper.SetDefault("gateway.usage_record.auto_scale_enabled", true)
-	viper.SetDefault("gateway.usage_record.auto_scale_min_workers", 128)
-	viper.SetDefault("gateway.usage_record.auto_scale_max_workers", 512)
-	viper.SetDefault("gateway.usage_record.auto_scale_up_queue_percent", 70)
-	viper.SetDefault("gateway.usage_record.auto_scale_down_queue_percent", 15)
-	viper.SetDefault("gateway.usage_record.auto_scale_up_step", 32)
-	viper.SetDefault("gateway.usage_record.auto_scale_down_step", 16)
-	viper.SetDefault("gateway.usage_record.auto_scale_check_interval_seconds", 3)
-	viper.SetDefault("gateway.usage_record.auto_scale_cooldown_seconds", 10)
-	viper.SetDefault("gateway.user_group_rate_cache_ttl_seconds", 30)
-	viper.SetDefault("gateway.models_list_cache_ttl_seconds", 15)
+	v.SetDefault("gateway.usage_record.overflow_policy", UsageRecordOverflowPolicySync)
+	v.SetDefault("gateway.usage_record.overflow_sample_percent", 10)
+	v.SetDefault("gateway.usage_record.auto_scale_enabled", true)
+	v.SetDefault("gateway.usage_record.auto_scale_min_workers", 128)
+	v.SetDefault("gateway.usage_record.auto_scale_max_workers", 512)
+	v.SetDefault("gateway.usage_record.auto_scale_up_queue_percent", 70)
+	v.SetDefault("gateway.usage_record.auto_scale_down_queue_percent", 15)
+	v.SetDefault("gateway.usage_record.auto_scale_up_step", 32)
+	v.SetDefault("gateway.usage_record.auto_scale_down_step", 16)
+	v.SetDefault("gateway.usage_record.auto_scale_check_interval_seconds", 3)
+	v.SetDefault("gateway.usage_record.auto_scale_cooldown_seconds", 10)
+	v.SetDefault("gateway.user_group_rate_cache_ttl_seconds", 30)
+	v.SetDefault("gateway.models_list_cache_ttl_seconds", 15)
 	// TLS指纹伪装配置（默认关闭，需要账号级别单独启用）
 	// 用户消息串行队列默认值
-	viper.SetDefault("gateway.user_message_queue.enabled", false)
-	viper.SetDefault("gateway.user_message_queue.lock_ttl_ms", 120000)
-	viper.SetDefault("gateway.user_message_queue.wait_timeout_ms", 30000)
-	viper.SetDefault("gateway.user_message_queue.min_delay_ms", 200)
-	viper.SetDefault("gateway.user_message_queue.max_delay_ms", 2000)
-	viper.SetDefault("gateway.user_message_queue.cleanup_interval_seconds", 60)
+	v.SetDefault("gateway.user_message_queue.enabled", false)
+	v.SetDefault("gateway.user_message_queue.lock_ttl_ms", 120000)
+	v.SetDefault("gateway.user_message_queue.wait_timeout_ms", 30000)
+	v.SetDefault("gateway.user_message_queue.min_delay_ms", 200)
+	v.SetDefault("gateway.user_message_queue.max_delay_ms", 2000)
+	v.SetDefault("gateway.user_message_queue.cleanup_interval_seconds", 60)
 
-	viper.SetDefault("gateway.tls_fingerprint.enabled", true)
-	viper.SetDefault("concurrency.ping_interval", 10)
+	v.SetDefault("gateway.tls_fingerprint.enabled", true)
+	v.SetDefault("concurrency.ping_interval", 10)
 
 	// TokenRefresh
-	viper.SetDefault("token_refresh.enabled", true)
-	viper.SetDefault("token_refresh.check_interval_minutes", 5)        // 每5分钟检查一次
-	viper.SetDefault("token_refresh.refresh_before_expiry_hours", 0.5) // 提前30分钟刷新（适配Google 1小时token）
-	viper.SetDefault("token_refresh.max_retries", 3)                   // 最多重试3次
-	viper.SetDefault("token_refresh.retry_backoff_seconds", 2)         // 重试退避基础2秒
-	viper.SetDefault("token_refresh.candidate_page_size", 200)
-	viper.SetDefault("token_refresh.provider_concurrency", 4)
-	viper.SetDefault("token_refresh.provider_qps", 2)
-	viper.SetDefault("token_refresh.provider_failure_threshold", 3)
-	viper.SetDefault("token_refresh.attempt_timeout_seconds", 15)
-	viper.SetDefault("token_refresh.cycle_timeout_seconds", 240)
+	v.SetDefault("token_refresh.enabled", true)
+	v.SetDefault("token_refresh.check_interval_minutes", 5)        // 每5分钟检查一次
+	v.SetDefault("token_refresh.refresh_before_expiry_hours", 0.5) // 提前30分钟刷新（适配Google 1小时token）
+	v.SetDefault("token_refresh.max_retries", 3)                   // 最多重试3次
+	v.SetDefault("token_refresh.retry_backoff_seconds", 2)         // 重试退避基础2秒
+	v.SetDefault("token_refresh.candidate_page_size", 200)
+	v.SetDefault("token_refresh.provider_concurrency", 4)
+	v.SetDefault("token_refresh.provider_qps", 2)
+	v.SetDefault("token_refresh.provider_failure_threshold", 3)
+	v.SetDefault("token_refresh.attempt_timeout_seconds", 15)
+	v.SetDefault("token_refresh.cycle_timeout_seconds", 240)
 
 	// Gemini OAuth - configure via environment variables or config file
 	// GEMINI_OAUTH_CLIENT_ID and GEMINI_OAUTH_CLIENT_SECRET
 	// Default: uses Gemini CLI public credentials (set via environment)
-	viper.SetDefault("gemini.oauth.client_id", "")
-	viper.SetDefault("gemini.oauth.client_secret", "")
-	viper.SetDefault("gemini.oauth.scopes", "")
-	viper.SetDefault("gemini.quota.policy", "")
+	v.SetDefault("gemini.oauth.client_id", "")
+	v.SetDefault("gemini.oauth.client_secret", "")
+	v.SetDefault("gemini.oauth.scopes", "")
+	v.SetDefault("gemini.quota.policy", "")
 
 	// Subscription Maintenance (bounded queue + worker pool)
-	viper.SetDefault("subscription_maintenance.worker_count", 2)
-	viper.SetDefault("subscription_maintenance.queue_size", 1024)
+	v.SetDefault("subscription_maintenance.worker_count", 2)
+	v.SetDefault("subscription_maintenance.queue_size", 1024)
 
-	setEnvReachableDefaults()
+	setEnvReachableDefaults(v)
 }
 
 // setEnvReachableDefaults registers zero-valued defaults for keys that are
@@ -2638,20 +2817,20 @@ func setDefaults() {
 // zero keeps behavior identical while making the key addressable from the
 // environment. Any subsystem that wants a richer default still applies it after
 // unmarshal, exactly as before.
-func setEnvReachableDefaults() {
-	viper.SetDefault("gateway.forced_codex_instructions_template_file", "")
-	viper.SetDefault("gateway.session_idle_timeout_minutes", 0)
-	viper.SetDefault("gateway.user_message_queue.mode", "")
-	viper.SetDefault("update.proxy_url", "")
+func setEnvReachableDefaults(v *viper.Viper) {
+	v.SetDefault("gateway.forced_codex_instructions_template_file", "")
+	v.SetDefault("gateway.session_idle_timeout_minutes", 0)
+	v.SetDefault("gateway.user_message_queue.mode", "")
+	v.SetDefault("update.proxy_url", "")
 
 	// sticky_escape_enabled is the one exception to the zero-value rule: its
 	// effective default is true, applied post-unmarshal via a viper.IsSet guard.
 	// Registering false would make IsSet always report true and permanently
 	// disable sticky escape, so register the effective default instead. An
 	// explicit false in config or env still wins.
-	viper.SetDefault("gateway.openai_scheduler.sticky_escape_enabled", true)
-	viper.SetDefault("gateway.openai_scheduler.sticky_escape_error_rate", 0.0)
-	viper.SetDefault("gateway.openai_scheduler.sticky_escape_ttft_ms", 0)
+	v.SetDefault("gateway.openai_scheduler.sticky_escape_enabled", true)
+	v.SetDefault("gateway.openai_scheduler.sticky_escape_error_rate", 0.0)
+	v.SetDefault("gateway.openai_scheduler.sticky_escape_ttft_ms", 0)
 
 	// server.trusted_proxies and security.forwarded_client_ip_headers are the
 	// other exception: load() distinguishes explicit configuration from absence
@@ -2669,37 +2848,37 @@ func setEnvReachableDefaults() {
 	// the settings an operator expects to inject via the environment, but every
 	// key here was previously unreachable that way.
 	for _, provider := range []string{"github_oauth", "google_oauth"} {
-		viper.SetDefault(provider+".enabled", false)
-		viper.SetDefault(provider+".client_id", "")
-		viper.SetDefault(provider+".client_secret", "")
-		viper.SetDefault(provider+".authorize_url", "")
-		viper.SetDefault(provider+".token_url", "")
-		viper.SetDefault(provider+".userinfo_url", "")
-		viper.SetDefault(provider+".emails_url", "")
-		viper.SetDefault(provider+".scopes", "")
-		viper.SetDefault(provider+".redirect_url", "")
-		viper.SetDefault(provider+".frontend_redirect_url", "")
+		v.SetDefault(provider+".enabled", false)
+		v.SetDefault(provider+".client_id", "")
+		v.SetDefault(provider+".client_secret", "")
+		v.SetDefault(provider+".authorize_url", "")
+		v.SetDefault(provider+".token_url", "")
+		v.SetDefault(provider+".userinfo_url", "")
+		v.SetDefault(provider+".emails_url", "")
+		v.SetDefault(provider+".scopes", "")
+		v.SetDefault(provider+".redirect_url", "")
+		v.SetDefault(provider+".frontend_redirect_url", "")
 	}
 
-	viper.SetDefault("dingtalk_connect.client_id", "")
-	viper.SetDefault("dingtalk_connect.client_secret", "")
-	viper.SetDefault("dingtalk_connect.internal_corp_id", "")
-	viper.SetDefault("dingtalk_connect.redirect_url", "")
-	viper.SetDefault("dingtalk_connect.bypass_registration", false)
-	viper.SetDefault("dingtalk_connect.username_attribute_key", "")
-	viper.SetDefault("dingtalk_connect.enable_attribute_matching", false)
-	viper.SetDefault("dingtalk_connect.enable_attribute_sync", false)
-	viper.SetDefault("dingtalk_connect.attribute_sync_fields", []string{})
-	viper.SetDefault("dingtalk_connect.attribute_sync_overwrite_policy", "")
-	viper.SetDefault("dingtalk_connect.sync_display_name", false)
-	viper.SetDefault("dingtalk_connect.sync_display_name_attr_key", "")
-	viper.SetDefault("dingtalk_connect.sync_display_name_attr_name", "")
-	viper.SetDefault("dingtalk_connect.sync_dept", false)
-	viper.SetDefault("dingtalk_connect.sync_dept_attr_key", "")
-	viper.SetDefault("dingtalk_connect.sync_dept_attr_name", "")
-	viper.SetDefault("dingtalk_connect.sync_corp_email", false)
-	viper.SetDefault("dingtalk_connect.sync_corp_email_attr_key", "")
-	viper.SetDefault("dingtalk_connect.sync_corp_email_attr_name", "")
+	v.SetDefault("dingtalk_connect.client_id", "")
+	v.SetDefault("dingtalk_connect.client_secret", "")
+	v.SetDefault("dingtalk_connect.internal_corp_id", "")
+	v.SetDefault("dingtalk_connect.redirect_url", "")
+	v.SetDefault("dingtalk_connect.bypass_registration", false)
+	v.SetDefault("dingtalk_connect.username_attribute_key", "")
+	v.SetDefault("dingtalk_connect.enable_attribute_matching", false)
+	v.SetDefault("dingtalk_connect.enable_attribute_sync", false)
+	v.SetDefault("dingtalk_connect.attribute_sync_fields", []string{})
+	v.SetDefault("dingtalk_connect.attribute_sync_overwrite_policy", "")
+	v.SetDefault("dingtalk_connect.sync_display_name", false)
+	v.SetDefault("dingtalk_connect.sync_display_name_attr_key", "")
+	v.SetDefault("dingtalk_connect.sync_display_name_attr_name", "")
+	v.SetDefault("dingtalk_connect.sync_dept", false)
+	v.SetDefault("dingtalk_connect.sync_dept_attr_key", "")
+	v.SetDefault("dingtalk_connect.sync_dept_attr_name", "")
+	v.SetDefault("dingtalk_connect.sync_corp_email", false)
+	v.SetDefault("dingtalk_connect.sync_corp_email_attr_key", "")
+	v.SetDefault("dingtalk_connect.sync_corp_email_attr_name", "")
 }
 
 func (c *Config) Validate() error {
@@ -3129,23 +3308,44 @@ func (c *Config) Validate() error {
 	if c.Database.ConnMaxIdleTimeMinutes < 0 {
 		return fmt.Errorf("database.conn_max_idle_time_minutes must be non-negative")
 	}
-	if c.Redis.DialTimeoutSeconds <= 0 {
-		return fmt.Errorf("redis.dial_timeout_seconds must be positive")
+	switch c.Database.Type {
+	case DatabaseTypePostgres:
+	case DatabaseTypeSQLite:
+		if strings.TrimSpace(c.Database.Path) == "" {
+			return fmt.Errorf("database.path must not be empty when database.type is sqlite")
+		}
+	default:
+		return fmt.Errorf("database.type must be postgres or sqlite, got %q", c.Database.Type)
 	}
-	if c.Redis.ReadTimeoutSeconds <= 0 {
-		return fmt.Errorf("redis.read_timeout_seconds must be positive")
-	}
-	if c.Redis.WriteTimeoutSeconds <= 0 {
-		return fmt.Errorf("redis.write_timeout_seconds must be positive")
-	}
-	if c.Redis.PoolSize <= 0 {
-		return fmt.Errorf("redis.pool_size must be positive")
-	}
-	if c.Redis.MinIdleConns < 0 {
-		return fmt.Errorf("redis.min_idle_conns must be non-negative")
-	}
-	if c.Redis.MinIdleConns > c.Redis.PoolSize {
-		return fmt.Errorf("redis.min_idle_conns cannot exceed redis.pool_size")
+	switch c.Redis.Type {
+	case CacheTypeRedis:
+		if c.Redis.DialTimeoutSeconds <= 0 {
+			return fmt.Errorf("redis.dial_timeout_seconds must be positive")
+		}
+		if c.Redis.ReadTimeoutSeconds <= 0 {
+			return fmt.Errorf("redis.read_timeout_seconds must be positive")
+		}
+		if c.Redis.WriteTimeoutSeconds <= 0 {
+			return fmt.Errorf("redis.write_timeout_seconds must be positive")
+		}
+		if c.Redis.PoolSize <= 0 {
+			return fmt.Errorf("redis.pool_size must be positive")
+		}
+		if c.Redis.MinIdleConns < 0 {
+			return fmt.Errorf("redis.min_idle_conns must be non-negative")
+		}
+		if c.Redis.MinIdleConns > c.Redis.PoolSize {
+			return fmt.Errorf("redis.min_idle_conns cannot exceed redis.pool_size")
+		}
+	case CacheTypeMemory:
+		if c.Redis.Memory.MaxCapacityMB <= 0 {
+			return fmt.Errorf("redis.memory.max_capacity_mb must be positive")
+		}
+		if c.Redis.Memory.GCIntervalSeconds <= 0 {
+			return fmt.Errorf("redis.memory.gc_interval_seconds must be positive")
+		}
+	default:
+		return fmt.Errorf("redis.type must be redis or memory, got %q", c.Redis.Type)
 	}
 	if c.BatchImage.QueueEnabled {
 		if strings.TrimSpace(c.BatchImage.QueueReadyKey) == "" {

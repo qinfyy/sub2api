@@ -103,7 +103,8 @@ var migrationChecksumCompatibilityRules = map[string]migrationChecksumCompatibil
 // 该函数可以在每次应用启动时安全调用：
 // - 已应用的迁移会被自动跳过（通过校验 filename 判断）
 // - 如果迁移文件内容被修改（checksum 不匹配），会返回错误
-// - 使用 PostgreSQL Advisory Lock 确保多实例并发安全
+// - PostgreSQL 使用 Advisory Lock 确保多实例并发安全
+// - SQLite 使用进程内互斥锁（单实例部署）
 //
 // 参数：
 //   - ctx: 上下文，用于超时控制和取消
@@ -114,6 +115,9 @@ var migrationChecksumCompatibilityRules = map[string]migrationChecksumCompatibil
 func ApplyMigrations(ctx context.Context, db *sql.DB) error {
 	if db == nil {
 		return errors.New("nil sql db")
+	}
+	if isSQLiteDB(db) {
+		return applySQLiteMigrationsFS(ctx, db)
 	}
 	return applyMigrationsFS(ctx, db, migrations.FS)
 }
@@ -139,6 +143,11 @@ func ApplyMigrations(ctx context.Context, db *sql.DB) error {
 func applyMigrationsFS(ctx context.Context, db *sql.DB, fsys fs.FS) error {
 	if db == nil {
 		return errors.New("nil sql db")
+	}
+	// SQLite 后端的基线 schema 由 Ent 维护，PostgreSQL 的 SQL 迁移包含
+	// JSONB / 数组 / PL/pgSQL 等方言特性，不适用于 SQLite。
+	if isSQLiteDB(db) {
+		return applySQLiteSchema(ctx, db)
 	}
 
 	// 获取分布式锁，确保多实例部署时只有一个实例执行迁移。

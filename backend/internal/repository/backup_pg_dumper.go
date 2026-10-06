@@ -15,15 +15,20 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
-// PgDumper implements service.DBDumper using pg_dump/psql
+// PgDumper implements service.DBDumper using pg_dump/psql.
+// SQLite 走 SQLiteDumper（VACUUM INTO），由 NewPgDumper 按配置分派。
 type PgDumper struct {
 	cfg            *config.DatabaseConfig
 	db             *sql.DB
 	commandContext func(context.Context, string, ...string) *exec.Cmd
 }
 
-// NewPgDumper creates a new PgDumper
+// NewPgDumper creates a DBDumper for the configured database backend.
+// PostgreSQL 走 pg_dump/psql，SQLite 走 VACUUM INTO。
 func NewPgDumper(cfg *config.Config, db *sql.DB) service.DBDumper {
+	if dialectOf(cfg) == config.DatabaseTypeSQLite {
+		return NewSQLiteDumper(cfg, db)
+	}
 	return &PgDumper{
 		cfg:            &cfg.Database,
 		db:             db,

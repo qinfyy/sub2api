@@ -35,6 +35,7 @@ func RegisterPaymentRoutes(
 	settingService *service.SettingService,
 	panelRateLimiter *middleware.PanelRateLimiter,
 	redisClient *redis.Client,
+	limiters ...*ratelimit.RateLimiter,
 ) {
 	// --- User-facing payment endpoints (authenticated) ---
 	authenticated := v1.Group("/payment")
@@ -68,6 +69,9 @@ func RegisterPaymentRoutes(
 	// enumeration. It fails open on Redis errors so an outage never blocks a
 	// user who is mid-payment from seeing their result.
 	publicRateLimiter := ratelimit.NewRateLimiter(redisClient)
+	if len(limiters) > 0 && limiters[0] != nil {
+		publicRateLimiter = limiters[0]
+	}
 	public := v1.Group("/payment/public")
 	{
 		public.POST("/orders/verify",

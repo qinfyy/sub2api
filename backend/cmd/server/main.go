@@ -148,10 +148,11 @@ func runMainServer() {
 		BuildType: BuildType,
 	}
 
-	app, err := initializeApplication(buildInfo)
+	app, closeResources, err := initializeApplication(buildInfo)
 	if err != nil {
 		log.Fatalf("Failed to initialize application: %v", err)
 	}
+	defer closeResources()
 	defer app.Cleanup()
 	if app.PluginManager != nil {
 		if err := app.PluginManager.Start(context.Background()); err != nil {
@@ -180,7 +181,12 @@ func runMainServer() {
 	// 等待中断信号
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
+	select {
+	case <-quit:
+	case err := <-app.Backends.Lost():
+		log.Printf("Deployment lock lost; stopping server: %v", err)
+		_ = app.Server.Close()
+	}
 
 	log.Println("Shutting down server...")
 

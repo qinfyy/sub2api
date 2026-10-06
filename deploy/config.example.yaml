@@ -842,10 +842,14 @@ concurrency:
   ping_interval: 10
 
 # =============================================================================
-# Database Configuration (PostgreSQL)
-# 数据库配置 (PostgreSQL)
+# Database Configuration (PostgreSQL or SQLite)
+# 数据库配置 (PostgreSQL 或 SQLite)
 # =============================================================================
 database:
+  # Database backend: postgres or sqlite
+  # 数据库类型：postgres 或 sqlite
+  # sqlite 为单实例嵌入式部署，不需要外部数据库服务
+  type: "postgres"
   # Database host address
   # 数据库主机地址
   host: "localhost"
@@ -865,6 +869,9 @@ database:
   # SSL 模式：disable（禁用）, prefer（优先加密，默认）, require（要求）, verify-ca（验证CA）, verify-full（完全验证）
   # 默认值为 "prefer"，数据库支持 SSL 时自动使用加密连接，不支持时回退明文
   sslmode: "prefer"
+  # SQLite database file path (only used when type is sqlite)
+  # SQLite 数据库文件路径（仅当 type 为 sqlite 时生效）
+  path: "data/sub2api.db"
   # Max open connections (高并发场景建议 256+，需配合 PostgreSQL max_connections 调整)
   # 最大打开连接数
   max_open_conns: 256
@@ -879,10 +886,14 @@ database:
   conn_max_idle_time_minutes: 5
 
 # =============================================================================
-# Redis Configuration
-# Redis 配置
+# Cache Configuration (Redis or in-memory)
+# 缓存配置 (Redis 或内存)
 # =============================================================================
 redis:
+  # Cache backend: redis or memory
+  # 缓存类型：redis 或 memory
+  # memory 为进程内缓存，仅支持单实例部署，不跨进程共享状态
+  type: "redis"
   # Redis host address
   # Redis 主机地址
   host: "localhost"
@@ -907,6 +918,15 @@ redis:
   # Enable TLS/SSL connection
   # 是否启用 TLS/SSL 连接
   enable_tls: false
+  # In-memory cache settings (only used when type is memory)
+  # 内存缓存配置（仅当 type 为 memory 时生效）
+  memory:
+    # Estimated memory budget for cached values in MB
+    # 缓存值内存容量上限（MB）
+    max_capacity_mb: 512
+    # Interval for purging expired entries
+    # 过期条目清理间隔（秒）
+    gc_interval_seconds: 60
 
 # =============================================================================
 # Ops Monitoring (Optional)

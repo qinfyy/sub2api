@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -88,21 +89,29 @@ type SetupConfig struct {
 }
 
 type DatabaseConfig struct {
+	Type     string `json:"type" yaml:"type"`
 	Host     string `json:"host" yaml:"host"`
 	Port     int    `json:"port" yaml:"port"`
 	User     string `json:"user" yaml:"user"`
 	Password string `json:"password" yaml:"password"`
 	DBName   string `json:"dbname" yaml:"dbname"`
 	SSLMode  string `json:"sslmode" yaml:"sslmode"`
+	Path     string `json:"path" yaml:"path"`
 }
 
 type RedisConfig struct {
+	Type      string `json:"type" yaml:"type"`
 	Host      string `json:"host" yaml:"host"`
 	Port      int    `json:"port" yaml:"port"`
 	Username  string `json:"username" yaml:"username"`
 	Password  string `json:"password" yaml:"password"`
 	DB        int    `json:"db" yaml:"db"`
 	EnableTLS bool   `json:"enable_tls" yaml:"enable_tls"`
+	Memory    struct {
+		PersistencePath   string `json:"persistence_path" yaml:"persistence_path"`
+		MaxCapacityMB     int    `json:"max_capacity_mb" yaml:"max_capacity_mb"`
+		GCIntervalSeconds int    `json:"gc_interval_seconds" yaml:"gc_interval_seconds"`
+	} `json:"memory" yaml:"memory"`
 }
 
 type AdminConfig struct {
@@ -214,7 +223,42 @@ type postgresDatabaseOpener func(*DatabaseConfig, string) (*sql.DB, error)
 
 // TestDatabaseConnection tests the database connection and creates database if not exists
 func TestDatabaseConnection(cfg *DatabaseConfig) error {
+	if strings.EqualFold(strings.TrimSpace(cfg.Type), "sqlite") {
+		db, err := openSetupSQLite(cfg)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = db.Close() }()
+		ctx, cancel := context.WithTimeout(context.Background(), databasePingTimeout)
+		defer cancel()
+		return db.PingContext(ctx)
+	}
 	return testDatabaseConnection(cfg, openAndPingPostgresDatabase)
+}
+
+func setupSQLiteConfig(cfg *DatabaseConfig) (config.DatabaseConfig, error) {
+	database := config.DatabaseConfig{Type: config.DatabaseTypeSQLite, Path: cfg.Path}
+	if err := database.ResolveSQLitePath(filepath.Dir(GetConfigFilePath())); err != nil {
+		return database, err
+	}
+	return database, nil
+}
+
+func openSetupSQLite(cfg *DatabaseConfig) (*sql.DB, error) {
+	database, err := setupSQLiteConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(database.Path), 0o750); err != nil {
+		return nil, fmt.Errorf("create sqlite directory: %w", err)
+	}
+	db, err := sql.Open("sqlite", database.SQLiteDSN())
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	return db, nil
 }
 
 func testDatabaseConnection(cfg *DatabaseConfig, openDatabase postgresDatabaseOpener) error {
@@ -279,6 +323,9 @@ func testDatabaseConnection(cfg *DatabaseConfig, openDatabase postgresDatabaseOp
 
 // TestRedisConnection tests the Redis connection
 func TestRedisConnection(cfg *RedisConfig) error {
+	if strings.EqualFold(strings.TrimSpace(cfg.Type), "memory") {
+		return nil
+	}
 	opts := &redis.Options{
 		Addr:     fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
 		Username: cfg.Username,
@@ -326,14 +373,45 @@ func Install(cfg *SetupConfig) error {
 		cfg.JWT.Secret = secret
 		logger.LegacyPrintf("setup", "%s", "Warning: JWT secret auto-generated. Consider setting a fixed secret for production.")
 	}
+	cfg.Database.Type = strings.ToLower(strings.TrimSpace(cfg.Database.Type))
+	cfg.Redis.Type = strings.ToLower(strings.TrimSpace(cfg.Redis.Type))
+	if cfg.Database.Type == "" {
+		cfg.Database.Type = config.DatabaseTypePostgres
+	}
+	if strings.TrimSpace(cfg.Redis.Type) == "" {
+		cfg.Redis.Type = config.CacheTypeRedis
+	}
+	if cfg.Database.Type != config.DatabaseTypeSQLite && cfg.Database.Type != config.DatabaseTypePostgres {
+		return fmt.Errorf("unsupported database type %q", cfg.Database.Type)
+	}
+	if cfg.Redis.Type != config.CacheTypeMemory && cfg.Redis.Type != config.CacheTypeRedis {
+		return fmt.Errorf("unsupported cache type %q", cfg.Redis.Type)
+	}
+	if cfg.Redis.Type == config.CacheTypeMemory {
+		defaults := config.NewDefaultConfig().Redis.Memory
+		if strings.TrimSpace(cfg.Redis.Memory.PersistencePath) == "" {
+			cfg.Redis.Memory.PersistencePath = defaults.PersistencePath
+		}
+		if cfg.Redis.Memory.MaxCapacityMB <= 0 {
+			cfg.Redis.Memory.MaxCapacityMB = defaults.MaxCapacityMB
+		}
+		if cfg.Redis.Memory.GCIntervalSeconds <= 0 {
+			cfg.Redis.Memory.GCIntervalSeconds = defaults.GCIntervalSeconds
+		}
+	}
+	if strings.EqualFold(cfg.Database.Type, config.DatabaseTypeSQLite) && strings.TrimSpace(cfg.Database.Path) == "" {
+		cfg.Database.Path = "data/sub2api.db"
+	}
 
 	// Test connections
 	if err := TestDatabaseConnection(&cfg.Database); err != nil {
 		return fmt.Errorf("database connection failed: %w", err)
 	}
 
-	if err := TestRedisConnection(&cfg.Redis); err != nil {
-		return fmt.Errorf("redis connection failed: %w", err)
+	if !strings.EqualFold(strings.TrimSpace(cfg.Redis.Type), "memory") {
+		if err := TestRedisConnection(&cfg.Redis); err != nil {
+			return fmt.Errorf("redis connection failed: %w", err)
+		}
 	}
 
 	// Initialize database
@@ -366,6 +444,30 @@ func createInstallLock() error {
 }
 
 func initializeDatabase(cfg *SetupConfig) error {
+	if strings.EqualFold(strings.TrimSpace(cfg.Database.Type), config.DatabaseTypeSQLite) {
+		database, err := setupSQLiteConfig(&cfg.Database)
+		if err != nil {
+			return err
+		}
+		// InitEnt 结束前会做一次完整 cfg.Validate()，因此这里必须带上全部
+		// 默认值（插件上传上限、网关参数等），不能用只填了 Type/Path 的裸结构体，
+		// 否则安装向导的 SQLite 分支必然校验失败。
+		clientConfig := config.NewDefaultConfig()
+		clientConfig.Database.Type = database.Type
+		clientConfig.Database.Path = database.Path
+		clientConfig.Redis.Type = cfg.Redis.Type
+		if cfg.Timezone != "" {
+			clientConfig.Timezone = cfg.Timezone
+		}
+		clientConfig.Database.NormalizeType()
+		clientConfig.Redis.NormalizeType()
+		clientConfig.JWT.Secret = cfg.JWT.Secret
+		client, _, err := repository.InitEnt(clientConfig)
+		if err != nil {
+			return err
+		}
+		return client.Close()
+	}
 	dsn := fmt.Sprintf(
 		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
 		cfg.Database.Host, cfg.Database.Port, cfg.Database.User,
@@ -396,20 +498,25 @@ func (cfg *SetupConfig) migrationTimeout() time.Duration {
 }
 
 func createAdminUser(cfg *SetupConfig) (bool, string, error) {
-	dsn := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		cfg.Database.Host, cfg.Database.Port, cfg.Database.User,
-		cfg.Database.Password, cfg.Database.DBName, cfg.Database.SSLMode,
-	)
-
-	db, err := sql.Open("postgres", dsn)
+	var db *sql.DB
+	var err error
+	if strings.EqualFold(strings.TrimSpace(cfg.Database.Type), config.DatabaseTypeSQLite) {
+		db, err = openSetupSQLite(&cfg.Database)
+	} else {
+		dsn := fmt.Sprintf(
+			"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+			cfg.Database.Host, cfg.Database.Port, cfg.Database.User,
+			cfg.Database.Password, cfg.Database.DBName, cfg.Database.SSLMode,
+		)
+		db, err = sql.Open("postgres", dsn)
+	}
 	if err != nil {
 		return false, "", err
 	}
 
 	defer func() {
 		if err := db.Close(); err != nil {
-			logger.LegacyPrintf("setup", "failed to close postgres connection: %v", err)
+			logger.LegacyPrintf("setup", "failed to close database connection: %v", err)
 		}
 	}()
 
@@ -580,14 +687,17 @@ func AutoSetupFromEnv() error {
 	// Build config from environment variables
 	cfg := &SetupConfig{
 		Database: DatabaseConfig{
+			Type:     getEnvOrDefault("DATABASE_TYPE", config.DatabaseTypePostgres),
 			Host:     getEnvOrDefault("DATABASE_HOST", "localhost"),
 			Port:     getEnvIntOrDefault("DATABASE_PORT", 5432),
 			User:     getEnvOrDefault("DATABASE_USER", "postgres"),
 			Password: getEnvOrDefault("DATABASE_PASSWORD", ""),
 			DBName:   getEnvOrDefault("DATABASE_DBNAME", "sub2api"),
 			SSLMode:  getEnvOrDefault("DATABASE_SSLMODE", "disable"),
+			Path:     getEnvOrDefault("DATABASE_PATH", "data/sub2api.db"),
 		},
 		Redis: RedisConfig{
+			Type:      getEnvOrDefault("REDIS_TYPE", config.CacheTypeRedis),
 			Host:      getEnvOrDefault("REDIS_HOST", "localhost"),
 			Port:      getEnvIntOrDefault("REDIS_PORT", 6379),
 			Username:  getEnvOrDefault("REDIS_USERNAME", ""),

@@ -42,6 +42,9 @@ return {current, repaired}
 
 // rateLimitRun 允许测试覆写脚本执行逻辑
 var rateLimitRun = func(ctx context.Context, client *redis.Client, key string, windowMillis int64) (int64, bool, error) {
+	if client == nil {
+		return 0, false, fmt.Errorf("rate limit backend unavailable")
+	}
 	values, err := rateLimitScript.Run(ctx, client, []string{key}, windowMillis).Slice()
 	if err != nil {
 		return 0, false, err
@@ -62,15 +65,38 @@ var rateLimitRun = func(ctx context.Context, client *redis.Client, key string, w
 
 // RateLimiter Redis 速率限制器
 type RateLimiter struct {
-	redis  *redis.Client
-	prefix string
+	redis   *redis.Client
+	prefix  string
+	backend RateLimitBackend
+}
+
+type RateLimitBackend interface {
+	Increment(context.Context, string, time.Duration) (int64, bool, error)
+	TTL(context.Context, string) (time.Duration, error)
+}
+
+type redisRateLimitBackend struct{ client *redis.Client }
+
+func (b redisRateLimitBackend) Increment(ctx context.Context, key string, window time.Duration) (int64, bool, error) {
+	return rateLimitRun(ctx, b.client, key, windowTTLMillis(window))
+}
+func (b redisRateLimitBackend) TTL(ctx context.Context, key string) (time.Duration, error) {
+	if b.client == nil {
+		return 0, fmt.Errorf("rate limit backend unavailable")
+	}
+	return b.client.PTTL(ctx, key).Result()
+}
+
+func NewRateLimiterWithBackend(backend RateLimitBackend) *RateLimiter {
+	return &RateLimiter{backend: backend, prefix: "rate_limit:"}
 }
 
 // NewRateLimiter 创建速率限制器实例
 func NewRateLimiter(redisClient *redis.Client) *RateLimiter {
 	return &RateLimiter{
-		redis:  redisClient,
-		prefix: "rate_limit:",
+		redis:   redisClient,
+		prefix:  "rate_limit:",
+		backend: redisRateLimitBackend{client: redisClient},
 	}
 }
 
@@ -88,20 +114,22 @@ type AllowResult struct {
 // 供需要自定义限流维度（如按用户 ID）的调用方使用；Redis 错误由调用方决定 fail-open/close。
 func (r *RateLimiter) Allow(ctx context.Context, key string, limit int, window time.Duration) (AllowResult, error) {
 	redisKey := r.prefix + key
-	windowMillis := windowTTLMillis(window)
-
-	count, repaired, err := rateLimitRun(ctx, r.redis, redisKey, windowMillis)
+	backend := r.backend
+	if backend == nil {
+		backend = redisRateLimitBackend{client: r.redis}
+	}
+	count, repaired, err := backend.Increment(ctx, redisKey, window)
 	if err != nil {
 		return AllowResult{}, err
 	}
 	if repaired {
-		log.Printf("[RateLimit] ttl repaired: key=%s window_ms=%d", redisKey, windowMillis)
+		log.Printf("[RateLimit] ttl repaired: key=%s window_ms=%d", redisKey, windowTTLMillis(window))
 	}
 
 	result := AllowResult{Allowed: count <= int64(limit), Count: count}
 	if !result.Allowed {
 		result.RetryAfter = window
-		if ttl, ttlErr := r.redis.PTTL(ctx, redisKey).Result(); ttlErr == nil && ttl > 0 {
+		if ttl, ttlErr := backend.TTL(ctx, redisKey); ttlErr == nil && ttl > 0 {
 			result.RetryAfter = ttl
 		}
 	}
@@ -138,7 +166,7 @@ func (r *RateLimiter) LimitWithOptions(key string, limit int, window time.Durati
 	return func(c *gin.Context) {
 		result, err := r.Allow(c.Request.Context(), key+":"+clientIPForRateLimit(c), limit, window)
 		if err != nil {
-			log.Printf("[RateLimit] redis error: key=%s mode=%s err=%v", r.prefix+key, failureModeLabel(failureMode), err)
+			log.Printf("[RateLimit] backend error: key=%s mode=%s err=%v", r.prefix+key, failureModeLabel(failureMode), err)
 			if failureMode == RateLimitFailClose {
 				abortRateLimit(c, window)
 				return
