@@ -27,10 +27,12 @@ import (
 	"github.com/Wei-Shaw/sub2api/ent/channelmonitorhistory"
 	"github.com/Wei-Shaw/sub2api/ent/channelmonitorrequesttemplate"
 	"github.com/Wei-Shaw/sub2api/ent/compositemodelroute"
+	"github.com/Wei-Shaw/sub2api/ent/durablestate"
 	"github.com/Wei-Shaw/sub2api/ent/errorpassthroughrule"
 	"github.com/Wei-Shaw/sub2api/ent/group"
 	"github.com/Wei-Shaw/sub2api/ent/idempotencyrecord"
 	"github.com/Wei-Shaw/sub2api/ent/identityadoptiondecision"
+	"github.com/Wei-Shaw/sub2api/ent/imagequeueentry"
 	"github.com/Wei-Shaw/sub2api/ent/paymentauditlog"
 	"github.com/Wei-Shaw/sub2api/ent/paymentorder"
 	"github.com/Wei-Shaw/sub2api/ent/paymentproviderinstance"
@@ -79,10 +81,12 @@ const (
 	TypeChannelMonitorHistory         = "ChannelMonitorHistory"
 	TypeChannelMonitorRequestTemplate = "ChannelMonitorRequestTemplate"
 	TypeCompositeModelRoute           = "CompositeModelRoute"
+	TypeDurableState                  = "DurableState"
 	TypeErrorPassthroughRule          = "ErrorPassthroughRule"
 	TypeGroup                         = "Group"
 	TypeIdempotencyRecord             = "IdempotencyRecord"
 	TypeIdentityAdoptionDecision      = "IdentityAdoptionDecision"
+	TypeImageQueueEntry               = "ImageQueueEntry"
 	TypePaymentAuditLog               = "PaymentAuditLog"
 	TypePaymentOrder                  = "PaymentOrder"
 	TypePaymentProviderInstance       = "PaymentProviderInstance"
@@ -20755,6 +20759,505 @@ func (m *CompositeModelRouteMutation) ResetEdge(name string) error {
 	return fmt.Errorf("unknown CompositeModelRoute edge %s", name)
 }
 
+// DurableStateMutation represents an operation that mutates the DurableState nodes in the graph.
+type DurableStateMutation struct {
+	config
+	op            Op
+	typ           string
+	id            *string
+	value         *[]byte
+	expires_at    *int64
+	addexpires_at *int64
+	updated_at    *string
+	clearedFields map[string]struct{}
+	done          bool
+	oldValue      func(context.Context) (*DurableState, error)
+	predicates    []predicate.DurableState
+}
+
+var _ ent.Mutation = (*DurableStateMutation)(nil)
+
+// durablestateOption allows management of the mutation configuration using functional options.
+type durablestateOption func(*DurableStateMutation)
+
+// newDurableStateMutation creates new mutation for the DurableState entity.
+func newDurableStateMutation(c config, op Op, opts ...durablestateOption) *DurableStateMutation {
+	m := &DurableStateMutation{
+		config:        c,
+		op:            op,
+		typ:           TypeDurableState,
+		clearedFields: make(map[string]struct{}),
+	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
+}
+
+// withDurableStateID sets the ID field of the mutation.
+func withDurableStateID(id string) durablestateOption {
+	return func(m *DurableStateMutation) {
+		var (
+			err   error
+			once  sync.Once
+			value *DurableState
+		)
+		m.oldValue = func(ctx context.Context) (*DurableState, error) {
+			once.Do(func() {
+				if m.done {
+					err = errors.New("querying old values post mutation is not allowed")
+				} else {
+					value, err = m.Client().DurableState.Get(ctx, id)
+				}
+			})
+			return value, err
+		}
+		m.id = &id
+	}
+}
+
+// withDurableState sets the old DurableState of the mutation.
+func withDurableState(node *DurableState) durablestateOption {
+	return func(m *DurableStateMutation) {
+		m.oldValue = func(context.Context) (*DurableState, error) {
+			return node, nil
+		}
+		m.id = &node.ID
+	}
+}
+
+// Client returns a new `ent.Client` from the mutation. If the mutation was
+// executed in a transaction (ent.Tx), a transactional client is returned.
+func (m DurableStateMutation) Client() *Client {
+	client := &Client{config: m.config}
+	client.init()
+	return client
+}
+
+// Tx returns an `ent.Tx` for mutations that were executed in transactions;
+// it returns an error otherwise.
+func (m DurableStateMutation) Tx() (*Tx, error) {
+	if _, ok := m.driver.(*txDriver); !ok {
+		return nil, errors.New("ent: mutation is not running in a transaction")
+	}
+	tx := &Tx{config: m.config}
+	tx.init()
+	return tx, nil
+}
+
+// SetID sets the value of the id field. Note that this
+// operation is only accepted on creation of DurableState entities.
+func (m *DurableStateMutation) SetID(id string) {
+	m.id = &id
+}
+
+// ID returns the ID value in the mutation. Note that the ID is only available
+// if it was provided to the builder or after it was returned from the database.
+func (m *DurableStateMutation) ID() (id string, exists bool) {
+	if m.id == nil {
+		return
+	}
+	return *m.id, true
+}
+
+// IDs queries the database and returns the entity ids that match the mutation's predicate.
+// That means, if the mutation is applied within a transaction with an isolation level such
+// as sql.LevelSerializable, the returned ids match the ids of the rows that will be updated
+// or updated by the mutation.
+func (m *DurableStateMutation) IDs(ctx context.Context) ([]string, error) {
+	switch {
+	case m.op.Is(OpUpdateOne | OpDeleteOne):
+		id, exists := m.ID()
+		if exists {
+			return []string{id}, nil
+		}
+		fallthrough
+	case m.op.Is(OpUpdate | OpDelete):
+		return m.Client().DurableState.Query().Where(m.predicates...).IDs(ctx)
+	default:
+		return nil, fmt.Errorf("IDs is not allowed on %s operations", m.op)
+	}
+}
+
+// SetValue sets the "value" field.
+func (m *DurableStateMutation) SetValue(b []byte) {
+	m.value = &b
+}
+
+// Value returns the value of the "value" field in the mutation.
+func (m *DurableStateMutation) Value() (r []byte, exists bool) {
+	v := m.value
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldValue returns the old "value" field's value of the DurableState entity.
+// If the DurableState object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *DurableStateMutation) OldValue(ctx context.Context) (v []byte, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldValue is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldValue requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldValue: %w", err)
+	}
+	return oldValue.Value, nil
+}
+
+// ResetValue resets all changes to the "value" field.
+func (m *DurableStateMutation) ResetValue() {
+	m.value = nil
+}
+
+// SetExpiresAt sets the "expires_at" field.
+func (m *DurableStateMutation) SetExpiresAt(i int64) {
+	m.expires_at = &i
+	m.addexpires_at = nil
+}
+
+// ExpiresAt returns the value of the "expires_at" field in the mutation.
+func (m *DurableStateMutation) ExpiresAt() (r int64, exists bool) {
+	v := m.expires_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldExpiresAt returns the old "expires_at" field's value of the DurableState entity.
+// If the DurableState object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *DurableStateMutation) OldExpiresAt(ctx context.Context) (v *int64, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldExpiresAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldExpiresAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldExpiresAt: %w", err)
+	}
+	return oldValue.ExpiresAt, nil
+}
+
+// AddExpiresAt adds i to the "expires_at" field.
+func (m *DurableStateMutation) AddExpiresAt(i int64) {
+	if m.addexpires_at != nil {
+		*m.addexpires_at += i
+	} else {
+		m.addexpires_at = &i
+	}
+}
+
+// AddedExpiresAt returns the value that was added to the "expires_at" field in this mutation.
+func (m *DurableStateMutation) AddedExpiresAt() (r int64, exists bool) {
+	v := m.addexpires_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ClearExpiresAt clears the value of the "expires_at" field.
+func (m *DurableStateMutation) ClearExpiresAt() {
+	m.expires_at = nil
+	m.addexpires_at = nil
+	m.clearedFields[durablestate.FieldExpiresAt] = struct{}{}
+}
+
+// ExpiresAtCleared returns if the "expires_at" field was cleared in this mutation.
+func (m *DurableStateMutation) ExpiresAtCleared() bool {
+	_, ok := m.clearedFields[durablestate.FieldExpiresAt]
+	return ok
+}
+
+// ResetExpiresAt resets all changes to the "expires_at" field.
+func (m *DurableStateMutation) ResetExpiresAt() {
+	m.expires_at = nil
+	m.addexpires_at = nil
+	delete(m.clearedFields, durablestate.FieldExpiresAt)
+}
+
+// SetUpdatedAt sets the "updated_at" field.
+func (m *DurableStateMutation) SetUpdatedAt(s string) {
+	m.updated_at = &s
+}
+
+// UpdatedAt returns the value of the "updated_at" field in the mutation.
+func (m *DurableStateMutation) UpdatedAt() (r string, exists bool) {
+	v := m.updated_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldUpdatedAt returns the old "updated_at" field's value of the DurableState entity.
+// If the DurableState object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *DurableStateMutation) OldUpdatedAt(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldUpdatedAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldUpdatedAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldUpdatedAt: %w", err)
+	}
+	return oldValue.UpdatedAt, nil
+}
+
+// ResetUpdatedAt resets all changes to the "updated_at" field.
+func (m *DurableStateMutation) ResetUpdatedAt() {
+	m.updated_at = nil
+}
+
+// Where appends a list predicates to the DurableStateMutation builder.
+func (m *DurableStateMutation) Where(ps ...predicate.DurableState) {
+	m.predicates = append(m.predicates, ps...)
+}
+
+// WhereP appends storage-level predicates to the DurableStateMutation builder. Using this method,
+// users can use type-assertion to append predicates that do not depend on any generated package.
+func (m *DurableStateMutation) WhereP(ps ...func(*sql.Selector)) {
+	p := make([]predicate.DurableState, len(ps))
+	for i := range ps {
+		p[i] = ps[i]
+	}
+	m.Where(p...)
+}
+
+// Op returns the operation name.
+func (m *DurableStateMutation) Op() Op {
+	return m.op
+}
+
+// SetOp allows setting the mutation operation.
+func (m *DurableStateMutation) SetOp(op Op) {
+	m.op = op
+}
+
+// Type returns the node type of this mutation (DurableState).
+func (m *DurableStateMutation) Type() string {
+	return m.typ
+}
+
+// Fields returns all fields that were changed during this mutation. Note that in
+// order to get all numeric fields that were incremented/decremented, call
+// AddedFields().
+func (m *DurableStateMutation) Fields() []string {
+	fields := make([]string, 0, 3)
+	if m.value != nil {
+		fields = append(fields, durablestate.FieldValue)
+	}
+	if m.expires_at != nil {
+		fields = append(fields, durablestate.FieldExpiresAt)
+	}
+	if m.updated_at != nil {
+		fields = append(fields, durablestate.FieldUpdatedAt)
+	}
+	return fields
+}
+
+// Field returns the value of a field with the given name. The second boolean
+// return value indicates that this field was not set, or was not defined in the
+// schema.
+func (m *DurableStateMutation) Field(name string) (ent.Value, bool) {
+	switch name {
+	case durablestate.FieldValue:
+		return m.Value()
+	case durablestate.FieldExpiresAt:
+		return m.ExpiresAt()
+	case durablestate.FieldUpdatedAt:
+		return m.UpdatedAt()
+	}
+	return nil, false
+}
+
+// OldField returns the old value of the field from the database. An error is
+// returned if the mutation operation is not UpdateOne, or the query to the
+// database failed.
+func (m *DurableStateMutation) OldField(ctx context.Context, name string) (ent.Value, error) {
+	switch name {
+	case durablestate.FieldValue:
+		return m.OldValue(ctx)
+	case durablestate.FieldExpiresAt:
+		return m.OldExpiresAt(ctx)
+	case durablestate.FieldUpdatedAt:
+		return m.OldUpdatedAt(ctx)
+	}
+	return nil, fmt.Errorf("unknown DurableState field %s", name)
+}
+
+// SetField sets the value of a field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *DurableStateMutation) SetField(name string, value ent.Value) error {
+	switch name {
+	case durablestate.FieldValue:
+		v, ok := value.([]byte)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetValue(v)
+		return nil
+	case durablestate.FieldExpiresAt:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetExpiresAt(v)
+		return nil
+	case durablestate.FieldUpdatedAt:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetUpdatedAt(v)
+		return nil
+	}
+	return fmt.Errorf("unknown DurableState field %s", name)
+}
+
+// AddedFields returns all numeric fields that were incremented/decremented during
+// this mutation.
+func (m *DurableStateMutation) AddedFields() []string {
+	var fields []string
+	if m.addexpires_at != nil {
+		fields = append(fields, durablestate.FieldExpiresAt)
+	}
+	return fields
+}
+
+// AddedField returns the numeric value that was incremented/decremented on a field
+// with the given name. The second boolean return value indicates that this field
+// was not set, or was not defined in the schema.
+func (m *DurableStateMutation) AddedField(name string) (ent.Value, bool) {
+	switch name {
+	case durablestate.FieldExpiresAt:
+		return m.AddedExpiresAt()
+	}
+	return nil, false
+}
+
+// AddField adds the value to the field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *DurableStateMutation) AddField(name string, value ent.Value) error {
+	switch name {
+	case durablestate.FieldExpiresAt:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddExpiresAt(v)
+		return nil
+	}
+	return fmt.Errorf("unknown DurableState numeric field %s", name)
+}
+
+// ClearedFields returns all nullable fields that were cleared during this
+// mutation.
+func (m *DurableStateMutation) ClearedFields() []string {
+	var fields []string
+	if m.FieldCleared(durablestate.FieldExpiresAt) {
+		fields = append(fields, durablestate.FieldExpiresAt)
+	}
+	return fields
+}
+
+// FieldCleared returns a boolean indicating if a field with the given name was
+// cleared in this mutation.
+func (m *DurableStateMutation) FieldCleared(name string) bool {
+	_, ok := m.clearedFields[name]
+	return ok
+}
+
+// ClearField clears the value of the field with the given name. It returns an
+// error if the field is not defined in the schema.
+func (m *DurableStateMutation) ClearField(name string) error {
+	switch name {
+	case durablestate.FieldExpiresAt:
+		m.ClearExpiresAt()
+		return nil
+	}
+	return fmt.Errorf("unknown DurableState nullable field %s", name)
+}
+
+// ResetField resets all changes in the mutation for the field with the given name.
+// It returns an error if the field is not defined in the schema.
+func (m *DurableStateMutation) ResetField(name string) error {
+	switch name {
+	case durablestate.FieldValue:
+		m.ResetValue()
+		return nil
+	case durablestate.FieldExpiresAt:
+		m.ResetExpiresAt()
+		return nil
+	case durablestate.FieldUpdatedAt:
+		m.ResetUpdatedAt()
+		return nil
+	}
+	return fmt.Errorf("unknown DurableState field %s", name)
+}
+
+// AddedEdges returns all edge names that were set/added in this mutation.
+func (m *DurableStateMutation) AddedEdges() []string {
+	edges := make([]string, 0, 0)
+	return edges
+}
+
+// AddedIDs returns all IDs (to other nodes) that were added for the given edge
+// name in this mutation.
+func (m *DurableStateMutation) AddedIDs(name string) []ent.Value {
+	return nil
+}
+
+// RemovedEdges returns all edge names that were removed in this mutation.
+func (m *DurableStateMutation) RemovedEdges() []string {
+	edges := make([]string, 0, 0)
+	return edges
+}
+
+// RemovedIDs returns all IDs (to other nodes) that were removed for the edge with
+// the given name in this mutation.
+func (m *DurableStateMutation) RemovedIDs(name string) []ent.Value {
+	return nil
+}
+
+// ClearedEdges returns all edge names that were cleared in this mutation.
+func (m *DurableStateMutation) ClearedEdges() []string {
+	edges := make([]string, 0, 0)
+	return edges
+}
+
+// EdgeCleared returns a boolean which indicates if the edge with the given name
+// was cleared in this mutation.
+func (m *DurableStateMutation) EdgeCleared(name string) bool {
+	return false
+}
+
+// ClearEdge clears the value of the edge with the given name. It returns an error
+// if that edge is not defined in the schema.
+func (m *DurableStateMutation) ClearEdge(name string) error {
+	return fmt.Errorf("unknown DurableState unique edge %s", name)
+}
+
+// ResetEdge resets all changes to the edge with the given name in this mutation.
+// It returns an error if the edge is not defined in the schema.
+func (m *DurableStateMutation) ResetEdge(name string) error {
+	return fmt.Errorf("unknown DurableState edge %s", name)
+}
+
 // ErrorPassthroughRuleMutation represents an operation that mutates the ErrorPassthroughRule nodes in the graph.
 type ErrorPassthroughRuleMutation struct {
 	config
@@ -29554,6 +30057,569 @@ func (m *IdentityAdoptionDecisionMutation) ResetEdge(name string) error {
 		return nil
 	}
 	return fmt.Errorf("unknown IdentityAdoptionDecision edge %s", name)
+}
+
+// ImageQueueEntryMutation represents an operation that mutates the ImageQueueEntry nodes in the graph.
+type ImageQueueEntryMutation struct {
+	config
+	op              Op
+	typ             string
+	id              *string
+	state           *imagequeueentry.State
+	available_at    *int64
+	addavailable_at *int64
+	heartbeat_at    *int64
+	addheartbeat_at *int64
+	receipt         *string
+	clearedFields   map[string]struct{}
+	done            bool
+	oldValue        func(context.Context) (*ImageQueueEntry, error)
+	predicates      []predicate.ImageQueueEntry
+}
+
+var _ ent.Mutation = (*ImageQueueEntryMutation)(nil)
+
+// imagequeueentryOption allows management of the mutation configuration using functional options.
+type imagequeueentryOption func(*ImageQueueEntryMutation)
+
+// newImageQueueEntryMutation creates new mutation for the ImageQueueEntry entity.
+func newImageQueueEntryMutation(c config, op Op, opts ...imagequeueentryOption) *ImageQueueEntryMutation {
+	m := &ImageQueueEntryMutation{
+		config:        c,
+		op:            op,
+		typ:           TypeImageQueueEntry,
+		clearedFields: make(map[string]struct{}),
+	}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
+}
+
+// withImageQueueEntryID sets the ID field of the mutation.
+func withImageQueueEntryID(id string) imagequeueentryOption {
+	return func(m *ImageQueueEntryMutation) {
+		var (
+			err   error
+			once  sync.Once
+			value *ImageQueueEntry
+		)
+		m.oldValue = func(ctx context.Context) (*ImageQueueEntry, error) {
+			once.Do(func() {
+				if m.done {
+					err = errors.New("querying old values post mutation is not allowed")
+				} else {
+					value, err = m.Client().ImageQueueEntry.Get(ctx, id)
+				}
+			})
+			return value, err
+		}
+		m.id = &id
+	}
+}
+
+// withImageQueueEntry sets the old ImageQueueEntry of the mutation.
+func withImageQueueEntry(node *ImageQueueEntry) imagequeueentryOption {
+	return func(m *ImageQueueEntryMutation) {
+		m.oldValue = func(context.Context) (*ImageQueueEntry, error) {
+			return node, nil
+		}
+		m.id = &node.ID
+	}
+}
+
+// Client returns a new `ent.Client` from the mutation. If the mutation was
+// executed in a transaction (ent.Tx), a transactional client is returned.
+func (m ImageQueueEntryMutation) Client() *Client {
+	client := &Client{config: m.config}
+	client.init()
+	return client
+}
+
+// Tx returns an `ent.Tx` for mutations that were executed in transactions;
+// it returns an error otherwise.
+func (m ImageQueueEntryMutation) Tx() (*Tx, error) {
+	if _, ok := m.driver.(*txDriver); !ok {
+		return nil, errors.New("ent: mutation is not running in a transaction")
+	}
+	tx := &Tx{config: m.config}
+	tx.init()
+	return tx, nil
+}
+
+// SetID sets the value of the id field. Note that this
+// operation is only accepted on creation of ImageQueueEntry entities.
+func (m *ImageQueueEntryMutation) SetID(id string) {
+	m.id = &id
+}
+
+// ID returns the ID value in the mutation. Note that the ID is only available
+// if it was provided to the builder or after it was returned from the database.
+func (m *ImageQueueEntryMutation) ID() (id string, exists bool) {
+	if m.id == nil {
+		return
+	}
+	return *m.id, true
+}
+
+// IDs queries the database and returns the entity ids that match the mutation's predicate.
+// That means, if the mutation is applied within a transaction with an isolation level such
+// as sql.LevelSerializable, the returned ids match the ids of the rows that will be updated
+// or updated by the mutation.
+func (m *ImageQueueEntryMutation) IDs(ctx context.Context) ([]string, error) {
+	switch {
+	case m.op.Is(OpUpdateOne | OpDeleteOne):
+		id, exists := m.ID()
+		if exists {
+			return []string{id}, nil
+		}
+		fallthrough
+	case m.op.Is(OpUpdate | OpDelete):
+		return m.Client().ImageQueueEntry.Query().Where(m.predicates...).IDs(ctx)
+	default:
+		return nil, fmt.Errorf("IDs is not allowed on %s operations", m.op)
+	}
+}
+
+// SetState sets the "state" field.
+func (m *ImageQueueEntryMutation) SetState(i imagequeueentry.State) {
+	m.state = &i
+}
+
+// State returns the value of the "state" field in the mutation.
+func (m *ImageQueueEntryMutation) State() (r imagequeueentry.State, exists bool) {
+	v := m.state
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldState returns the old "state" field's value of the ImageQueueEntry entity.
+// If the ImageQueueEntry object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ImageQueueEntryMutation) OldState(ctx context.Context) (v imagequeueentry.State, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldState is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldState requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldState: %w", err)
+	}
+	return oldValue.State, nil
+}
+
+// ResetState resets all changes to the "state" field.
+func (m *ImageQueueEntryMutation) ResetState() {
+	m.state = nil
+}
+
+// SetAvailableAt sets the "available_at" field.
+func (m *ImageQueueEntryMutation) SetAvailableAt(i int64) {
+	m.available_at = &i
+	m.addavailable_at = nil
+}
+
+// AvailableAt returns the value of the "available_at" field in the mutation.
+func (m *ImageQueueEntryMutation) AvailableAt() (r int64, exists bool) {
+	v := m.available_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldAvailableAt returns the old "available_at" field's value of the ImageQueueEntry entity.
+// If the ImageQueueEntry object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ImageQueueEntryMutation) OldAvailableAt(ctx context.Context) (v int64, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldAvailableAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldAvailableAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldAvailableAt: %w", err)
+	}
+	return oldValue.AvailableAt, nil
+}
+
+// AddAvailableAt adds i to the "available_at" field.
+func (m *ImageQueueEntryMutation) AddAvailableAt(i int64) {
+	if m.addavailable_at != nil {
+		*m.addavailable_at += i
+	} else {
+		m.addavailable_at = &i
+	}
+}
+
+// AddedAvailableAt returns the value that was added to the "available_at" field in this mutation.
+func (m *ImageQueueEntryMutation) AddedAvailableAt() (r int64, exists bool) {
+	v := m.addavailable_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetAvailableAt resets all changes to the "available_at" field.
+func (m *ImageQueueEntryMutation) ResetAvailableAt() {
+	m.available_at = nil
+	m.addavailable_at = nil
+}
+
+// SetHeartbeatAt sets the "heartbeat_at" field.
+func (m *ImageQueueEntryMutation) SetHeartbeatAt(i int64) {
+	m.heartbeat_at = &i
+	m.addheartbeat_at = nil
+}
+
+// HeartbeatAt returns the value of the "heartbeat_at" field in the mutation.
+func (m *ImageQueueEntryMutation) HeartbeatAt() (r int64, exists bool) {
+	v := m.heartbeat_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldHeartbeatAt returns the old "heartbeat_at" field's value of the ImageQueueEntry entity.
+// If the ImageQueueEntry object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ImageQueueEntryMutation) OldHeartbeatAt(ctx context.Context) (v int64, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldHeartbeatAt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldHeartbeatAt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldHeartbeatAt: %w", err)
+	}
+	return oldValue.HeartbeatAt, nil
+}
+
+// AddHeartbeatAt adds i to the "heartbeat_at" field.
+func (m *ImageQueueEntryMutation) AddHeartbeatAt(i int64) {
+	if m.addheartbeat_at != nil {
+		*m.addheartbeat_at += i
+	} else {
+		m.addheartbeat_at = &i
+	}
+}
+
+// AddedHeartbeatAt returns the value that was added to the "heartbeat_at" field in this mutation.
+func (m *ImageQueueEntryMutation) AddedHeartbeatAt() (r int64, exists bool) {
+	v := m.addheartbeat_at
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// ResetHeartbeatAt resets all changes to the "heartbeat_at" field.
+func (m *ImageQueueEntryMutation) ResetHeartbeatAt() {
+	m.heartbeat_at = nil
+	m.addheartbeat_at = nil
+}
+
+// SetReceipt sets the "receipt" field.
+func (m *ImageQueueEntryMutation) SetReceipt(s string) {
+	m.receipt = &s
+}
+
+// Receipt returns the value of the "receipt" field in the mutation.
+func (m *ImageQueueEntryMutation) Receipt() (r string, exists bool) {
+	v := m.receipt
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldReceipt returns the old "receipt" field's value of the ImageQueueEntry entity.
+// If the ImageQueueEntry object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *ImageQueueEntryMutation) OldReceipt(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldReceipt is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldReceipt requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldReceipt: %w", err)
+	}
+	return oldValue.Receipt, nil
+}
+
+// ResetReceipt resets all changes to the "receipt" field.
+func (m *ImageQueueEntryMutation) ResetReceipt() {
+	m.receipt = nil
+}
+
+// Where appends a list predicates to the ImageQueueEntryMutation builder.
+func (m *ImageQueueEntryMutation) Where(ps ...predicate.ImageQueueEntry) {
+	m.predicates = append(m.predicates, ps...)
+}
+
+// WhereP appends storage-level predicates to the ImageQueueEntryMutation builder. Using this method,
+// users can use type-assertion to append predicates that do not depend on any generated package.
+func (m *ImageQueueEntryMutation) WhereP(ps ...func(*sql.Selector)) {
+	p := make([]predicate.ImageQueueEntry, len(ps))
+	for i := range ps {
+		p[i] = ps[i]
+	}
+	m.Where(p...)
+}
+
+// Op returns the operation name.
+func (m *ImageQueueEntryMutation) Op() Op {
+	return m.op
+}
+
+// SetOp allows setting the mutation operation.
+func (m *ImageQueueEntryMutation) SetOp(op Op) {
+	m.op = op
+}
+
+// Type returns the node type of this mutation (ImageQueueEntry).
+func (m *ImageQueueEntryMutation) Type() string {
+	return m.typ
+}
+
+// Fields returns all fields that were changed during this mutation. Note that in
+// order to get all numeric fields that were incremented/decremented, call
+// AddedFields().
+func (m *ImageQueueEntryMutation) Fields() []string {
+	fields := make([]string, 0, 4)
+	if m.state != nil {
+		fields = append(fields, imagequeueentry.FieldState)
+	}
+	if m.available_at != nil {
+		fields = append(fields, imagequeueentry.FieldAvailableAt)
+	}
+	if m.heartbeat_at != nil {
+		fields = append(fields, imagequeueentry.FieldHeartbeatAt)
+	}
+	if m.receipt != nil {
+		fields = append(fields, imagequeueentry.FieldReceipt)
+	}
+	return fields
+}
+
+// Field returns the value of a field with the given name. The second boolean
+// return value indicates that this field was not set, or was not defined in the
+// schema.
+func (m *ImageQueueEntryMutation) Field(name string) (ent.Value, bool) {
+	switch name {
+	case imagequeueentry.FieldState:
+		return m.State()
+	case imagequeueentry.FieldAvailableAt:
+		return m.AvailableAt()
+	case imagequeueentry.FieldHeartbeatAt:
+		return m.HeartbeatAt()
+	case imagequeueentry.FieldReceipt:
+		return m.Receipt()
+	}
+	return nil, false
+}
+
+// OldField returns the old value of the field from the database. An error is
+// returned if the mutation operation is not UpdateOne, or the query to the
+// database failed.
+func (m *ImageQueueEntryMutation) OldField(ctx context.Context, name string) (ent.Value, error) {
+	switch name {
+	case imagequeueentry.FieldState:
+		return m.OldState(ctx)
+	case imagequeueentry.FieldAvailableAt:
+		return m.OldAvailableAt(ctx)
+	case imagequeueentry.FieldHeartbeatAt:
+		return m.OldHeartbeatAt(ctx)
+	case imagequeueentry.FieldReceipt:
+		return m.OldReceipt(ctx)
+	}
+	return nil, fmt.Errorf("unknown ImageQueueEntry field %s", name)
+}
+
+// SetField sets the value of a field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *ImageQueueEntryMutation) SetField(name string, value ent.Value) error {
+	switch name {
+	case imagequeueentry.FieldState:
+		v, ok := value.(imagequeueentry.State)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetState(v)
+		return nil
+	case imagequeueentry.FieldAvailableAt:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetAvailableAt(v)
+		return nil
+	case imagequeueentry.FieldHeartbeatAt:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetHeartbeatAt(v)
+		return nil
+	case imagequeueentry.FieldReceipt:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetReceipt(v)
+		return nil
+	}
+	return fmt.Errorf("unknown ImageQueueEntry field %s", name)
+}
+
+// AddedFields returns all numeric fields that were incremented/decremented during
+// this mutation.
+func (m *ImageQueueEntryMutation) AddedFields() []string {
+	var fields []string
+	if m.addavailable_at != nil {
+		fields = append(fields, imagequeueentry.FieldAvailableAt)
+	}
+	if m.addheartbeat_at != nil {
+		fields = append(fields, imagequeueentry.FieldHeartbeatAt)
+	}
+	return fields
+}
+
+// AddedField returns the numeric value that was incremented/decremented on a field
+// with the given name. The second boolean return value indicates that this field
+// was not set, or was not defined in the schema.
+func (m *ImageQueueEntryMutation) AddedField(name string) (ent.Value, bool) {
+	switch name {
+	case imagequeueentry.FieldAvailableAt:
+		return m.AddedAvailableAt()
+	case imagequeueentry.FieldHeartbeatAt:
+		return m.AddedHeartbeatAt()
+	}
+	return nil, false
+}
+
+// AddField adds the value to the field with the given name. It returns an error if
+// the field is not defined in the schema, or if the type mismatched the field
+// type.
+func (m *ImageQueueEntryMutation) AddField(name string, value ent.Value) error {
+	switch name {
+	case imagequeueentry.FieldAvailableAt:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddAvailableAt(v)
+		return nil
+	case imagequeueentry.FieldHeartbeatAt:
+		v, ok := value.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.AddHeartbeatAt(v)
+		return nil
+	}
+	return fmt.Errorf("unknown ImageQueueEntry numeric field %s", name)
+}
+
+// ClearedFields returns all nullable fields that were cleared during this
+// mutation.
+func (m *ImageQueueEntryMutation) ClearedFields() []string {
+	return nil
+}
+
+// FieldCleared returns a boolean indicating if a field with the given name was
+// cleared in this mutation.
+func (m *ImageQueueEntryMutation) FieldCleared(name string) bool {
+	_, ok := m.clearedFields[name]
+	return ok
+}
+
+// ClearField clears the value of the field with the given name. It returns an
+// error if the field is not defined in the schema.
+func (m *ImageQueueEntryMutation) ClearField(name string) error {
+	return fmt.Errorf("unknown ImageQueueEntry nullable field %s", name)
+}
+
+// ResetField resets all changes in the mutation for the field with the given name.
+// It returns an error if the field is not defined in the schema.
+func (m *ImageQueueEntryMutation) ResetField(name string) error {
+	switch name {
+	case imagequeueentry.FieldState:
+		m.ResetState()
+		return nil
+	case imagequeueentry.FieldAvailableAt:
+		m.ResetAvailableAt()
+		return nil
+	case imagequeueentry.FieldHeartbeatAt:
+		m.ResetHeartbeatAt()
+		return nil
+	case imagequeueentry.FieldReceipt:
+		m.ResetReceipt()
+		return nil
+	}
+	return fmt.Errorf("unknown ImageQueueEntry field %s", name)
+}
+
+// AddedEdges returns all edge names that were set/added in this mutation.
+func (m *ImageQueueEntryMutation) AddedEdges() []string {
+	edges := make([]string, 0, 0)
+	return edges
+}
+
+// AddedIDs returns all IDs (to other nodes) that were added for the given edge
+// name in this mutation.
+func (m *ImageQueueEntryMutation) AddedIDs(name string) []ent.Value {
+	return nil
+}
+
+// RemovedEdges returns all edge names that were removed in this mutation.
+func (m *ImageQueueEntryMutation) RemovedEdges() []string {
+	edges := make([]string, 0, 0)
+	return edges
+}
+
+// RemovedIDs returns all IDs (to other nodes) that were removed for the edge with
+// the given name in this mutation.
+func (m *ImageQueueEntryMutation) RemovedIDs(name string) []ent.Value {
+	return nil
+}
+
+// ClearedEdges returns all edge names that were cleared in this mutation.
+func (m *ImageQueueEntryMutation) ClearedEdges() []string {
+	edges := make([]string, 0, 0)
+	return edges
+}
+
+// EdgeCleared returns a boolean which indicates if the edge with the given name
+// was cleared in this mutation.
+func (m *ImageQueueEntryMutation) EdgeCleared(name string) bool {
+	return false
+}
+
+// ClearEdge clears the value of the edge with the given name. It returns an error
+// if that edge is not defined in the schema.
+func (m *ImageQueueEntryMutation) ClearEdge(name string) error {
+	return fmt.Errorf("unknown ImageQueueEntry unique edge %s", name)
+}
+
+// ResetEdge resets all changes to the edge with the given name in this mutation.
+// It returns an error if the edge is not defined in the schema.
+func (m *ImageQueueEntryMutation) ResetEdge(name string) error {
+	return fmt.Errorf("unknown ImageQueueEntry edge %s", name)
 }
 
 // PaymentAuditLogMutation represents an operation that mutates the PaymentAuditLog nodes in the graph.

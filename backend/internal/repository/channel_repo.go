@@ -13,12 +13,13 @@ import (
 )
 
 type channelRepository struct {
-	db *sql.DB
+	db     *sql.DB
+	sqlite bool
 }
 
 // NewChannelRepository 创建渠道数据访问实例
 func NewChannelRepository(db *sql.DB) service.ChannelRepository {
-	return &channelRepository{db: db}
+	return &channelRepository{db: db, sqlite: isSQLiteDB(db)}
 }
 
 // runInTx 在事务中执行 fn，成功 commit，失败 rollback。
@@ -45,11 +46,19 @@ func (r *channelRepository) Create(ctx context.Context, channel *service.Channel
 		if err != nil {
 			return err
 		}
-		err = tx.QueryRowContext(ctx,
-			`INSERT INTO channels (name, description, status, model_mapping, billing_model_source, restrict_models, features, features_config, apply_pricing_to_account_stats) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-			 RETURNING id, created_at, updated_at`,
-			channel.Name, channel.Description, channel.Status, modelMappingJSON, channel.BillingModelSource, channel.RestrictModels, channel.Features, featuresConfigJSON, channel.ApplyPricingToAccountStats,
-		).Scan(&channel.ID, &channel.CreatedAt, &channel.UpdatedAt)
+		if r.sqlite {
+			err = tx.QueryRowContext(ctx,
+				`INSERT INTO channels (name, description, status, model_mapping, billing_model_source, restrict_models, features, features_config, apply_pricing_to_account_stats) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				 RETURNING id, created_at, updated_at`,
+				channel.Name, channel.Description, channel.Status, modelMappingJSON, channel.BillingModelSource, channel.RestrictModels, channel.Features, featuresConfigJSON, channel.ApplyPricingToAccountStats,
+			).Scan(&channel.ID, timeScanDest(r.sqlite, &channel.CreatedAt), timeScanDest(r.sqlite, &channel.UpdatedAt))
+		} else {
+			err = tx.QueryRowContext(ctx,
+				`INSERT INTO channels (name, description, status, model_mapping, billing_model_source, restrict_models, features, features_config, apply_pricing_to_account_stats) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				 RETURNING id, created_at, updated_at`,
+				channel.Name, channel.Description, channel.Status, modelMappingJSON, channel.BillingModelSource, channel.RestrictModels, channel.Features, featuresConfigJSON, channel.ApplyPricingToAccountStats,
+			).Scan(&channel.ID, &channel.CreatedAt, &channel.UpdatedAt)
+		}
 		if err != nil {
 			if isUniqueViolation(err) {
 				return service.ErrChannelExists
@@ -59,21 +68,21 @@ func (r *channelRepository) Create(ctx context.Context, channel *service.Channel
 
 		// 设置分组关联
 		if len(channel.GroupIDs) > 0 {
-			if err := setGroupIDsTx(ctx, tx, channel.ID, channel.GroupIDs); err != nil {
+			if err := setGroupIDsTx(ctx, tx, channel.ID, channel.GroupIDs, r.sqlite); err != nil {
 				return err
 			}
 		}
 
 		// 设置模型定价
 		if len(channel.ModelPricing) > 0 {
-			if err := replaceModelPricingTx(ctx, tx, channel.ID, channel.ModelPricing); err != nil {
+			if err := replaceModelPricingTx(ctx, tx, channel.ID, channel.ModelPricing, r.sqlite); err != nil {
 				return err
 			}
 		}
 
 		// 设置账号统计定价规则
 		if len(channel.AccountStatsPricingRules) > 0 {
-			if err := replaceAccountStatsPricingRulesTx(ctx, tx, channel.ID, channel.AccountStatsPricingRules); err != nil {
+			if err := replaceAccountStatsPricingRulesTx(ctx, tx, channel.ID, channel.AccountStatsPricingRules, r.sqlite); err != nil {
 				return err
 			}
 		}
@@ -88,7 +97,7 @@ func (r *channelRepository) GetByID(ctx context.Context, id int64) (*service.Cha
 	err := r.db.QueryRowContext(ctx,
 		`SELECT id, name, description, status, model_mapping, billing_model_source, restrict_models, features, features_config, apply_pricing_to_account_stats, created_at, updated_at
 		 FROM channels WHERE id = $1`, id,
-	).Scan(&ch.ID, &ch.Name, &ch.Description, &ch.Status, &modelMappingJSON, &ch.BillingModelSource, &ch.RestrictModels, &ch.Features, &featuresConfigJSON, &ch.ApplyPricingToAccountStats, &ch.CreatedAt, &ch.UpdatedAt)
+	).Scan(&ch.ID, &ch.Name, &ch.Description, &ch.Status, &modelMappingJSON, &ch.BillingModelSource, &ch.RestrictModels, &ch.Features, &featuresConfigJSON, &ch.ApplyPricingToAccountStats, timeScanDest(r.sqlite, &ch.CreatedAt), timeScanDest(r.sqlite, &ch.UpdatedAt))
 	if err == sql.ErrNoRows {
 		return nil, service.ErrChannelNotFound
 	}
@@ -129,9 +138,9 @@ func (r *channelRepository) Update(ctx context.Context, channel *service.Channel
 		if err != nil {
 			return err
 		}
-		result, err := tx.ExecContext(ctx,
-			`UPDATE channels SET name = $1, description = $2, status = $3, model_mapping = $4, billing_model_source = $5, restrict_models = $6, features = $7, features_config = $8, apply_pricing_to_account_stats = $9, updated_at = NOW()
-			 WHERE id = $10`,
+		updateSQL := `UPDATE channels SET name = $1, description = $2, status = $3, model_mapping = $4, billing_model_source = $5, restrict_models = $6, features = $7, features_config = $8, apply_pricing_to_account_stats = $9, updated_at = NOW()
+			 WHERE id = $10`
+		result, err := tx.ExecContext(ctx, updateSQL,
 			channel.Name, channel.Description, channel.Status, modelMappingJSON, channel.BillingModelSource, channel.RestrictModels, channel.Features, featuresConfigJSON, channel.ApplyPricingToAccountStats, channel.ID,
 		)
 		if err != nil {
@@ -147,21 +156,21 @@ func (r *channelRepository) Update(ctx context.Context, channel *service.Channel
 
 		// 更新分组关联
 		if channel.GroupIDs != nil {
-			if err := setGroupIDsTx(ctx, tx, channel.ID, channel.GroupIDs); err != nil {
+			if err := setGroupIDsTx(ctx, tx, channel.ID, channel.GroupIDs, r.sqlite); err != nil {
 				return err
 			}
 		}
 
 		// 更新模型定价
 		if channel.ModelPricing != nil {
-			if err := replaceModelPricingTx(ctx, tx, channel.ID, channel.ModelPricing); err != nil {
+			if err := replaceModelPricingTx(ctx, tx, channel.ID, channel.ModelPricing, r.sqlite); err != nil {
 				return err
 			}
 		}
 
 		// 更新账号统计定价规则
 		if channel.AccountStatsPricingRules != nil {
-			if err := replaceAccountStatsPricingRulesTx(ctx, tx, channel.ID, channel.AccountStatsPricingRules); err != nil {
+			if err := replaceAccountStatsPricingRulesTx(ctx, tx, channel.ID, channel.AccountStatsPricingRules, r.sqlite); err != nil {
 				return err
 			}
 		}
@@ -193,7 +202,11 @@ func (r *channelRepository) List(ctx context.Context, params pagination.Paginati
 		argIdx++
 	}
 	if search != "" {
-		where = append(where, fmt.Sprintf("(c.name ILIKE $%d OR c.description ILIKE $%d)", argIdx, argIdx))
+		likeOp := "ILIKE"
+		if r.sqlite {
+			likeOp = "LIKE"
+		}
+		where = append(where, fmt.Sprintf("(c.name %s $%d OR c.description %s $%d)", likeOp, argIdx, likeOp, argIdx))
 		args = append(args, "%"+escapeLike(search)+"%")
 		argIdx++
 	}
@@ -233,7 +246,7 @@ func (r *channelRepository) List(ctx context.Context, params pagination.Paginati
 	for rows.Next() {
 		var ch service.Channel
 		var modelMappingJSON, featuresConfigJSON []byte
-		if err := rows.Scan(&ch.ID, &ch.Name, &ch.Description, &ch.Status, &modelMappingJSON, &ch.BillingModelSource, &ch.RestrictModels, &ch.Features, &featuresConfigJSON, &ch.ApplyPricingToAccountStats, &ch.CreatedAt, &ch.UpdatedAt); err != nil {
+		if err := rows.Scan(&ch.ID, &ch.Name, &ch.Description, &ch.Status, &modelMappingJSON, &ch.BillingModelSource, &ch.RestrictModels, &ch.Features, &featuresConfigJSON, &ch.ApplyPricingToAccountStats, timeScanDest(r.sqlite, &ch.CreatedAt), timeScanDest(r.sqlite, &ch.UpdatedAt)); err != nil {
 			return nil, nil, fmt.Errorf("scan channel: %w", err)
 		}
 		ch.ModelMapping = unmarshalModelMapping(modelMappingJSON)
@@ -320,7 +333,7 @@ func (r *channelRepository) ListAll(ctx context.Context) ([]service.Channel, err
 	for rows.Next() {
 		var ch service.Channel
 		var modelMappingJSON, featuresConfigJSON []byte
-		if err := rows.Scan(&ch.ID, &ch.Name, &ch.Description, &ch.Status, &modelMappingJSON, &ch.BillingModelSource, &ch.RestrictModels, &ch.Features, &featuresConfigJSON, &ch.ApplyPricingToAccountStats, &ch.CreatedAt, &ch.UpdatedAt); err != nil {
+		if err := rows.Scan(&ch.ID, &ch.Name, &ch.Description, &ch.Status, &modelMappingJSON, &ch.BillingModelSource, &ch.RestrictModels, &ch.Features, &featuresConfigJSON, &ch.ApplyPricingToAccountStats, timeScanDest(r.sqlite, &ch.CreatedAt), timeScanDest(r.sqlite, &ch.UpdatedAt)); err != nil {
 			return nil, fmt.Errorf("scan channel: %w", err)
 		}
 		ch.ModelMapping = unmarshalModelMapping(modelMappingJSON)
@@ -367,11 +380,17 @@ func (r *channelRepository) ListAll(ctx context.Context) ([]service.Channel, err
 
 // batchLoadGroupIDs 批量加载多个渠道的分组 ID
 func (r *channelRepository) batchLoadGroupIDs(ctx context.Context, channelIDs []int64) (map[int64][]int64, error) {
-	rows, err := r.db.QueryContext(ctx,
-		`SELECT channel_id, group_id FROM channel_groups
-		 WHERE channel_id = ANY($1) ORDER BY channel_id, group_id`,
-		pq.Array(channelIDs),
-	)
+	query := `SELECT channel_id, group_id FROM channel_groups
+		 WHERE channel_id = ANY($1) ORDER BY channel_id, group_id`
+	args := []any{pq.Array(channelIDs)}
+	if r.sqlite {
+		var bindErr error
+		query, args, bindErr = bindArrayArgsForSQLite(query, []any{channelIDs})
+		if bindErr != nil {
+			return nil, fmt.Errorf("batch load group ids: %w", bindErr)
+		}
+	}
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("batch load group ids: %w", err)
 	}
@@ -433,7 +452,7 @@ func (r *channelRepository) GetGroupIDs(ctx context.Context, channelID int64) ([
 }
 
 func (r *channelRepository) SetGroupIDs(ctx context.Context, channelID int64, groupIDs []int64) error {
-	return setGroupIDsTx(ctx, r.db, channelID, groupIDs)
+	return setGroupIDsTx(ctx, r.db, channelID, groupIDs, r.sqlite)
 }
 
 func (r *channelRepository) GetChannelIDByGroupID(ctx context.Context, groupID int64) (int64, error) {
@@ -451,10 +470,16 @@ func (r *channelRepository) GetGroupsInOtherChannels(ctx context.Context, channe
 	if len(groupIDs) == 0 {
 		return nil, nil
 	}
-	rows, err := r.db.QueryContext(ctx,
-		`SELECT group_id FROM channel_groups WHERE group_id = ANY($1) AND channel_id != $2`,
-		pq.Array(groupIDs), channelID,
-	)
+	query := `SELECT group_id FROM channel_groups WHERE group_id = ANY($1) AND channel_id != $2`
+	args := []any{pq.Array(groupIDs), channelID}
+	if r.sqlite {
+		var bindErr error
+		query, args, bindErr = bindArrayArgsForSQLite(query, []any{groupIDs, channelID})
+		if bindErr != nil {
+			return nil, fmt.Errorf("get groups in other channels: %w", bindErr)
+		}
+	}
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("get groups in other channels: %w", err)
 	}
@@ -526,10 +551,16 @@ func (r *channelRepository) GetGroupPlatforms(ctx context.Context, groupIDs []in
 	if len(groupIDs) == 0 {
 		return make(map[int64]string), nil
 	}
-	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, platform FROM groups WHERE id = ANY($1)`,
-		pq.Array(groupIDs),
-	)
+	query := `SELECT id, platform FROM groups WHERE id = ANY($1)`
+	args := []any{pq.Array(groupIDs)}
+	if r.sqlite {
+		var bindErr error
+		query, args, bindErr = bindArrayArgsForSQLite(query, []any{groupIDs})
+		if bindErr != nil {
+			return nil, fmt.Errorf("get group platforms: %w", bindErr)
+		}
+	}
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("get group platforms: %w", err)
 	}

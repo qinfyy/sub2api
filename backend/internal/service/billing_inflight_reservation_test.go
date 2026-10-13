@@ -65,6 +65,27 @@ func TestReserveInflightBalance_SimpleModeDisabled(t *testing.T) {
 	require.False(t, svc.InflightReservationEnabled())
 }
 
+type capacityExhaustedInflightCache struct {
+	*memInflightCache
+}
+
+func (c *capacityExhaustedInflightCache) ReserveInflightBalance(context.Context, int64, string, float64, float64, time.Duration) (bool, float64, error) {
+	return false, 0, &testCapacityError{}
+}
+
+type testCapacityError struct{}
+
+func (*testCapacityError) Error() string                { return "capacity exhausted" }
+func (*testCapacityError) CacheCapacityExhausted() bool { return true }
+
+func TestReserveInflightBalance_CapacityExhaustedFailsClosed(t *testing.T) {
+	base := newMemInflightCache(10)
+	svc := newInflightSvc(t, &capacityExhaustedInflightCache{memInflightCache: base}, 60)
+
+	_, err := svc.ReserveInflightBalance(context.Background(), &User{ID: 1}, nil, nil, 1)
+	require.ErrorIs(t, err, ErrBillingServiceUnavailable)
+}
+
 // ---------------------------------------------------------------------------
 // estimate: same model / resolver as billing
 // ---------------------------------------------------------------------------

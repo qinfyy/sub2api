@@ -15,11 +15,17 @@ import (
 // batchLoadAccountStatsPricingRules 批量加载多个渠道的账号统计定价规则（含模型定价）
 func (r *channelRepository) batchLoadAccountStatsPricingRules(ctx context.Context, channelIDs []int64) (map[int64][]service.AccountStatsPricingRule, error) {
 	// 1. 查询规则
-	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, channel_id, name, group_ids, account_ids, sort_order, created_at, updated_at
-		 FROM channel_account_stats_pricing_rules WHERE channel_id = ANY($1) ORDER BY channel_id, sort_order, id`,
-		pq.Array(channelIDs),
-	)
+	query := `SELECT id, channel_id, name, group_ids, account_ids, sort_order, created_at, updated_at
+		 FROM channel_account_stats_pricing_rules WHERE channel_id = ANY($1) ORDER BY channel_id, sort_order, id`
+	args := []any{pq.Array(channelIDs)}
+	if r.sqlite {
+		var bindErr error
+		query, args, bindErr = bindArrayArgsForSQLite(query, []any{channelIDs})
+		if bindErr != nil {
+			return nil, fmt.Errorf("batch load account stats pricing rules: %w", bindErr)
+		}
+	}
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("batch load account stats pricing rules: %w", err)
 	}
@@ -29,7 +35,18 @@ func (r *channelRepository) batchLoadAccountStatsPricingRules(ctx context.Contex
 	var ruleIDs []int64
 	for rows.Next() {
 		var rule service.AccountStatsPricingRule
-		if err := rows.Scan(
+		if r.sqlite {
+			var groupIDsJSON, accountIDsJSON []byte
+			if err := rows.Scan(
+				&rule.ID, &rule.ChannelID, &rule.Name,
+				&groupIDsJSON, &accountIDsJSON,
+				&rule.SortOrder, timeScanDest(true, &rule.CreatedAt), timeScanDest(true, &rule.UpdatedAt),
+			); err != nil {
+				return nil, fmt.Errorf("scan account stats pricing rule: %w", err)
+			}
+			rule.GroupIDs = decodeSQLiteInt64JSON(groupIDsJSON)
+			rule.AccountIDs = decodeSQLiteInt64JSON(accountIDsJSON)
+		} else if err := rows.Scan(
 			&rule.ID, &rule.ChannelID, &rule.Name,
 			pq.Array(&rule.GroupIDs), pq.Array(&rule.AccountIDs),
 			&rule.SortOrder, &rule.CreatedAt, &rule.UpdatedAt,
@@ -65,12 +82,18 @@ func (r *channelRepository) batchLoadAccountStatsModelPricing(ctx context.Contex
 		return make(map[int64][]service.ChannelModelPricing), nil
 	}
 
-	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, rule_id, platform, models, billing_mode, input_price, output_price,
+	query := `SELECT id, rule_id, platform, models, billing_mode, input_price, output_price,
 		        cache_write_price, cache_write_1h_price, cache_read_price, reasoning_effort_multipliers, image_output_price, per_request_price, created_at, updated_at
-		 FROM channel_account_stats_model_pricing WHERE rule_id = ANY($1) ORDER BY rule_id, id`,
-		pq.Array(ruleIDs),
-	)
+		 FROM channel_account_stats_model_pricing WHERE rule_id = ANY($1) ORDER BY rule_id, id`
+	args := []any{pq.Array(ruleIDs)}
+	if r.sqlite {
+		var bindErr error
+		query, args, bindErr = bindArrayArgsForSQLite(query, []any{ruleIDs})
+		if bindErr != nil {
+			return nil, fmt.Errorf("batch load account stats model pricing: %w", bindErr)
+		}
+	}
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("batch load account stats model pricing: %w", err)
 	}
@@ -85,7 +108,7 @@ func (r *channelRepository) batchLoadAccountStatsModelPricing(ctx context.Contex
 		if err := rows.Scan(
 			&p.ID, &ruleID, &p.Platform, &modelsJSON, &p.BillingMode,
 			&p.InputPrice, &p.OutputPrice, &p.CacheWritePrice, &p.CacheWrite1hPrice, &p.CacheReadPrice,
-			&reasoningEffortMultipliersJSON, &p.ImageOutputPrice, &p.PerRequestPrice, &p.CreatedAt, &p.UpdatedAt,
+			&reasoningEffortMultipliersJSON, &p.ImageOutputPrice, &p.PerRequestPrice, timeScanDest(r.sqlite, &p.CreatedAt), timeScanDest(r.sqlite, &p.UpdatedAt),
 		); err != nil {
 			return nil, fmt.Errorf("scan account stats model pricing: %w", err)
 		}
@@ -136,7 +159,7 @@ func (r *channelRepository) loadAccountStatsPricingRules(ctx context.Context, ch
 }
 
 // replaceAccountStatsPricingRulesTx 在事务中替换渠道的账号统计定价规则（删除旧的 + 插入新的）
-func replaceAccountStatsPricingRulesTx(ctx context.Context, tx *sql.Tx, channelID int64, rules []service.AccountStatsPricingRule) error {
+func replaceAccountStatsPricingRulesTx(ctx context.Context, tx *sql.Tx, channelID int64, rules []service.AccountStatsPricingRule, sqlite ...bool) error {
 	// CASCADE 会自动删除关联的 model_pricing
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM channel_account_stats_pricing_rules WHERE channel_id = $1`, channelID,
@@ -146,7 +169,7 @@ func replaceAccountStatsPricingRulesTx(ctx context.Context, tx *sql.Tx, channelI
 
 	for i := range rules {
 		rules[i].ChannelID = channelID
-		if err := createAccountStatsPricingRuleTx(ctx, tx, &rules[i]); err != nil {
+		if err := createAccountStatsPricingRuleTx(ctx, tx, &rules[i], sqlite...); err != nil {
 			return fmt.Errorf("insert account stats pricing rule: %w", err)
 		}
 	}
@@ -154,18 +177,38 @@ func replaceAccountStatsPricingRulesTx(ctx context.Context, tx *sql.Tx, channelI
 }
 
 // createAccountStatsPricingRuleTx 在事务中创建单条账号统计定价规则及其模型定价
-func createAccountStatsPricingRuleTx(ctx context.Context, tx *sql.Tx, rule *service.AccountStatsPricingRule) error {
-	err := tx.QueryRowContext(ctx,
-		`INSERT INTO channel_account_stats_pricing_rules (channel_id, name, group_ids, account_ids, sort_order)
-		 VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at, updated_at`,
-		rule.ChannelID, rule.Name, pq.Array(rule.GroupIDs), pq.Array(rule.AccountIDs), rule.SortOrder,
-	).Scan(&rule.ID, &rule.CreatedAt, &rule.UpdatedAt)
+func createAccountStatsPricingRuleTx(ctx context.Context, tx *sql.Tx, rule *service.AccountStatsPricingRule, sqlite ...bool) error {
+	var err error
+	if len(sqlite) > 0 && sqlite[0] {
+		result, execErr := tx.ExecContext(ctx,
+			`INSERT INTO channel_account_stats_pricing_rules (channel_id, name, group_ids, account_ids, sort_order)
+			 VALUES ($1, $2, $3, $4, $5)`,
+			rule.ChannelID, rule.Name, sqliteJSONSlice(rule.GroupIDs), sqliteJSONSlice(rule.AccountIDs), rule.SortOrder,
+		)
+		if execErr != nil {
+			return fmt.Errorf("insert account stats pricing rule: %w", execErr)
+		}
+		rule.ID, err = result.LastInsertId()
+		if err != nil {
+			return fmt.Errorf("insert account stats pricing rule id: %w", err)
+		}
+		err = tx.QueryRowContext(ctx,
+			`SELECT created_at, updated_at FROM channel_account_stats_pricing_rules WHERE id = $1`,
+			rule.ID,
+		).Scan(timeScanDest(true, &rule.CreatedAt), timeScanDest(true, &rule.UpdatedAt))
+	} else {
+		err = tx.QueryRowContext(ctx,
+			`INSERT INTO channel_account_stats_pricing_rules (channel_id, name, group_ids, account_ids, sort_order)
+			 VALUES ($1, $2, $3, $4, $5) RETURNING id, created_at, updated_at`,
+			rule.ChannelID, rule.Name, pq.Array(rule.GroupIDs), pq.Array(rule.AccountIDs), rule.SortOrder,
+		).Scan(&rule.ID, &rule.CreatedAt, &rule.UpdatedAt)
+	}
 	if err != nil {
 		return fmt.Errorf("insert account stats pricing rule: %w", err)
 	}
 
 	for j := range rule.Pricing {
-		if err := createAccountStatsModelPricingTx(ctx, tx, rule.ID, &rule.Pricing[j]); err != nil {
+		if err := createAccountStatsModelPricingTx(ctx, tx, rule.ID, &rule.Pricing[j], sqlite...); err != nil {
 			return err
 		}
 	}
@@ -173,7 +216,7 @@ func createAccountStatsPricingRuleTx(ctx context.Context, tx *sql.Tx, rule *serv
 }
 
 // createAccountStatsModelPricingTx 在事务中创建单条账号统计模型定价
-func createAccountStatsModelPricingTx(ctx context.Context, tx *sql.Tx, ruleID int64, pricing *service.ChannelModelPricing) error {
+func createAccountStatsModelPricingTx(ctx context.Context, tx *sql.Tx, ruleID int64, pricing *service.ChannelModelPricing, sqlite ...bool) error {
 	modelsJSON, err := json.Marshal(pricing.Models)
 	if err != nil {
 		return fmt.Errorf("marshal models: %w", err)
@@ -187,13 +230,34 @@ func createAccountStatsModelPricingTx(ctx context.Context, tx *sql.Tx, ruleID in
 		billingMode = service.BillingModeToken
 	}
 	platform := pricing.Platform
-	err = tx.QueryRowContext(ctx,
-		`INSERT INTO channel_account_stats_model_pricing (rule_id, platform, models, billing_mode, input_price, output_price, cache_write_price, cache_write_1h_price, cache_read_price, reasoning_effort_multipliers, image_output_price, per_request_price)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id, created_at, updated_at`,
-		ruleID, platform, modelsJSON, billingMode,
-		pricing.InputPrice, pricing.OutputPrice, pricing.CacheWritePrice, pricing.CacheWrite1hPrice, pricing.CacheReadPrice,
-		reasoningEffortMultipliersJSON, pricing.ImageOutputPrice, pricing.PerRequestPrice,
-	).Scan(&pricing.ID, &pricing.CreatedAt, &pricing.UpdatedAt)
+	if len(sqlite) > 0 && sqlite[0] {
+		result, execErr := tx.ExecContext(ctx,
+			`INSERT INTO channel_account_stats_model_pricing (rule_id, platform, models, billing_mode, input_price, output_price, cache_write_price, cache_write_1h_price, cache_read_price, reasoning_effort_multipliers, image_output_price, per_request_price)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+			ruleID, platform, modelsJSON, billingMode,
+			pricing.InputPrice, pricing.OutputPrice, pricing.CacheWritePrice, pricing.CacheWrite1hPrice, pricing.CacheReadPrice,
+			reasoningEffortMultipliersJSON, pricing.ImageOutputPrice, pricing.PerRequestPrice,
+		)
+		if execErr != nil {
+			return fmt.Errorf("insert account stats model pricing: %w", execErr)
+		}
+		pricing.ID, err = result.LastInsertId()
+		if err != nil {
+			return fmt.Errorf("insert account stats model pricing id: %w", err)
+		}
+		err = tx.QueryRowContext(ctx,
+			`SELECT created_at, updated_at FROM channel_account_stats_model_pricing WHERE id = $1`,
+			pricing.ID,
+		).Scan(timeScanDest(true, &pricing.CreatedAt), timeScanDest(true, &pricing.UpdatedAt))
+	} else {
+		err = tx.QueryRowContext(ctx,
+			`INSERT INTO channel_account_stats_model_pricing (rule_id, platform, models, billing_mode, input_price, output_price, cache_write_price, cache_write_1h_price, cache_read_price, reasoning_effort_multipliers, image_output_price, per_request_price)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id, created_at, updated_at`,
+			ruleID, platform, modelsJSON, billingMode,
+			pricing.InputPrice, pricing.OutputPrice, pricing.CacheWritePrice, pricing.CacheWrite1hPrice, pricing.CacheReadPrice,
+			reasoningEffortMultipliersJSON, pricing.ImageOutputPrice, pricing.PerRequestPrice,
+		).Scan(&pricing.ID, &pricing.CreatedAt, &pricing.UpdatedAt)
+	}
 	if err != nil {
 		return fmt.Errorf("insert account stats model pricing: %w", err)
 	}
@@ -201,7 +265,7 @@ func createAccountStatsModelPricingTx(ctx context.Context, tx *sql.Tx, ruleID in
 	for i := range pricing.Intervals {
 		iv := &pricing.Intervals[i]
 		iv.PricingID = pricing.ID
-		if err := createAccountStatsIntervalTx(ctx, tx, iv); err != nil {
+		if err := createAccountStatsIntervalTx(ctx, tx, iv, sqlite...); err != nil {
 			return err
 		}
 	}
@@ -209,7 +273,22 @@ func createAccountStatsModelPricingTx(ctx context.Context, tx *sql.Tx, ruleID in
 }
 
 // createAccountStatsIntervalTx inserts a single interval for an account stats pricing entry.
-func createAccountStatsIntervalTx(ctx context.Context, tx *sql.Tx, iv *service.PricingInterval) error {
+func createAccountStatsIntervalTx(ctx context.Context, tx *sql.Tx, iv *service.PricingInterval, sqlite ...bool) error {
+	if len(sqlite) > 0 && sqlite[0] {
+		result, err := tx.ExecContext(ctx,
+			`INSERT INTO channel_account_stats_pricing_intervals
+		 (pricing_id, min_tokens, max_tokens, tier_label, input_price, output_price, cache_write_price, cache_write_1h_price, cache_read_price, per_request_price, sort_order)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+			iv.PricingID, iv.MinTokens, iv.MaxTokens, iv.TierLabel,
+			iv.InputPrice, iv.OutputPrice, iv.CacheWritePrice, iv.CacheWrite1hPrice, iv.CacheReadPrice,
+			iv.PerRequestPrice, iv.SortOrder,
+		)
+		if err != nil {
+			return err
+		}
+		iv.ID, _ = result.LastInsertId()
+		return nil
+	}
 	return tx.QueryRowContext(ctx,
 		`INSERT INTO channel_account_stats_pricing_intervals
 		 (pricing_id, min_tokens, max_tokens, tier_label, input_price, output_price, cache_write_price, cache_write_1h_price, cache_read_price, per_request_price, sort_order)
@@ -225,14 +304,20 @@ func (r *channelRepository) batchLoadAccountStatsIntervals(ctx context.Context, 
 	if len(pricingIDs) == 0 {
 		return nil, nil
 	}
-	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, pricing_id, min_tokens, max_tokens, tier_label,
+	query := `SELECT id, pricing_id, min_tokens, max_tokens, tier_label,
 		        input_price, output_price, cache_write_price, cache_write_1h_price, cache_read_price,
 		        per_request_price, sort_order, created_at, updated_at
 		 FROM channel_account_stats_pricing_intervals
-		 WHERE pricing_id = ANY($1) ORDER BY pricing_id, sort_order, id`,
-		pq.Array(pricingIDs),
-	)
+		 WHERE pricing_id = ANY($1) ORDER BY pricing_id, sort_order, id`
+	args := []any{pq.Array(pricingIDs)}
+	if r.sqlite {
+		var bindErr error
+		query, args, bindErr = bindArrayArgsForSQLite(query, []any{pricingIDs})
+		if bindErr != nil {
+			return nil, fmt.Errorf("batch load account stats pricing intervals: %w", bindErr)
+		}
+	}
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("batch load account stats pricing intervals: %w", err)
 	}
@@ -244,7 +329,7 @@ func (r *channelRepository) batchLoadAccountStatsIntervals(ctx context.Context, 
 		if err := rows.Scan(
 			&iv.ID, &iv.PricingID, &iv.MinTokens, &iv.MaxTokens, &iv.TierLabel,
 			&iv.InputPrice, &iv.OutputPrice, &iv.CacheWritePrice, &iv.CacheWrite1hPrice, &iv.CacheReadPrice,
-			&iv.PerRequestPrice, &iv.SortOrder, &iv.CreatedAt, &iv.UpdatedAt,
+			&iv.PerRequestPrice, &iv.SortOrder, timeScanDest(r.sqlite, &iv.CreatedAt), timeScanDest(r.sqlite, &iv.UpdatedAt),
 		); err != nil {
 			return nil, fmt.Errorf("scan account stats pricing interval: %w", err)
 		}

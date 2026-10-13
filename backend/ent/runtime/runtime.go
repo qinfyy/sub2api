@@ -20,10 +20,12 @@ import (
 	"github.com/Wei-Shaw/sub2api/ent/channelmonitorhistory"
 	"github.com/Wei-Shaw/sub2api/ent/channelmonitorrequesttemplate"
 	"github.com/Wei-Shaw/sub2api/ent/compositemodelroute"
+	"github.com/Wei-Shaw/sub2api/ent/durablestate"
 	"github.com/Wei-Shaw/sub2api/ent/errorpassthroughrule"
 	"github.com/Wei-Shaw/sub2api/ent/group"
 	"github.com/Wei-Shaw/sub2api/ent/idempotencyrecord"
 	"github.com/Wei-Shaw/sub2api/ent/identityadoptiondecision"
+	"github.com/Wei-Shaw/sub2api/ent/imagequeueentry"
 	"github.com/Wei-Shaw/sub2api/ent/paymentauditlog"
 	"github.com/Wei-Shaw/sub2api/ent/paymentorder"
 	"github.com/Wei-Shaw/sub2api/ent/paymentproviderinstance"
@@ -927,6 +929,12 @@ func init() {
 	compositemodelrouteDescEnabled := compositemodelrouteFields[7].Descriptor()
 	// compositemodelroute.DefaultEnabled holds the default value on creation for the enabled field.
 	compositemodelroute.DefaultEnabled = compositemodelrouteDescEnabled.Default.(bool)
+	durablestateFields := schema.DurableState{}.Fields()
+	_ = durablestateFields
+	// durablestateDescUpdatedAt is the schema descriptor for updated_at field.
+	durablestateDescUpdatedAt := durablestateFields[3].Descriptor()
+	// durablestate.DefaultUpdatedAt holds the default value on creation for the updated_at field.
+	durablestate.DefaultUpdatedAt = durablestateDescUpdatedAt.Default.(func() string)
 	errorpassthroughruleMixin := schema.ErrorPassthroughRule{}.Mixin()
 	errorpassthroughruleMixinFields0 := errorpassthroughruleMixin[0].Fields()
 	_ = errorpassthroughruleMixinFields0
@@ -1285,6 +1293,16 @@ func init() {
 	identityadoptiondecisionDescDecidedAt := identityadoptiondecisionFields[4].Descriptor()
 	// identityadoptiondecision.DefaultDecidedAt holds the default value on creation for the decided_at field.
 	identityadoptiondecision.DefaultDecidedAt = identityadoptiondecisionDescDecidedAt.Default.(func() time.Time)
+	imagequeueentryFields := schema.ImageQueueEntry{}.Fields()
+	_ = imagequeueentryFields
+	// imagequeueentryDescHeartbeatAt is the schema descriptor for heartbeat_at field.
+	imagequeueentryDescHeartbeatAt := imagequeueentryFields[3].Descriptor()
+	// imagequeueentry.DefaultHeartbeatAt holds the default value on creation for the heartbeat_at field.
+	imagequeueentry.DefaultHeartbeatAt = imagequeueentryDescHeartbeatAt.Default.(int64)
+	// imagequeueentryDescReceipt is the schema descriptor for receipt field.
+	imagequeueentryDescReceipt := imagequeueentryFields[4].Descriptor()
+	// imagequeueentry.DefaultReceipt holds the default value on creation for the receipt field.
+	imagequeueentry.DefaultReceipt = imagequeueentryDescReceipt.Default.(string)
 	paymentauditlogFields := schema.PaymentAuditLog{}.Fields()
 	_ = paymentauditlogFields
 	// paymentauditlogDescOrderID is the schema descriptor for order_id field.

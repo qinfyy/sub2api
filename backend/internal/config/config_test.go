@@ -16,6 +16,7 @@ import (
 
 func resetViperWithJWTSecret(t *testing.T) {
 	t.Helper()
+	t.Chdir(t.TempDir())
 	viper.Reset()
 	t.Cleanup(viper.Reset)
 	t.Setenv("CONFIG_FILE", "")
@@ -347,6 +348,7 @@ func TestLoadReturnsErrorForMissingConfigFile(t *testing.T) {
 }
 
 func TestLoadForBootstrapAllowsMissingJWTSecret(t *testing.T) {
+	t.Chdir(t.TempDir())
 	viper.Reset()
 	t.Cleanup(viper.Reset)
 	t.Setenv("CONFIG_FILE", "")
@@ -896,8 +898,26 @@ func TestLoadDefaultDatabaseSSLMode(t *testing.T) {
 		t.Fatalf("Load() error: %v", err)
 	}
 
-	if cfg.Database.SSLMode != "prefer" {
-		t.Fatalf("Database.SSLMode = %q, want %q", cfg.Database.SSLMode, "prefer")
+	if cfg.Database.SSLMode != "require" {
+		t.Fatalf("Database.SSLMode = %q, want %q", cfg.Database.SSLMode, "require")
+	}
+}
+
+func TestDatabaseSSLModeValidation(t *testing.T) {
+	for _, mode := range []string{"require", "verify-ca", "verify-full", "disable", "prefer", ""} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := NewDefaultConfig()
+			cfg.JWT.Secret = strings.Repeat("s", 32)
+			cfg.Database.SSLMode = mode
+			err := cfg.Validate()
+			if mode == "prefer" || mode == "" {
+				if err == nil || !strings.Contains(err.Error(), "database.sslmode") {
+					t.Fatalf("want SSL mode error, got %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

@@ -60,7 +60,22 @@ func (c *memoryCacheCore) set(key string, value any, ttl time.Duration) {
 	c.setLocked(key, value, ttl)
 }
 
-var errMemoryCapacity = errors.New("memory cache capacity exhausted")
+// memoryCacheCapacityError marks admission failures caused by the configured
+// memory budget. The marker lets upper layers distinguish "full" from a
+// transient backend outage without importing the repository package.
+type memoryCacheCapacityError struct {
+	error
+}
+
+func (memoryCacheCapacityError) CacheCapacityExhausted() bool { return true }
+
+// ErrMemoryCacheCapacity is returned when a protected entry cannot be added
+// because the configured memory budget is exhausted. Callers must not treat
+// this like a transient backend outage and silently fail open.
+var ErrMemoryCacheCapacity = memoryCacheCapacityError{errors.New("memory cache capacity exhausted")}
+
+// errMemoryCapacity is kept as an internal alias for the existing call sites.
+var errMemoryCapacity = ErrMemoryCacheCapacity
 
 func (c *memoryCacheCore) increment(key string, ttl time.Duration, refreshTTL bool) (int64, error) {
 	c.mu.Lock()

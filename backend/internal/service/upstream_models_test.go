@@ -772,6 +772,26 @@ func TestSyncUpstreamModelCatalogDoesNotOverwriteSnapshotWhenRegistryFails(t *te
 	require.Nil(t, repo.updates, "a failed metadata enrichment must not erase a previously saved snapshot")
 }
 
+func TestSyncUpstreamModelCatalogUnmatchedProviderPreservesSnapshot(t *testing.T) {
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{
+		{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"data":[{"id":"custom-model"}]}`))},
+		{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"other":{"api":"https://other.example/v1","models":{}}}`))},
+	}}
+	repo := &upstreamModelMetadataRepoStub{}
+	svc := &AccountTestService{accountRepo: repo, httpUpstream: upstream, cfg: upstreamModelSyncTestConfig()}
+	account := &Account{ID: 99, Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
+		Credentials: map[string]any{"api_key": "test-key", "base_url": "https://custom.example/v1"},
+		Extra:       map[string]any{UpstreamModelMetadataExtraKey: map[string]any{"source": "upstream", "models": map[string]any{"custom-model": map[string]any{"reasoning": true}}}},
+	}
+	catalog, err := svc.SyncUpstreamModelCatalog(context.Background(), account)
+	require.NoError(t, err)
+	require.Equal(t, []string{"custom-model"}, catalog.Models)
+	require.Nil(t, repo.updates)
+	require.NotEmpty(t, catalog.Warnings)
+	_, err = svc.fetchModelsDevMetadata(context.Background(), account, catalog.Models)
+	require.ErrorIs(t, err, errModelMetadataProviderNotMatched)
+}
+
 func TestSyncUpstreamModelCatalogDoesNotPersistPartialMetadataWhenRegistryFails(t *testing.T) {
 	upstream := &httpUpstreamRecorder{responses: []*http.Response{
 		{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"models":[{

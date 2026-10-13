@@ -59,6 +59,7 @@ type OpsAggregationService struct {
 	db          *sql.DB
 	redisClient *redis.Client
 	instanceID  string
+	leaderLock  LeaderLockCache
 
 	stopCh    chan struct{}
 	startOnce sync.Once
@@ -76,6 +77,7 @@ func NewOpsAggregationService(
 	settingRepo SettingRepository,
 	db *sql.DB,
 	redisClient *redis.Client,
+	leaderLock LeaderLockCache,
 	cfg *config.Config,
 ) *OpsAggregationService {
 	return &OpsAggregationService{
@@ -84,8 +86,18 @@ func NewOpsAggregationService(
 		cfg:         cfg,
 		db:          db,
 		redisClient: redisClient,
+		leaderLock:  leaderLock,
 		instanceID:  uuid.NewString(),
 	}
+}
+
+// SetLeaderLock lets tests and legacy constructors inject the shared lock
+// backend after construction.
+func (s *OpsAggregationService) SetLeaderLock(lock LeaderLockCache) {
+	if s == nil {
+		return
+	}
+	s.leaderLock = lock
 }
 
 func (s *OpsAggregationService) Start() {
@@ -373,13 +385,6 @@ func (s *OpsAggregationService) isMonitoringEnabled(ctx context.Context) bool {
 	}
 }
 
-var opsAggReleaseScript = redis.NewScript(`
-if redis.call("GET", KEYS[1]) == ARGV[1] then
-  return redis.call("DEL", KEYS[1])
-end
-return 0
-`)
-
 func (s *OpsAggregationService) tryAcquireLeaderLock(ctx context.Context, key string, ttl time.Duration, logPrefix string) (func(), bool) {
 	if s == nil {
 		return nil, false
@@ -388,26 +393,7 @@ func (s *OpsAggregationService) tryAcquireLeaderLock(ctx context.Context, key st
 		ctx = context.Background()
 	}
 
-	// Prefer Redis leader lock when available (multi-instance), but avoid stampeding
-	// the DB when Redis is flaky by falling back to a DB advisory lock.
-	if s.redisClient != nil {
-		ok, err := s.redisClient.SetNX(ctx, key, s.instanceID, ttl).Result()
-		if err == nil {
-			if !ok {
-				s.maybeLogSkip(logPrefix)
-				return nil, false
-			}
-			release := func() {
-				ctx2, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-				defer cancel()
-				_, _ = opsAggReleaseScript.Run(ctx2, s.redisClient, []string{key}, s.instanceID).Result()
-			}
-			return release, true
-		}
-		// Redis error: fall through to DB advisory lock.
-	}
-
-	release, ok := tryAcquireDBAdvisoryLock(ctx, s.db, hashAdvisoryLockID(key))
+	release, ok := tryAcquireSingletonLeaderLock(ctx, s.leaderLock, s.db, key, s.instanceID, ttl)
 	if !ok {
 		s.maybeLogSkip(logPrefix)
 		return nil, false

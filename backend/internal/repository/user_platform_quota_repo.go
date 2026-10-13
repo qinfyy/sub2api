@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"entgo.io/ent/dialect"
 	dbent "github.com/Wei-Shaw/sub2api/ent"
 	"github.com/Wei-Shaw/sub2api/ent/userplatformquota"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/timezone"
@@ -176,14 +177,20 @@ func (r *userPlatformQuotaRepository) ListByUser(ctx context.Context, userID int
 //     不存在的行等价于不限额，没有可累加的对象。
 func (r *userPlatformQuotaRepository) IncrementUsageWithReset(ctx context.Context, userID int64, platform string, cost float64, now time.Time) error {
 	return r.withTx(ctx, func(txCtx context.Context, txClient *dbent.Client) error {
-		existing, err := txClient.UserPlatformQuota.Query().
+		query := txClient.UserPlatformQuota.Query().
 			Where(
 				userplatformquota.UserIDEQ(userID),
 				userplatformquota.PlatformEQ(platform),
 				userplatformquota.DeletedAtIsNil(),
-			).
-			ForUpdate().
-			Only(txCtx)
+			)
+		if txClient.Driver().Dialect() == dialect.SQLite {
+			if _, err := txClient.ExecContext(txCtx, `UPDATE user_platform_quotas SET daily_usage_usd=daily_usage_usd WHERE user_id=$1 AND platform=$2 AND deleted_at IS NULL`, userID, platform); err != nil {
+				return err
+			}
+		} else {
+			query = query.ForUpdate()
+		}
+		existing, err := query.Only(txCtx)
 		if dbent.IsNotFound(err) {
 			return nil
 		}
@@ -432,6 +439,19 @@ const batchRows = 6000
 func (r *userPlatformQuotaRepository) BatchSnapshotUsage(ctx context.Context, snapshots []UserPlatformQuotaSnapshot, now time.Time) error {
 	if len(snapshots) == 0 {
 		return nil
+	}
+	if r.client.Driver().Dialect() == dialect.SQLite {
+		return r.withTx(ctx, func(txCtx context.Context, client *dbent.Client) error {
+			for _, s := range snapshots {
+				_, err := client.UserPlatformQuota.Update().Where(userplatformquota.UserIDEQ(s.UserID), userplatformquota.PlatformEQ(s.Platform), userplatformquota.DeletedAtIsNil()).
+					SetDailyUsageUsd(s.DailyUsageUSD).SetWeeklyUsageUsd(s.WeeklyUsageUSD).SetMonthlyUsageUsd(s.MonthlyUsageUSD).
+					SetDailyWindowStart(s.DailyWindowStart).SetWeeklyWindowStart(s.WeeklyWindowStart).SetMonthlyWindowStart(s.MonthlyWindowStart).SetUpdatedAt(now).Save(txCtx)
+				if err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 	}
 
 	client := clientFromContext(ctx, r.client)

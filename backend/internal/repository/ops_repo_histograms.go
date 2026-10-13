@@ -22,7 +22,7 @@ func (r *opsRepository) GetLatencyHistogram(ctx context.Context, filter *service
 	start := filter.StartTime.UTC()
 	end := filter.EndTime.UTC()
 
-	join, where, args, _ := buildUsageWhere(filter, start, end, 1)
+	join, where, args, _ := buildUsageWhere(filter, start, end, 1, isSQLiteDB(r.db))
 	rangeExpr := latencyHistogramRangeCaseExpr("ul.duration_ms")
 	orderExpr := latencyHistogramRangeOrderCaseExpr("ul.duration_ms")
 

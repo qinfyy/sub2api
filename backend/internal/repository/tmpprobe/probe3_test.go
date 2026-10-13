@@ -29,7 +29,7 @@ func TestProbeEntTimestampFormat(t *testing.T) {
 	defer client.Close()
 
 	if err := client.Schema.Create(context.Background()); err != nil {
-	t.Fatalf("schema create: %v", err)
+		t.Fatalf("schema create: %v", err)
 	}
 
 	now := time.Date(2026, 1, 2, 3, 4, 5, 123456000, time.UTC)
@@ -77,7 +77,7 @@ func TestProbeEntTimestampFormat(t *testing.T) {
 		t.Logf("sqlite variant with $1: %v", err)
 	} else {
 		rows.Close()
-	t.Logf("sqlite variant with $1 executed OK (ent translates for exec? no) ")
+		t.Logf("sqlite variant with $1 executed OK (ent translates for exec? no) ")
 	}
 	_ = dbgroup.FieldName
 }

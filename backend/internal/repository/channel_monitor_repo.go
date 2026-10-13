@@ -12,6 +12,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/ent/channelmonitor"
 	"github.com/Wei-Shaw/sub2api/ent/channelmonitorhistory"
 	"github.com/Wei-Shaw/sub2api/internal/domain"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/dbtime"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/lib/pq"
 
@@ -28,11 +29,12 @@ import (
 type channelMonitorRepository struct {
 	client *dbent.Client
 	db     *sql.DB
+	sqlite bool
 }
 
 // NewChannelMonitorRepository 创建仓储实例。
 func NewChannelMonitorRepository(client *dbent.Client, db *sql.DB) service.ChannelMonitorRepository {
-	return &channelMonitorRepository{client: client, db: db}
+	return &channelMonitorRepository{client: client, db: db, sqlite: isSQLiteDB(db)}
 }
 
 // ---------- CRUD ----------
@@ -263,6 +265,9 @@ func (r *channelMonitorRepository) InsertHistoryBatch(ctx context.Context, rows 
 // DeleteHistoryBefore 物理删 checked_at < before 的明细，分批 channelMonitorPruneBatchSize 行一批，
 // 避免单事务删除过多引起锁/WAL 压力。借助 (checked_at) 索引定位小批 id，再按 id 删。
 func (r *channelMonitorRepository) DeleteHistoryBefore(ctx context.Context, before time.Time) (int64, error) {
+	if r.sqlite {
+		return deleteChannelMonitorBatched(ctx, r.db, channelMonitorSQLitePruneHistorySQL, before)
+	}
 	return deleteChannelMonitorBatched(ctx, r.db, channelMonitorPruneHistorySQL, before)
 }
 
@@ -303,6 +308,17 @@ func (r *channelMonitorRepository) ListHistory(ctx context.Context, monitorID in
 // ListLatestPerModel 用 DISTINCT ON 取每个 (monitor_id, model) 的最近一条记录。
 // 借助 (monitor_id, model, checked_at DESC) 索引可走 Index Scan。
 func (r *channelMonitorRepository) ListLatestPerModel(ctx context.Context, monitorID int64) ([]*service.ChannelMonitorLatest, error) {
+	if r.sqlite {
+		rows, err := r.ListLatestForMonitorIDs(ctx, []int64{monitorID})
+		if err != nil {
+			return nil, err
+		}
+		out := rows[monitorID]
+		if out == nil {
+			out = []*service.ChannelMonitorLatest{}
+		}
+		return out, nil
+	}
 	const q = `
 		SELECT DISTINCT ON (model)
 		    model, status, latency_ms, ping_latency_ms, checked_at
@@ -361,6 +377,17 @@ func scanMonitorQuota(data []byte) *domain.MonitorQuotaSnapshot {
 // 明细保留 30 天（monitorHistoryRetentionDays），窗口 <= 30 天时直接扫 histories，
 // 精度到秒，避免与聚合表 UNION 带来的 UTC 日切精度损失。
 func (r *channelMonitorRepository) ComputeAvailability(ctx context.Context, monitorID int64, windowDays int) ([]*service.ChannelMonitorAvailability, error) {
+	if r.sqlite {
+		rows, err := r.ComputeAvailabilityForMonitors(ctx, []int64{monitorID}, windowDays)
+		if err != nil {
+			return nil, err
+		}
+		out := rows[monitorID]
+		if out == nil {
+			out = []*service.ChannelMonitorAvailability{}
+		}
+		return out, nil
+	}
 	if windowDays <= 0 {
 		windowDays = 7
 	}
@@ -431,7 +458,16 @@ func (r *channelMonitorRepository) ListLatestForMonitorIDs(ctx context.Context, 
 		WHERE monitor_id = ANY($1)
 		ORDER BY monitor_id, model, checked_at DESC
 	`
-	rows, err := r.db.QueryContext(ctx, q, pq.Array(ids))
+	query, arg := q, any(pq.Array(ids))
+	if r.sqlite {
+		query = channelMonitorSQLiteLatestSQL
+		var err error
+		arg, err = jsonArrayArg(ids)
+		if err != nil {
+			return nil, err
+		}
+	}
+	rows, err := r.db.QueryContext(ctx, query, arg)
 	if err != nil {
 		return nil, fmt.Errorf("query latest batch: %w", err)
 	}
@@ -442,7 +478,7 @@ func (r *channelMonitorRepository) ListLatestForMonitorIDs(ctx context.Context, 
 		l := &service.ChannelMonitorLatest{}
 		var latency, ping sql.NullInt64
 		var quota []byte
-		if err := rows.Scan(&monitorID, &l.Model, &l.Status, &latency, &ping, &l.CheckedAt, &quota); err != nil {
+		if err := rows.Scan(&monitorID, &l.Model, &l.Status, &latency, &ping, dbtime.Dest(&l.CheckedAt), &quota); err != nil {
 			return nil, fmt.Errorf("scan latest batch row: %w", err)
 		}
 		assignNullInt(&l.LatencyMs, latency)
@@ -497,7 +533,21 @@ func (r *channelMonitorRepository) ListRecentHistoryForMonitors(
 		WHERE rn <= $3
 		ORDER BY monitor_id, checked_at DESC
 	`
-	rows, err := r.db.QueryContext(ctx, q, pq.Array(pairIDs), pq.Array(pairModels), perMonitorLimit)
+	query := q
+	argIDs, argModels := any(pq.Array(pairIDs)), any(pq.Array(pairModels))
+	if r.sqlite {
+		query = channelMonitorSQLiteRecentSQL
+		var err error
+		argIDs, err = jsonArrayArg(pairIDs)
+		if err != nil {
+			return nil, err
+		}
+		argModels, err = jsonArrayArg(pairModels)
+		if err != nil {
+			return nil, err
+		}
+	}
+	rows, err := r.db.QueryContext(ctx, query, argIDs, argModels, perMonitorLimit)
 	if err != nil {
 		return nil, fmt.Errorf("query recent history batch: %w", err)
 	}
@@ -507,7 +557,7 @@ func (r *channelMonitorRepository) ListRecentHistoryForMonitors(
 		var monitorID int64
 		entry := &service.ChannelMonitorHistoryEntry{}
 		var latency, ping sql.NullInt64
-		if err := rows.Scan(&monitorID, &entry.Status, &latency, &ping, &entry.CheckedAt); err != nil {
+		if err := rows.Scan(&monitorID, &entry.Status, &latency, &ping, dbtime.Dest(&entry.CheckedAt)); err != nil {
 			return nil, fmt.Errorf("scan recent history row: %w", err)
 		}
 		assignNullInt(&entry.LatencyMs, latency)
@@ -580,7 +630,17 @@ func (r *channelMonitorRepository) ComputeAvailabilityForMonitors(ctx context.Co
 		  AND checked_at >= NOW() - ($2::int || ' days')::interval
 		GROUP BY monitor_id, model
 	`
-	rows, err := r.db.QueryContext(ctx, q, pq.Array(ids), windowDays)
+	query, arg, cutoff := q, any(pq.Array(ids)), any(windowDays)
+	if r.sqlite {
+		query = channelMonitorSQLiteAvailabilitySQL
+		var err error
+		arg, err = jsonArrayArg(ids)
+		if err != nil {
+			return nil, err
+		}
+		cutoff = time.Now().UTC().AddDate(0, 0, -windowDays)
+	}
+	rows, err := r.db.QueryContext(ctx, query, arg, cutoff)
 	if err != nil {
 		return nil, fmt.Errorf("query availability batch: %w", err)
 	}
@@ -612,6 +672,9 @@ func (r *channelMonitorRepository) ComputeAvailabilityForMonitors(ctx context.Co
 //     重复执行只会用最新统计覆盖；
 //   - $1::date 让 PG 自动把入参 truncate 到 UTC 日期，调用方不需要预处理 targetDate。
 func (r *channelMonitorRepository) UpsertDailyRollupsFor(ctx context.Context, targetDate time.Time) (int64, error) {
+	if r.sqlite {
+		return r.upsertDailyRollupsSQLite(ctx, targetDate)
+	}
 	const q = `
 		INSERT INTO channel_monitor_daily_rollups (
 		    monitor_id, model, bucket_date,
@@ -666,6 +729,9 @@ func (r *channelMonitorRepository) UpsertDailyRollupsFor(ctx context.Context, ta
 
 // DeleteRollupsBefore 物理删 bucket_date < beforeDate 的聚合行，同样分批。
 func (r *channelMonitorRepository) DeleteRollupsBefore(ctx context.Context, beforeDate time.Time) (int64, error) {
+	if r.sqlite {
+		return deleteChannelMonitorBatched(ctx, r.db, channelMonitorSQLitePruneRollupSQL, beforeDate.UTC().Truncate(24*time.Hour))
+	}
 	return deleteChannelMonitorBatched(ctx, r.db, channelMonitorPruneRollupSQL, beforeDate)
 }
 
@@ -724,7 +790,7 @@ func deleteChannelMonitorBatched(ctx context.Context, db *sql.DB, query string, 
 //   - 行不存在或 last_aggregated_date IS NULL：返回 (nil, nil)，由调用方决定首次回填策略
 func (r *channelMonitorRepository) LoadAggregationWatermark(ctx context.Context) (*time.Time, error) {
 	const q = `SELECT last_aggregated_date FROM channel_monitor_aggregation_watermark WHERE id = 1`
-	var t sql.NullTime
+	var t dbtime.NullTime
 	if err := r.db.QueryRowContext(ctx, q).Scan(&t); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -740,6 +806,12 @@ func (r *channelMonitorRepository) LoadAggregationWatermark(ctx context.Context)
 // UpdateAggregationWatermark 更新 watermark（UPSERT 到 id=1）。
 // $1::date 让 PG 把入参 truncate 到 UTC 日期，与 last_aggregated_date 列的 DATE 类型一致。
 func (r *channelMonitorRepository) UpdateAggregationWatermark(ctx context.Context, date time.Time) error {
+	if r.sqlite {
+		_, err := r.db.ExecContext(ctx, `INSERT INTO channel_monitor_aggregation_watermark(id,last_aggregated_date,updated_at)
+		 VALUES(1,?,strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(id) DO UPDATE SET
+		 last_aggregated_date=excluded.last_aggregated_date,updated_at=excluded.updated_at`, date.UTC().Format("2006-01-02"))
+		return err
+	}
 	const q = `
 		INSERT INTO channel_monitor_aggregation_watermark (id, last_aggregated_date, updated_at)
 		VALUES (1, $1::date, NOW())

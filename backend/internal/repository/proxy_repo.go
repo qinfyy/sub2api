@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"entgo.io/ent/dialect"
 	dbent "github.com/Wei-Shaw/sub2api/ent"
 	"github.com/Wei-Shaw/sub2api/ent/proxy"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -187,7 +188,7 @@ func updateProxyAndInvalidateProbeSnapshots(ctx context.Context, client *dbent.C
 	if currentIdentity == proxyProbeIdentityFromService(proxyIn) {
 		return updated, nil
 	}
-	accountIDs, err := invalidateProxyProbeSnapshots(ctx, client, proxyIn.ID)
+	accountIDs, err := invalidateProxyProbeSnapshots(ctx, client, proxyIn.ID, client.Driver().Dialect() == dialect.SQLite)
 	if err != nil {
 		return nil, err
 	}
@@ -198,12 +199,16 @@ func updateProxyAndInvalidateProbeSnapshots(ctx context.Context, client *dbent.C
 }
 
 func lockProxyProbeIdentity(ctx context.Context, client *dbent.Client, proxyID int64) (proxyProbeIdentity, error) {
-	rows, err := client.QueryContext(ctx, `
+	query := `
 		SELECT protocol, host, port, COALESCE(username, ''), COALESCE(password, ''), status
 		FROM proxies
 		WHERE id = $1 AND deleted_at IS NULL
 		FOR NO KEY UPDATE
-	`, proxyID)
+	`
+	if client.Driver().Dialect() == dialect.SQLite {
+		query = `UPDATE proxies SET status=status WHERE id=$1 AND deleted_at IS NULL RETURNING protocol,host,port,COALESCE(username,''),COALESCE(password,''),status`
+	}
+	rows, err := client.QueryContext(ctx, query, proxyID)
 	if err != nil {
 		return proxyProbeIdentity{}, err
 	}
@@ -221,8 +226,8 @@ func lockProxyProbeIdentity(ctx context.Context, client *dbent.Client, proxyID i
 	return identity, rows.Err()
 }
 
-func invalidateProxyProbeSnapshots(ctx context.Context, exec sqlExecutor, proxyID int64) ([]int64, error) {
-	rows, err := exec.QueryContext(ctx, `
+func invalidateProxyProbeSnapshots(ctx context.Context, exec sqlExecutor, proxyID int64, sqlite ...bool) ([]int64, error) {
+	query := `
 		UPDATE accounts
 		SET extra = COALESCE(extra, '{}'::jsonb)
 				- 'upstream_billing_probe'
@@ -234,17 +239,21 @@ func invalidateProxyProbeSnapshots(ctx context.Context, exec sqlExecutor, proxyI
 			AND (
 				(extra ? 'upstream_billing_probe'
 					AND extra -> 'upstream_billing_probe' <> 'null'::jsonb)
-				OR (platform IN (`+ollamaCloudUsagePlatformsSQL+`)
+				OR (platform IN (` + ollamaCloudUsagePlatformsSQL + `)
 					AND extra ? 'ollama_cloud_usage_snapshot'
 					AND extra -> 'ollama_cloud_usage_snapshot' <> 'null'::jsonb)
 				-- OpenCode 快照可能挂在 opencode_go 平台账号或挂载白名单平台账号上。
-				OR ((platform = 'opencode_go' OR platform IN (`+opencodeGoUsageMountPlatformsSQL+`))
+				OR ((platform = 'opencode_go' OR platform IN (` + opencodeGoUsageMountPlatformsSQL + `))
 					AND extra ? 'opencode_go_usage_snapshot'
 					AND extra -> 'opencode_go_usage_snapshot' <> 'null'::jsonb)
 			)
 			AND deleted_at IS NULL
 		RETURNING id
-	`, proxyID)
+	`
+	if len(sqlite) > 0 && sqlite[0] {
+		query = proxySQLiteInvalidateSnapshotsSQL
+	}
+	rows, err := exec.QueryContext(ctx, query, proxyID)
 	if err != nil {
 		return nil, err
 	}
@@ -728,6 +737,9 @@ func (r *proxyRepository) sweepOneExpiredProxy(ctx context.Context, snapshot ser
 
 // sweepOneExpiredProxyOnExec 在给定的 sqlExecutor 上执行：标记 expired + 改投账号。
 func (r *proxyRepository) sweepOneExpiredProxyOnExec(ctx context.Context, exec sqlExecutor, snapshot service.Proxy, now time.Time, target *int64, change bool) ([]int64, error) {
+	if r.client.Driver().Dialect() == dialect.SQLite {
+		return r.sweepOneExpiredProxySQLite(ctx, exec, snapshot, now, target, change)
+	}
 	proxyID := snapshot.ID
 	// The UPDATE locks the row and rechecks its predicates after concurrent writes.
 	// If an administrator renewed, disabled or reconfigured the proxy after the
@@ -818,6 +830,9 @@ func (r *proxyRepository) CountExpired(ctx context.Context) (int64, error) {
 
 // CountExpiringSoon 返回即将到期（在 expiry_warn_days 天内）的活跃代理数量。
 func (r *proxyRepository) CountExpiringSoon(ctx context.Context, now time.Time) (int64, error) {
+	if r.client != nil && r.client.Driver().Dialect() == dialect.SQLite {
+		return r.countExpiringSoonSQLite(ctx, now)
+	}
 	var c int64
 	err := scanSingleRow(ctx, r.sql, `
 		SELECT COUNT(*) FROM proxies

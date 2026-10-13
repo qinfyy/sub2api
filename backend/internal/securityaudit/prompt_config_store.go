@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,11 +24,12 @@ type activeConfigSnapshot struct {
 }
 
 type ConfigManager struct {
-	db        *sql.DB
-	settings  service.SettingRepository
-	redis     *redis.Client
-	encryptor SecretEncryptor
-	clock     Clock
+	db           *sql.DB
+	settings     service.SettingRepository
+	invalidation ConfigInvalidationBus
+	localBus     *localConfigInvalidationBus
+	encryptor    SecretEncryptor
+	clock        Clock
 	// encryptionKeyConfigured mirrors cfg.Totp.EncryptionKeyConfigured. With an
 	// auto-generated (per-boot) key, newly saved endpoint tokens would become
 	// undecryptable after the next restart, so Save rejects them (issue #4887).
@@ -56,11 +56,21 @@ type ConfigManager struct {
 	lifecycleMu sync.Mutex
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
+	unsubscribe func()
 }
 
 func NewConfigManager(db *sql.DB, settings service.SettingRepository, redisClient *redis.Client, encryptor service.SecretEncryptor, cfg *config.Config) *ConfigManager {
+	var invalidation ConfigInvalidationBus
+	var localBus *localConfigInvalidationBus
+	if redisClient != nil {
+		invalidation = NewRedisConfigInvalidationBus(redisClient)
+	} else {
+		localBus = NewLocalConfigInvalidationBus().(*localConfigInvalidationBus)
+		invalidation = localBus
+	}
 	return &ConfigManager{
-		db: db, settings: settings, redis: redisClient, encryptor: encryptor, clock: realClock{},
+		db: db, settings: settings, invalidation: invalidation, localBus: localBus,
+		encryptor: encryptor, clock: realClock{},
 		encryptionKeyConfigured: cfg != nil && cfg.Totp.EncryptionKeyConfigured,
 	}
 }
@@ -83,9 +93,16 @@ func (m *ConfigManager) Start(ctx context.Context) error {
 	}
 	m.wg.Add(1)
 	go m.refreshLoop(runCtx)
-	if m.redis != nil {
-		m.wg.Add(1)
-		go m.subscribeLoop(runCtx)
+	if m.invalidation != nil {
+		unsubscribe, err := m.invalidation.Subscribe(runCtx, m.handleInvalidation)
+		if err != nil {
+			cancel()
+			m.wg.Wait()
+			return err
+		}
+		m.lifecycleMu.Lock()
+		m.unsubscribe = unsubscribe
+		m.lifecycleMu.Unlock()
 	}
 	return loadErr
 }
@@ -97,11 +114,19 @@ func (m *ConfigManager) Shutdown(_ context.Context) error {
 	m.lifecycleMu.Lock()
 	cancel := m.cancel
 	m.cancel = nil
+	unsubscribe := m.unsubscribe
+	m.unsubscribe = nil
 	m.lifecycleMu.Unlock()
+	if unsubscribe != nil {
+		unsubscribe()
+	}
 	if cancel != nil {
 		cancel()
 	}
 	m.wg.Wait()
+	if m.localBus != nil {
+		m.localBus.close()
+	}
 	return nil
 }
 
@@ -264,17 +289,30 @@ func (m *ConfigManager) Save(ctx context.Context, req UpdateConfigRequest, actor
 	if req.ExpectedConfigVersion < 1 {
 		return PublicConfig{}, infraerrors.BadRequest("prompt_audit_expected_config_version_required", "必须提供有效的配置版本")
 	}
-	tx, err := m.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	sqlite := isSQLiteAuditDB(m.db)
+	opts := &sql.TxOptions{Isolation: sql.LevelReadCommitted}
+	if sqlite {
+		opts = nil
+	}
+	tx, err := m.db.BeginTx(ctx, opts)
 	if err != nil {
 		return PublicConfig{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, promptAuditConfigLockKey); err != nil {
+	lockQuery := `SELECT pg_advisory_xact_lock($1)`
+	var lockArg any = promptAuditConfigLockKey
+	readQuery := `SELECT value FROM settings WHERE key=$1 FOR UPDATE`
+	if sqlite {
+		lockQuery = `UPDATE settings SET value=value WHERE key=$1`
+		lockArg = SettingKeyPromptAuditConfig
+		readQuery = `SELECT value FROM settings WHERE key=$1`
+	}
+	if _, err := tx.ExecContext(ctx, lockQuery, lockArg); err != nil {
 		return PublicConfig{}, err
 	}
 	current := DefaultStorageConfig()
 	var raw string
-	err = tx.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=$1 FOR UPDATE`, SettingKeyPromptAuditConfig).Scan(&raw)
+	err = tx.QueryRowContext(ctx, readQuery, SettingKeyPromptAuditConfig).Scan(&raw)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return PublicConfig{}, err
 	}
@@ -330,8 +368,8 @@ func (m *ConfigManager) Save(ctx context.Context, req UpdateConfigRequest, actor
 	LogInfo(EventConfigUpdated, map[string]any{
 		"config_version": next.ConfigVersion, "status": "updated",
 	})
-	if m.redis != nil {
-		if err := m.redis.Publish(ctx, ConfigInvalidationChannel, strconv.FormatInt(next.ConfigVersion, 10)).Err(); err != nil {
+	if m.invalidation != nil {
+		if err := m.invalidation.Publish(ctx, next.ConfigVersion); err != nil {
 			LogWarn(EventConfigReloadDegraded, map[string]any{
 				"config_version": next.ConfigVersion, "status": "degraded", "error_code": "config_invalidation_publish_failed",
 			})
@@ -461,35 +499,20 @@ func (m *ConfigManager) refreshLoop(ctx context.Context) {
 	}
 }
 
-func (m *ConfigManager) subscribeLoop(ctx context.Context) {
-	defer m.wg.Done()
-	pubsub := m.redis.Subscribe(ctx, ConfigInvalidationChannel)
-	defer func() { _ = pubsub.Close() }()
-	channel := pubsub.Channel()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case message, ok := <-channel:
-			if !ok {
-				return
-			}
-			version, err := strconv.ParseInt(strings.TrimSpace(message.Payload), 10, 64)
-			if err != nil || version < 1 {
-				continue
-			}
-			m.expected.Store(version)
-			if err := m.Reload(ctx); err != nil {
-				// A newer published version failed to activate. Until reload
-				// succeeds, do not keep serving a potentially stale weaker mode.
-				if active, ok := m.Active(); !ok || active.ConfigVersion < version {
-					m.markConfigUntrusted()
-				}
-				LogWarn(EventConfigReloadDegraded, map[string]any{
-					"config_version": version, "status": "degraded", "error_code": "config_invalidation_reload_failed",
-				})
-			}
+func (m *ConfigManager) handleInvalidation(version int64) {
+	if m == nil || version < 1 {
+		return
+	}
+	m.expected.Store(version)
+	if err := m.Reload(context.Background()); err != nil {
+		// A newer published version failed to activate. Until reload
+		// succeeds, do not keep serving a potentially stale weaker mode.
+		if active, ok := m.Active(); !ok || active.ConfigVersion < version {
+			m.markConfigUntrusted()
 		}
+		LogWarn(EventConfigReloadDegraded, map[string]any{
+			"config_version": version, "status": "degraded", "error_code": "config_invalidation_reload_failed",
+		})
 	}
 }
 

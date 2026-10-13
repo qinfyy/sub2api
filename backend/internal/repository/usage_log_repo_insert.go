@@ -12,6 +12,7 @@ import (
 	"time"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/dbtime"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
@@ -159,7 +160,7 @@ func (r *usageLogRepository) Create(ctx context.Context, log *service.UsageLog) 
 		return r.createSingle(ctx, tx.Client(), log)
 	}
 	requestID := strings.TrimSpace(log.RequestID)
-	if requestID == "" {
+	if requestID == "" || r.sqlite {
 		return r.createSingle(ctx, r.sql, log)
 	}
 	log.RequestID = requestID
@@ -299,10 +300,15 @@ func (r *usageLogRepository) createSingle(ctx context.Context, sqlq sqlExecutor,
 		RETURNING id, created_at
 	`
 
-	if err := scanSingleRow(ctx, sqlq, query, prepared.args, &log.ID, &log.CreatedAt); err != nil {
+	args := prepared.args
+	if r.sqlite {
+		query, args = buildSQLiteUsageLogInsert([]usageLogInsertPrepared{prepared})
+		query += " RETURNING id, created_at"
+	}
+	if err := scanSingleRow(ctx, sqlq, query, args, &log.ID, dbtime.Dest(&log.CreatedAt)); err != nil {
 		if errors.Is(err, sql.ErrNoRows) && prepared.requestID != "" {
 			selectQuery := "SELECT id, created_at FROM usage_logs WHERE request_id = $1 AND api_key_id = $2"
-			if err := scanSingleRow(ctx, sqlq, selectQuery, []any{prepared.requestID, log.APIKeyID}, &log.ID, &log.CreatedAt); err != nil {
+			if err := scanSingleRow(ctx, sqlq, selectQuery, []any{prepared.requestID, log.APIKeyID}, &log.ID, dbtime.Dest(&log.CreatedAt)); err != nil {
 				return false, err
 			}
 			log.RateMultiplier = prepared.rateMultiplier
@@ -606,10 +612,19 @@ func (r *usageLogRepository) flushBestEffortBatch(db *sql.DB, batch []usageLogBe
 	defer cancel()
 
 	query, args := buildUsageLogBestEffortInsertQuery(preparedList)
+	if r.sqlite {
+		query, args = buildSQLiteUsageLogInsert(preparedList)
+	}
 	if _, err := db.ExecContext(ctx, query, args...); err != nil {
 		logger.LegacyPrintf("repository.usage_log", "best-effort batch insert failed: %v", err)
 		for _, group := range groupOrder {
-			singleErr := execUsageLogInsertNoResult(ctx, db, group.prepared)
+			var singleErr error
+			if r.sqlite {
+				query, args := buildSQLiteUsageLogInsert([]usageLogInsertPrepared{group.prepared})
+				_, singleErr = db.ExecContext(ctx, query, args...)
+			} else {
+				singleErr = execUsageLogInsertNoResult(ctx, db, group.prepared)
+			}
 			if singleErr != nil {
 				logger.LegacyPrintf("repository.usage_log", "best-effort single fallback insert failed: %v", singleErr)
 			} else if group.prepared.requestID != "" && r != nil && r.bestEffortRecent != nil {

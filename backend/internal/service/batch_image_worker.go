@@ -160,20 +160,28 @@ func (w *BatchImageWorker) RunOnce(ctx context.Context) error {
 	}()
 
 	// 处理期间持续心跳：刷新 active zset 时间戳防止 stale 恢复把在处理的
-	// job 重投给其他 worker，并对支持续期的锁实现延长锁 TTL。
+	// job 重投给其他 worker，并对支持续期的锁实现延长锁 TTL。心跳或锁续期
+	// 失败意味着租约可能已失效，必须取消处理，避免旧 worker 继续产生副作用。
+	processCtx, cancelProcess := context.WithCancel(ctx)
 	hbStop := make(chan struct{})
 	hbDone := make(chan struct{})
-	go w.runJobHeartbeat(ctx, reserved.BatchID, lock, hbStop, hbDone)
+	go w.runJobHeartbeat(processCtx, cancelProcess, reserved.BatchID, lock, hbStop, hbDone)
 
-	result, err := w.processor.Process(ctx, reserved.BatchID)
+	result, err := w.processor.Process(processCtx, reserved.BatchID)
 	close(hbStop)
 	<-hbDone
+	if processCtx.Err() != nil && err == nil {
+		err = processCtx.Err()
+	}
+	cancelProcess()
 	if err != nil {
 		logger.L().Warn("batch_image.worker_process_failed",
 			zap.String("batch_id", reserved.BatchID),
 			zap.Error(err),
 		)
-		return w.queue.RequeueAfter(ctx, reserved.BatchID, w.opts.ErrorRetryDelay)
+		requeueCtx, cancelRequeue := context.WithTimeout(context.WithoutCancel(ctx), w.opts.ReserveBlockTimeout)
+		defer cancelRequeue()
+		return w.queue.RequeueAfter(requeueCtx, reserved.BatchID, w.opts.ErrorRetryDelay)
 	}
 	if result.Terminal {
 		return w.queue.Ack(ctx, reserved.BatchID)
@@ -202,7 +210,7 @@ func (w *BatchImageWorker) heartbeatInterval() time.Duration {
 	return interval
 }
 
-func (w *BatchImageWorker) runJobHeartbeat(ctx context.Context, batchID string, lock BatchImageJobLock, stop <-chan struct{}, done chan<- struct{}) {
+func (w *BatchImageWorker) runJobHeartbeat(ctx context.Context, cancel context.CancelFunc, batchID string, lock BatchImageJobLock, stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	ticker := time.NewTicker(w.heartbeatInterval())
 	defer ticker.Stop()
@@ -218,6 +226,8 @@ func (w *BatchImageWorker) runJobHeartbeat(ctx context.Context, batchID string, 
 					zap.String("batch_id", batchID),
 					zap.Error(err),
 				)
+				cancel()
+				return
 			}
 			if refresher, ok := lock.(BatchImageJobLockRefresher); ok {
 				if err := refresher.Refresh(ctx, w.opts.JobLockTTL); err != nil && ctx.Err() == nil {
@@ -225,6 +235,8 @@ func (w *BatchImageWorker) runJobHeartbeat(ctx context.Context, batchID string, 
 						zap.String("batch_id", batchID),
 						zap.Error(err),
 					)
+					cancel()
+					return
 				}
 			}
 		}

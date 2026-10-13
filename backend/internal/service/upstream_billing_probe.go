@@ -38,6 +38,8 @@ const (
 	upstreamBillingProbeMaxIntervalMinutes     = 24 * 60
 	upstreamBillingProbeCycleInterval          = time.Minute
 	upstreamBillingProbeRequestTimeout         = 10 * time.Second
+	upstreamBillingProbeOperationTimeout       = 20 * time.Second
+	upstreamBillingProbePersistenceTimeout     = 5 * time.Second
 	upstreamBillingProbeMaxBodyBytes           = 64 * 1024
 	upstreamBillingProbeMaxPerCycle            = 20
 	upstreamBillingProbeConcurrency            = 4
@@ -345,7 +347,7 @@ func (s *UpstreamBillingProbeService) runLoop() {
 		case <-s.parentCtx.Done():
 			return
 		case <-ticker.C:
-			if err := s.RunDue(s.parentCtx); err != nil {
+			if err := s.RunDue(s.parentCtx); err != nil && s.parentCtx.Err() == nil {
 				logger.LegacyPrintf("service.upstream_billing_probe", "run_due_failed: err=%v", err)
 			}
 		}
@@ -357,7 +359,12 @@ func (s *UpstreamBillingProbeService) RunDue(ctx context.Context) error {
 	if s == nil || s.accountRepo == nil {
 		return nil
 	}
-	s.cycleMu.Lock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !s.cycleMu.TryLock() {
+		return nil
+	}
 	defer s.cycleMu.Unlock()
 
 	settings, err := s.getSettings(ctx)
@@ -387,7 +394,9 @@ func (s *UpstreamBillingProbeService) RunDue(ctx context.Context) error {
 	defer releaseUpstreamBillingProbeLeaderLock(cadenceRelease, lockNow.Truncate(upstreamBillingProbeCycleInterval).Add(upstreamBillingProbeCycleInterval))
 
 	now := s.currentTime()
-	accounts, err := s.listDueAccounts(ctx, now)
+	listCtx, cancelList := context.WithTimeout(ctx, upstreamBillingProbePersistenceTimeout)
+	accounts, err := s.listDueAccounts(listCtx, now)
+	cancelList()
 	if err != nil {
 		return fmt.Errorf("list enabled upstream billing probes: %w", err)
 	}
@@ -427,7 +436,7 @@ func (s *UpstreamBillingProbeService) RunDue(ctx context.Context) error {
 	for i := range due {
 		accountID := due[i].ID
 		group.Go(func() error {
-			if _, probeErr := s.probeScheduledAccount(ctx, accountID, settings.IntervalMinutes); probeErr != nil {
+			if _, probeErr := s.probeScheduledAccount(ctx, accountID, settings.IntervalMinutes); probeErr != nil && ctx.Err() == nil {
 				logger.LegacyPrintf("service.upstream_billing_probe", "probe_due_failed: account_id=%d err=%v", accountID, probeErr)
 			}
 			return nil
@@ -449,6 +458,8 @@ func (s *UpstreamBillingProbeService) getSettings(ctx context.Context) (*Upstrea
 	if s.settingService == nil {
 		return defaultUpstreamBillingProbeSettings(), nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, upstreamBillingProbePersistenceTimeout)
+	defer cancel()
 	return s.settingService.GetUpstreamBillingProbeSettings(ctx)
 }
 
@@ -468,6 +479,8 @@ func (s *UpstreamBillingProbeService) ProbeAccount(ctx context.Context, accountI
 	if s == nil || s.accountRepo == nil {
 		return nil, ErrUpstreamBillingProbeUnavailable
 	}
+	ctx, cancel := s.probeContext(ctx)
+	defer cancel()
 	settings, err := s.getSettings(ctx)
 	if err != nil {
 		return nil, err
@@ -484,15 +497,36 @@ func (s *UpstreamBillingProbeService) probeScheduledAccount(ctx context.Context,
 }
 
 func (s *UpstreamBillingProbeService) probeAccountWithMode(ctx context.Context, accountID int64, intervalMinutes int, requireEnabled bool) (*UpstreamBillingProbeSnapshot, error) {
+	ctx, cancel := s.probeContext(ctx)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	key := strconv.FormatInt(accountID, 10)
-	value, err, _ := s.probeGroup.Do(key, func() (any, error) {
+	result := s.probeGroup.DoChan(key, func() (value any, err error) {
+		s.mu.Lock()
+		if s.stopped {
+			s.mu.Unlock()
+			return nil, context.Canceled
+		}
+		s.wg.Add(1)
+		s.mu.Unlock()
+		defer s.wg.Done()
+		started := time.Now()
+		var before sql.DBStats
+		if s.db != nil {
+			before = s.db.Stats()
+		}
+		defer func() { s.logProbeOperation(accountID, started, before, err) }()
 		select {
 		case s.probeSlots <- struct{}{}:
 			defer func() { <-s.probeSlots }()
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
-		account, loadErr := s.accountRepo.GetByID(ctx, accountID)
+		loadCtx, cancelLoad := context.WithTimeout(ctx, upstreamBillingProbePersistenceTimeout)
+		account, loadErr := s.accountRepo.GetByID(loadCtx, accountID)
+		cancelLoad()
 		if loadErr != nil {
 			return nil, loadErr
 		}
@@ -510,9 +544,16 @@ func (s *UpstreamBillingProbeService) probeAccountWithMode(ctx context.Context, 
 		}
 		return s.probeLoadedAccount(ctx, account, intervalMinutes)
 	})
-	if err != nil {
-		return nil, err
+	var completed singleflight.Result
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case completed = <-result:
 	}
+	if completed.Err != nil {
+		return nil, completed.Err
+	}
+	value := completed.Val
 	if value == nil {
 		return nil, nil
 	}
@@ -521,6 +562,49 @@ func (s *UpstreamBillingProbeService) probeAccountWithMode(ctx context.Context, 
 		return nil, fmt.Errorf("invalid upstream billing probe result")
 	}
 	return snapshot, nil
+}
+
+func (s *UpstreamBillingProbeService) probeContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(ctx, upstreamBillingProbeOperationTimeout)
+	stop := context.AfterFunc(s.parentCtx, cancel)
+	if s.parentCtx.Err() != nil {
+		cancel()
+	}
+	return ctx, func() { stop(); cancel() }
+}
+
+func (s *UpstreamBillingProbeService) logProbeOperation(accountID int64, started time.Time, before sql.DBStats, err error) {
+	elapsed := time.Since(started)
+	if err == nil && elapsed < time.Second {
+		return
+	}
+	attrs := []any{"account_id", accountID, "elapsed_ms", elapsed.Milliseconds()}
+	if s.db != nil {
+		after := s.db.Stats()
+		attrs = append(attrs, "db_in_use", after.InUse, "db_open", after.OpenConnections,
+			"db_wait_count_delta", after.WaitCount-before.WaitCount,
+			"db_wait_ms_delta", (after.WaitDuration - before.WaitDuration).Milliseconds())
+	}
+	// Never log upstream response bodies or credentials in database diagnostics.
+	if err != nil {
+		kind := safeProbeError(err)
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			kind = "deadline_exceeded"
+		case errors.Is(err, context.Canceled):
+			kind = "canceled"
+		case errors.Is(err, ErrUpstreamBillingProbeIdentityChanged):
+			kind = "identity_changed"
+		}
+		attrs = append(attrs, "error_kind", kind)
+	}
+	if errors.Is(err, context.Canceled) && s.parentCtx.Err() != nil {
+		slog.Debug("upstream_billing_probe_stopped", attrs...)
+	} else if err != nil {
+		slog.Warn("upstream_billing_probe_failed", attrs...)
+	} else {
+		slog.Info("upstream_billing_probe_slow", attrs...)
+	}
 }
 
 // ProbeAccounts performs a bounded manual batch with the same concurrency limit as the runner.
@@ -798,6 +882,8 @@ func (s *UpstreamBillingProbeService) updateSnapshot(
 	if !ok {
 		return ErrUpstreamBillingProbeUnavailable
 	}
+	ctx, cancel := context.WithTimeout(ctx, upstreamBillingProbePersistenceTimeout)
+	defer cancel()
 	return writer.UpdateUpstreamBillingProbeSnapshot(ctx, account, snapshot, rateMultiplier)
 }
 

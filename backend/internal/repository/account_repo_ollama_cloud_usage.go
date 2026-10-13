@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"time"
@@ -23,6 +24,21 @@ const (
 	platform IN (` + ollamaCloudUsagePlatformsSQL + `)
 	AND type = 'apikey'
 	AND ` + ollamaCloudBaseURLMatchSQLPrefix + `credentials ->> 'base_url'` + ollamaCloudBaseURLMatchSQLSuffix + `
+	AND jsonb_typeof(credentials -> 'api_key') = 'string'
+`
+	sqliteOllamaCloudUsageEligibleSQL = `
+	platform IN (` + ollamaCloudUsagePlatformsSQL + `)
+	AND type = 'apikey'
+	AND lower(btrim(COALESCE(credentials ->> 'base_url', ''))) IN (
+		'https://ollama.com',
+		'https://ollama.com:443',
+		'https://ollama.com/v1',
+		'https://ollama.com:443/v1',
+		'https://www.ollama.com',
+		'https://www.ollama.com:443',
+		'https://www.ollama.com/v1',
+		'https://www.ollama.com:443/v1'
+	)
 	AND jsonb_typeof(credentials -> 'api_key') = 'string'
 `
 )
@@ -57,14 +73,27 @@ func (r *accountRepository) ListOllamaCloudUsageGroupAccounts(ctx context.Contex
 	if len(keys) == 0 {
 		return []service.Account{}, nil
 	}
-	rows, err := r.sql.QueryContext(ctx, `
+	eligible := ollamaCloudUsageEligibleSQL
+	if r.sqlite {
+		eligible = sqliteOllamaCloudUsageEligibleSQL
+	}
+	query := `
 		SELECT id
 		FROM accounts
 		WHERE deleted_at IS NULL
-			AND `+ollamaCloudUsageEligibleSQL+`
+			AND ` + eligible + `
 			AND credentials ->> 'api_key' = ANY($1)
 		ORDER BY id
-	`, pq.Array(keys))
+	`
+	args := []any{arrayArg(r.sqlite, keys)}
+	if r.sqlite {
+		var err error
+		query, args, err = bindArrayArgsForSQLite(query, args)
+		if err != nil {
+			return nil, err
+		}
+	}
+	rows, err := r.sql.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -194,7 +223,7 @@ func (r *accountRepository) updateOllamaCloudUsageGroup(
 		if !matchesProxy {
 			return service.ErrOllamaCloudUsageIdentityChanged
 		}
-		members, err := lockOllamaCloudUsageGroup(txCtx, client, account, apiKey)
+		members, err := r.lockOllamaCloudUsageGroup(txCtx, client, account, apiKey)
 		if err != nil {
 			return err
 		}
@@ -239,6 +268,41 @@ func (r *accountRepository) updateOllamaCloudUsageGroup(
 		for index := range members {
 			memberIDs[index] = members[index].id
 		}
+		if r.sqlite {
+			memberJSON, err := jsonArrayArg(memberIDs)
+			if err != nil {
+				return err
+			}
+			query := `
+				UPDATE accounts
+				SET extra = json_patch(
+						json_remove(
+							COALESCE(extra, '{}'),
+							'$.ollama_cloud_usage_session',
+							'$.ollama_cloud_usage_auto_refresh',
+							'$.ollama_cloud_usage_snapshot'
+						),
+						?
+					),
+					updated_at = NOW()
+				WHERE deleted_at IS NULL
+					AND ` + sqliteOllamaCloudUsageEligibleSQL + `
+					AND credentials ->> 'api_key' = ?
+					AND id IN (SELECT value FROM json_each(?))
+			`
+			result, err := client.ExecContext(txCtx, query, string(encoded), apiKey, memberJSON)
+			if err != nil {
+				return err
+			}
+			affected, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if affected != int64(len(members)) {
+				return service.ErrOllamaCloudUsageIdentityChanged
+			}
+			return nil
+		}
 		result, err := client.ExecContext(txCtx, `
 			UPDATE accounts
 			SET extra = (COALESCE(extra, '{}'::jsonb)
@@ -281,7 +345,7 @@ func (r *accountRepository) updateOllamaCloudUsageGroup(
 	return tx.Commit()
 }
 
-func lockOllamaCloudUsageGroup(
+func (r *accountRepository) lockOllamaCloudUsageGroup(
 	ctx context.Context,
 	client *dbent.Client,
 	account *service.Account,
@@ -294,6 +358,30 @@ func lockOllamaCloudUsageGroup(
 	var proxyID any
 	if account.ProxyID != nil {
 		proxyID = *account.ProxyID
+	}
+	if r.sqlite {
+		rows, err := client.QueryContext(ctx, `
+			SELECT
+				id,
+				id = ?
+					AND platform = ?
+					AND type = ?
+					AND json(credentials) = json(?)
+					AND proxy_id IS ?,
+				COALESCE(extra -> 'ollama_cloud_usage_session', 'null'),
+				COALESCE(extra -> 'ollama_cloud_usage_auto_refresh', 'null'),
+				COALESCE(extra -> 'ollama_cloud_usage_snapshot', 'null')
+			FROM accounts
+			WHERE deleted_at IS NULL
+				AND `+sqliteOllamaCloudUsageEligibleSQL+`
+				AND credentials ->> 'api_key' = ?
+			ORDER BY id
+		`, account.ID, account.Platform, account.Type, string(credentials), proxyID, apiKey)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = rows.Close() }()
+		return scanLockedOllamaCloudUsageMembers(rows)
 	}
 	rows, err := client.QueryContext(ctx, `
 		SELECT
@@ -317,6 +405,10 @@ func lockOllamaCloudUsageGroup(
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
+	return scanLockedOllamaCloudUsageMembers(rows)
+}
+
+func scanLockedOllamaCloudUsageMembers(rows *sql.Rows) ([]lockedOllamaCloudUsageMember, error) {
 	members := make([]lockedOllamaCloudUsageMember, 0, 1)
 	for rows.Next() {
 		var member lockedOllamaCloudUsageMember
@@ -422,6 +514,15 @@ func (r *accountRepository) ListDueOllamaCloudUsageAccounts(
 	}
 	if maxWait <= 0 {
 		maxWait = time.Hour
+	}
+	if r.sqlite {
+		return r.listDueSQLiteUsageAccounts(ctx, now, debounce, maxWait, limit, sqliteDueUsageQuery{
+			eligibleSQL:      sqliteOllamaCloudUsageEligibleSQL,
+			snapshotKey:      service.OllamaCloudUsageSnapshotExtraKey,
+			autoRefreshKey:   service.OllamaCloudUsageAutoRefreshExtraKey,
+			sessionKey:       service.OllamaCloudUsageSessionExtraKey,
+			minFetchInterval: service.OllamaCloudUsageMinFetchInterval,
+		})
 	}
 	debounceSeconds := debounce.Seconds()
 	maxWaitSeconds := maxWait.Seconds()

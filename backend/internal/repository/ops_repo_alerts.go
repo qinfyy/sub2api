@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/dbtime"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
@@ -47,7 +48,7 @@ ORDER BY id DESC`
 	for rows.Next() {
 		var rule service.OpsAlertRule
 		var filtersRaw []byte
-		var lastTriggeredAt sql.NullTime
+		var lastTriggeredAt dbtime.NullTime
 		if err := rows.Scan(
 			&rule.ID,
 			&rule.Name,
@@ -63,8 +64,8 @@ ORDER BY id DESC`
 			&rule.NotifyEmail,
 			&filtersRaw,
 			&lastTriggeredAt,
-			&rule.CreatedAt,
-			&rule.UpdatedAt,
+			dbtime.Dest(&rule.CreatedAt),
+			dbtime.Dest(&rule.UpdatedAt),
 		); err != nil {
 			return nil, err
 		}
@@ -138,7 +139,7 @@ RETURNING
 
 	var out service.OpsAlertRule
 	var filtersRaw []byte
-	var lastTriggeredAt sql.NullTime
+	var lastTriggeredAt dbtime.NullTime
 
 	if err := r.db.QueryRowContext(
 		ctx,
@@ -170,8 +171,8 @@ RETURNING
 		&out.NotifyEmail,
 		&filtersRaw,
 		&lastTriggeredAt,
-		&out.CreatedAt,
-		&out.UpdatedAt,
+		dbtime.Dest(&out.CreatedAt),
+		dbtime.Dest(&out.UpdatedAt),
 	); err != nil {
 		return nil, err
 	}
@@ -242,7 +243,7 @@ RETURNING
 
 	var out service.OpsAlertRule
 	var filtersRaw []byte
-	var lastTriggeredAt sql.NullTime
+	var lastTriggeredAt dbtime.NullTime
 
 	if err := r.db.QueryRowContext(
 		ctx,
@@ -275,8 +276,8 @@ RETURNING
 		&out.NotifyEmail,
 		&filtersRaw,
 		&lastTriggeredAt,
-		&out.CreatedAt,
-		&out.UpdatedAt,
+		dbtime.Dest(&out.CreatedAt),
+		dbtime.Dest(&out.UpdatedAt),
 	); err != nil {
 		return nil, err
 	}
@@ -369,7 +370,7 @@ LIMIT ` + limitArg
 		var metricValue sql.NullFloat64
 		var thresholdValue sql.NullFloat64
 		var dimensionsRaw []byte
-		var resolvedAt sql.NullTime
+		var resolvedAt dbtime.NullTime
 		if err := rows.Scan(
 			&ev.ID,
 			&ev.RuleID,
@@ -380,10 +381,10 @@ LIMIT ` + limitArg
 			&metricValue,
 			&thresholdValue,
 			&dimensionsRaw,
-			&ev.FiredAt,
+			dbtime.Dest(&ev.FiredAt),
 			&resolvedAt,
 			&ev.EmailSent,
-			&ev.CreatedAt,
+			dbtime.Dest(&ev.CreatedAt),
 		); err != nil {
 			return nil, err
 		}
@@ -683,10 +684,10 @@ RETURNING id, rule_id, platform, group_id, region, until, COALESCE(reason,''), c
 		&out.Platform,
 		&groupID,
 		&region,
-		&out.Until,
+		dbtime.Dest(&out.Until),
 		&out.Reason,
 		&createdBy,
-		&out.CreatedAt,
+		dbtime.Dest(&out.CreatedAt),
 	); err != nil {
 		return nil, err
 	}
@@ -748,7 +749,7 @@ func scanOpsAlertEvent(row opsAlertEventRow) (*service.OpsAlertEvent, error) {
 	var metricValue sql.NullFloat64
 	var thresholdValue sql.NullFloat64
 	var dimensionsRaw []byte
-	var resolvedAt sql.NullTime
+	var resolvedAt dbtime.NullTime
 
 	if err := row.Scan(
 		&ev.ID,
@@ -760,10 +761,10 @@ func scanOpsAlertEvent(row opsAlertEventRow) (*service.OpsAlertEvent, error) {
 		&metricValue,
 		&thresholdValue,
 		&dimensionsRaw,
-		&ev.FiredAt,
+		dbtime.Dest(&ev.FiredAt),
 		&resolvedAt,
 		&ev.EmailSent,
-		&ev.CreatedAt,
+		dbtime.Dest(&ev.CreatedAt),
 	); err != nil {
 		return nil, err
 	}

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/dbtime"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
@@ -17,12 +18,20 @@ type batchImageSQLExecutor interface {
 }
 
 type batchImageRepository struct {
-	db  *sql.DB
-	sql batchImageSQLExecutor
+	db     *sql.DB
+	sql    batchImageSQLExecutor
+	sqlite bool
 }
 
 func NewBatchImageRepository(db *sql.DB) service.BatchImageRepository {
-	return &batchImageRepository{db: db, sql: db}
+	return &batchImageRepository{db: db, sql: db, sqlite: isSQLiteDB(db)}
+}
+
+func (r *batchImageRepository) lockedJobQuery(columns string) string {
+	if r.sqlite {
+		return `UPDATE batch_image_jobs SET status=status WHERE batch_id=$1 RETURNING ` + columns
+	}
+	return `SELECT ` + columns + ` FROM batch_image_jobs WHERE batch_id = $1 FOR UPDATE`
 }
 
 func (r *batchImageRepository) CreateBatchImageJob(ctx context.Context, params service.CreateBatchImageJobParams) (*service.BatchImageJob, error) {
@@ -225,7 +234,7 @@ func (r *batchImageRepository) UpdateBatchImageJobProviderSubmit(ctx context.Con
 
 func (r *batchImageRepository) updateBatchImageJobProviderSubmitWithSQL(ctx context.Context, sqlq batchImageSQLExecutor, params service.UpdateBatchImageJobProviderSubmitParams) error {
 	var current string
-	if err := sqlq.QueryRowContext(ctx, `SELECT status FROM batch_image_jobs WHERE batch_id = $1 FOR UPDATE`, params.BatchID).Scan(&current); err != nil {
+	if err := sqlq.QueryRowContext(ctx, r.lockedJobQuery("status"), params.BatchID).Scan(&current); err != nil {
 		return translatePersistenceError(err, service.ErrBatchImageJobNotFound, nil)
 	}
 	if !service.CanTransitionBatchImageJob(current, service.BatchImageJobStatusSubmitted) {
@@ -356,7 +365,7 @@ RETURNING retry_count`, batchID, code, message, time.Now()).Scan(&retryCount)
 
 func (r *batchImageRepository) transitionBatchImageJobStatusWithSQL(ctx context.Context, sqlq batchImageSQLExecutor, batchID, toStatus string, opts service.BatchImageTransitionOptions) error {
 	var current string
-	if err := sqlq.QueryRowContext(ctx, `SELECT status FROM batch_image_jobs WHERE batch_id = $1 FOR UPDATE`, batchID).Scan(&current); err != nil {
+	if err := sqlq.QueryRowContext(ctx, r.lockedJobQuery("status"), batchID).Scan(&current); err != nil {
 		return translatePersistenceError(err, service.ErrBatchImageJobNotFound, nil)
 	}
 	if !service.CanTransitionBatchImageJob(current, toStatus) {
@@ -371,16 +380,16 @@ func (r *batchImageRepository) transitionBatchImageJobStatusWithSQL(ctx context.
 	if _, err := sqlq.ExecContext(ctx, `
 UPDATE batch_image_jobs
 SET
-    status = $2::varchar,
+    status = CAST($2 AS varchar),
     version = version + 1,
     updated_at = $3,
-    last_error_code = CASE WHEN $2::varchar = 'failed' THEN $4 ELSE last_error_code END,
-    last_error_message = CASE WHEN $2::varchar = 'failed' THEN $5 ELSE last_error_message END,
-    submitted_at = CASE WHEN $2::varchar = 'submitted' AND submitted_at IS NULL THEN $3 ELSE submitted_at END,
-    started_at = CASE WHEN $2::varchar = 'running' AND started_at IS NULL THEN $3 ELSE started_at END,
-    finished_at = CASE WHEN $2::varchar IN ('completed', 'failed', 'cancelled') AND finished_at IS NULL THEN $3 ELSE finished_at END,
-    settled_at = CASE WHEN $2::varchar = 'completed' AND settled_at IS NULL THEN $3 ELSE settled_at END,
-    output_deleted_at = CASE WHEN $2::varchar = 'output_deleted' AND output_deleted_at IS NULL THEN $3 ELSE output_deleted_at END
+    last_error_code = CASE WHEN CAST($2 AS varchar) = 'failed' THEN $4 ELSE last_error_code END,
+    last_error_message = CASE WHEN CAST($2 AS varchar) = 'failed' THEN $5 ELSE last_error_message END,
+    submitted_at = CASE WHEN CAST($2 AS varchar) = 'submitted' AND submitted_at IS NULL THEN $3 ELSE submitted_at END,
+    started_at = CASE WHEN CAST($2 AS varchar) = 'running' AND started_at IS NULL THEN $3 ELSE started_at END,
+    finished_at = CASE WHEN CAST($2 AS varchar) IN ('completed', 'failed', 'cancelled') AND finished_at IS NULL THEN $3 ELSE finished_at END,
+    settled_at = CASE WHEN CAST($2 AS varchar) = 'completed' AND settled_at IS NULL THEN $3 ELSE settled_at END,
+    output_deleted_at = CASE WHEN CAST($2 AS varchar) = 'output_deleted' AND output_deleted_at IS NULL THEN $3 ELSE output_deleted_at END
 WHERE batch_id = $1`, batchID, toStatus, now, opts.ErrorCode, opts.ErrorMessage); err != nil {
 		return err
 	}
@@ -450,7 +459,7 @@ func (r *batchImageRepository) ReplaceBatchImageItemsForJob(ctx context.Context,
 func (r *batchImageRepository) replaceBatchImageItemsForJobWithSQL(ctx context.Context, sqlq batchImageSQLExecutor, batchID string, items []service.CreateBatchImageItemParams, counts service.BatchImageCounts) error {
 	var id int64
 	var status string
-	if err := sqlq.QueryRowContext(ctx, `SELECT id, status FROM batch_image_jobs WHERE batch_id = $1 FOR UPDATE`, batchID).Scan(&id, &status); err != nil {
+	if err := sqlq.QueryRowContext(ctx, r.lockedJobQuery("id,status"), batchID).Scan(&id, &status); err != nil {
 		return translatePersistenceError(err, service.ErrBatchImageJobNotFound, nil)
 	}
 	// 仅允许 indexing 状态重建 item 表：防止锁过期后掉队的 worker
@@ -750,7 +759,7 @@ INSERT INTO batch_image_jobs (
     batch_discount_multiplier, hold_multiplier, billable_unit_price, hold_unit_price,
     pricing_snapshot_version,
     currency, hold_id,
-    idempotency_key, request_hash, manifest_hash, retry_count, session_id, output_expires_at
+    idempotency_key, request_hash, manifest_hash, retry_count, session_id, output_expires_at, created_at, updated_at
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9,
     $10, $11, $12, $13, $14,
@@ -760,7 +769,7 @@ INSERT INTO batch_image_jobs (
     $25, $26, $27, $28,
     $29,
     $30, $31,
-    $32, $33, $34, $35, $36, $37
+    $32, $33, $34, $35, $36, $37, NOW(), NOW()
 )
 RETURNING `+batchImageJobColumns,
 		params.BatchID, params.UserID, params.APIKeyID, params.AccountID, params.Provider, params.Model, params.TaskName, params.ParentBatchID, params.Status,
@@ -781,12 +790,12 @@ INSERT INTO batch_image_items (
     job_id, custom_id, status, request_hash, prompt_preview, provider_source_object,
     source_line_number, source_byte_offset, source_byte_length,
     mime_type, file_extension, image_count,
-    error_code, error_message, billed_amount, indexed_at
+    error_code, error_message, billed_amount, indexed_at, created_at
 ) VALUES (
     $1, $2, $3, $4, $5, $6,
     $7, $8, $9,
     $10, $11, $12,
-    $13, $14, $15, $16
+    $13, $14, $15, $16, NOW()
 )
 RETURNING `+batchImageItemColumns,
 		params.JobID, params.CustomID, params.Status, params.RequestHash, params.PromptPreview, params.ProviderSourceObject,
@@ -806,8 +815,8 @@ func appendBatchImageEventWithSQL(ctx context.Context, sqlq batchImageSQLExecuto
 		payloadArg = string(payloadBytes)
 	}
 	_, err := sqlq.ExecContext(ctx, `
-INSERT INTO batch_image_events (job_id, event_type, payload)
-VALUES ($1, $2, $3)`, batchID, eventType, payloadArg)
+INSERT INTO batch_image_events (job_id, event_type, payload, created_at)
+VALUES ($1, $2, $3, NOW())`, batchID, eventType, payloadArg)
 	return err
 }
 
@@ -839,9 +848,9 @@ func scanBatchImageJob(row rowScanner) (*service.BatchImageJob, error) {
 	var holdAmount, actualCost sql.NullFloat64
 	var holdID, idempotencyKey, requestHash, manifestHash sql.NullString
 	var sessionID sql.NullString
-	var outputExpiresAt, inputDeletedAt, outputDeletedAt, downloadedAt, userDeletedAt sql.NullTime
+	var outputExpiresAt, inputDeletedAt, outputDeletedAt, downloadedAt, userDeletedAt dbtime.NullTime
 	var lastErrorCode, lastErrorMessage sql.NullString
-	var submittedAt, startedAt, finishedAt, settledAt sql.NullTime
+	var submittedAt, startedAt, finishedAt, settledAt dbtime.NullTime
 
 	err := row.Scan(
 		&job.ID, &job.BatchID, &job.UserID, &apiKeyID, &accountID, &job.Provider, &job.Model, &job.TaskName, &parentBatchID, &job.Status,
@@ -855,7 +864,7 @@ func scanBatchImageJob(row rowScanner) (*service.BatchImageJob, error) {
 		&idempotencyKey, &requestHash, &manifestHash,
 		&job.RetryCount, &job.Version, &sessionID, &outputExpiresAt, &inputDeletedAt, &outputDeletedAt, &downloadedAt, &userDeletedAt,
 		&lastErrorCode, &lastErrorMessage,
-		&job.CreatedAt, &job.UpdatedAt, &submittedAt, &startedAt, &finishedAt, &settledAt,
+		dbtime.Dest(&job.CreatedAt), dbtime.Dest(&job.UpdatedAt), &submittedAt, &startedAt, &finishedAt, &settledAt,
 	)
 	if err != nil {
 		return nil, err
@@ -921,14 +930,14 @@ func scanBatchImageItem(row rowScanner) (*service.BatchImageItem, error) {
 	var sourceByteOffset, sourceByteLength sql.NullInt64
 	var mimeType, fileExtension, errorCode, errorMessage sql.NullString
 	var billedAmount sql.NullFloat64
-	var indexedAt sql.NullTime
+	var indexedAt dbtime.NullTime
 
 	err := row.Scan(
 		&item.ID, &item.JobID, &item.CustomID, &item.Status, &requestHash, &promptPreview, &providerSourceObject,
 		&sourceLineNumber, &sourceByteOffset, &sourceByteLength,
 		&mimeType, &fileExtension, &item.ImageCount,
 		&errorCode, &errorMessage, &billedAmount,
-		&item.CreatedAt, &indexedAt,
+		dbtime.Dest(&item.CreatedAt), &indexedAt,
 	)
 	if err != nil {
 		return nil, err
@@ -978,7 +987,7 @@ func batchImageNullFloat64Ptr(v sql.NullFloat64) *float64 {
 	return &v.Float64
 }
 
-func batchImageNullTimePtr(v sql.NullTime) *time.Time {
+func batchImageNullTimePtr(v dbtime.NullTime) *time.Time {
 	if !v.Valid {
 		return nil
 	}

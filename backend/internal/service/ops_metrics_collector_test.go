@@ -58,3 +58,13 @@ func TestOpsMetricsCollectorQueryErrorCountsExcludesCountTokens(t *testing.T) {
 	require.NoError(t, db.Close())
 	require.NoError(t, mock.ExpectationsWereMet())
 }
+
+func TestOpsMetricsCollectorMemoryCacheReportsHealthy(t *testing.T) {
+	collector := &OpsMetricsCollector{memoryCache: true}
+	require.True(t, collector.checkCache(context.Background()))
+}
+
+func TestOpsMetricsCollectorRedisCacheMissingReportsUnhealthy(t *testing.T) {
+	collector := &OpsMetricsCollector{}
+	require.False(t, collector.checkCache(context.Background()))
+}

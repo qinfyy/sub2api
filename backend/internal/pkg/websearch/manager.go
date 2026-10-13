@@ -19,6 +19,17 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// QuotaStore persists provider quota counters and temporary proxy
+// unavailability. Implementations must be safe for concurrent use.
+type QuotaStore interface {
+	IncrementQuota(ctx context.Context, key string, ttl time.Duration) (int64, error)
+	DecrementQuota(ctx context.Context, key string) error
+	GetQuota(ctx context.Context, key string) (int64, error)
+	ResetQuota(ctx context.Context, key string) error
+	SetProxyUnavailable(ctx context.Context, key string, ttl time.Duration) error
+	IsProxyUnavailable(ctx context.Context, key string) (bool, error)
+}
+
 // ProviderConfig holds the configuration for a single search provider.
 type ProviderConfig struct {
 	Type         string `json:"type"`                    // ProviderTypeBrave | ProviderTypeTavily
@@ -33,10 +44,61 @@ type ProviderConfig struct {
 // Manager selects providers by quota-weighted load balancing and tracks quota via Redis.
 type Manager struct {
 	configs []ProviderConfig
-	redis   *redis.Client
+	store   QuotaStore
 
 	clientMu    sync.Mutex
 	clientCache map[string]*http.Client
+}
+
+type redisQuotaStore struct {
+	client *redis.Client
+}
+
+// NewRedisQuotaStore exposes the Redis-backed store for dependency injection.
+func NewRedisQuotaStore(client *redis.Client) QuotaStore {
+	if client == nil {
+		return nil
+	}
+	return redisQuotaStore{client: client}
+}
+
+func (s redisQuotaStore) IncrementQuota(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+	ttlSec := int(ttl.Seconds())
+	if ttlSec <= 0 {
+		ttlSec = int(defaultQuotaTTL.Seconds())
+	}
+	return quotaIncrScript.Run(ctx, s.client, []string{key}, ttlSec).Int64()
+}
+
+func (s redisQuotaStore) DecrementQuota(ctx context.Context, key string) error {
+	return s.client.Decr(ctx, key).Err()
+}
+
+func (s redisQuotaStore) GetQuota(ctx context.Context, key string) (int64, error) {
+	val, err := s.client.Get(ctx, key).Int64()
+	if err == redis.Nil {
+		return 0, nil
+	}
+	return val, err
+}
+
+func (s redisQuotaStore) ResetQuota(ctx context.Context, key string) error {
+	return s.client.Del(ctx, key).Err()
+}
+
+func (s redisQuotaStore) SetProxyUnavailable(ctx context.Context, key string, ttl time.Duration) error {
+	return s.client.Set(ctx, key, "1", ttl).Err()
+}
+
+func (s redisQuotaStore) IsProxyUnavailable(ctx context.Context, key string) (bool, error) {
+	val, err := s.client.Get(ctx, key).Result()
+	if err == redis.Nil {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return val != "", nil
 }
 
 // Timeout constants for proxy and search operations.
@@ -75,11 +137,22 @@ return val
 // NewManager creates a Manager with the given provider configs and Redis client.
 // Provider order is preserved as-is; selectByQuotaWeight handles load balancing.
 func NewManager(configs []ProviderConfig, redisClient *redis.Client) *Manager {
+	var store QuotaStore
+	if redisClient != nil {
+		store = redisQuotaStore{client: redisClient}
+	}
+	return NewManagerWithStore(configs, store)
+}
+
+// NewManagerWithStore creates a Manager backed by a replaceable quota store.
+// A nil store keeps the legacy fail-open behavior used by tests and callers
+// that do not need quota tracking.
+func NewManagerWithStore(configs []ProviderConfig, store QuotaStore) *Manager {
 	copied := make([]ProviderConfig, len(configs))
 	copy(copied, configs)
 	return &Manager{
 		configs:     copied,
-		redis:       redisClient,
+		store:       store,
 		clientCache: make(map[string]*http.Client),
 	}
 }
@@ -244,11 +317,11 @@ func (m *Manager) isProviderAvailable(cfg ProviderConfig) bool {
 // markProxyUnavailable marks the effective proxy as unavailable for proxyUnavailableTTL.
 func (m *Manager) markProxyUnavailable(ctx context.Context, cfg ProviderConfig, accountProxyURL string) {
 	proxyID := resolveProxyID(cfg, accountProxyURL)
-	if proxyID <= 0 || m.redis == nil {
+	if proxyID <= 0 || m.store == nil {
 		return
 	}
 	key := fmt.Sprintf(proxyUnavailableKey, proxyID)
-	if err := m.redis.Set(ctx, key, "1", proxyUnavailableTTL).Err(); err != nil {
+	if err := m.store.SetProxyUnavailable(ctx, key, proxyUnavailableTTL); err != nil {
 		slog.Warn("websearch: failed to mark proxy unavailable",
 			"proxy_id", proxyID, "error", err)
 	}
@@ -256,15 +329,15 @@ func (m *Manager) markProxyUnavailable(ctx context.Context, cfg ProviderConfig, 
 
 // isProxyAvailable checks whether a proxy is currently marked as unavailable.
 func (m *Manager) isProxyAvailable(ctx context.Context, proxyID int64) bool {
-	if m.redis == nil || proxyID <= 0 {
+	if m.store == nil || proxyID <= 0 {
 		return true
 	}
 	key := fmt.Sprintf(proxyUnavailableKey, proxyID)
-	val, err := m.redis.Get(ctx, key).Result()
+	unavailable, err := m.store.IsProxyUnavailable(ctx, key)
 	if err != nil {
-		return true // Redis error → assume available
+		return true // backend error → assume available
 	}
-	return val == ""
+	return !unavailable
 }
 
 // resolveProxyID determines the effective proxy ID for a provider+account combination.
@@ -312,20 +385,20 @@ func (m *Manager) tryReserveQuota(ctx context.Context, cfg ProviderConfig) (bool
 	if cfg.QuotaLimit <= 0 {
 		return true, false
 	}
-	if m.redis == nil {
-		slog.Warn("websearch: Redis unavailable, quota check skipped", "provider", cfg.Type)
+	if m.store == nil {
+		slog.Warn("websearch: quota store unavailable, quota check skipped", "provider", cfg.Type)
 		return true, false
 	}
 	key := quotaRedisKey(cfg.Type)
-	ttlSec := int(quotaTTLFromSubscription(cfg.SubscribedAt).Seconds())
-	newVal, err := quotaIncrScript.Run(ctx, m.redis, []string{key}, ttlSec).Int64()
+	ttl := quotaTTLFromSubscription(cfg.SubscribedAt)
+	newVal, err := m.store.IncrementQuota(ctx, key, ttl)
 	if err != nil {
-		slog.Warn("websearch: quota Lua INCR failed, allowing request",
+		slog.Warn("websearch: quota increment failed, allowing request",
 			"provider", cfg.Type, "error", err)
 		return true, false
 	}
 	if newVal > cfg.QuotaLimit {
-		if decrErr := m.redis.Decr(ctx, key).Err(); decrErr != nil {
+		if decrErr := m.store.DecrementQuota(ctx, key); decrErr != nil {
 			slog.Warn("websearch: quota over-limit DECR failed",
 				"provider", cfg.Type, "error", decrErr)
 		}
@@ -337,11 +410,11 @@ func (m *Manager) tryReserveQuota(ctx context.Context, cfg ProviderConfig) (bool
 }
 
 func (m *Manager) rollbackQuota(ctx context.Context, cfg ProviderConfig) {
-	if cfg.QuotaLimit <= 0 || m.redis == nil {
+	if cfg.QuotaLimit <= 0 || m.store == nil {
 		return
 	}
 	key := quotaRedisKey(cfg.Type)
-	if err := m.redis.Decr(ctx, key).Err(); err != nil {
+	if err := m.store.DecrementQuota(ctx, key); err != nil {
 		slog.Warn("websearch: quota rollback DECR failed",
 			"provider", cfg.Type, "error", err)
 	}
@@ -426,15 +499,11 @@ func newHTTPClient(proxyURL string) (*http.Client, error) {
 
 // GetUsage returns the current usage count for the given provider.
 func (m *Manager) GetUsage(ctx context.Context, providerType string) (int64, error) {
-	if m.redis == nil {
+	if m.store == nil {
 		return 0, nil
 	}
 	key := quotaRedisKey(providerType)
-	val, err := m.redis.Get(ctx, key).Int64()
-	if err == redis.Nil {
-		return 0, nil
-	}
-	return val, err
+	return m.store.GetQuota(ctx, key)
 }
 
 // GetAllUsage returns usage for every configured provider.
@@ -449,11 +518,11 @@ func (m *Manager) GetAllUsage(ctx context.Context) map[string]int64 {
 
 // ResetUsage deletes the Redis quota key for the given provider, resetting usage to 0.
 func (m *Manager) ResetUsage(ctx context.Context, providerType string) error {
-	if m.redis == nil {
+	if m.store == nil {
 		return nil
 	}
 	key := quotaRedisKey(providerType)
-	return m.redis.Del(ctx, key).Err()
+	return m.store.ResetQuota(ctx, key)
 }
 
 // --- Provider factory ---

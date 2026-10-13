@@ -27,6 +27,9 @@ func NewDashboardAggregationRepository(sqlDB *sql.DB) service.DashboardAggregati
 	if sqlDB == nil {
 		return nil
 	}
+	if isSQLiteDB(sqlDB) {
+		return &sqliteDashboardAggregation{db: sqlDB, clock: time.Now}
+	}
 	if !isPostgresDriver(sqlDB) {
 		log.Printf("[DashboardAggregation] 检测到非 PostgreSQL 驱动，已自动禁用预聚合")
 		return nil
@@ -137,11 +140,11 @@ func (r *dashboardAggregationRepository) RecomputeRange(ctx context.Context, sta
 		if err != nil {
 			return err
 		}
-		if err := lockGroupUsageRollupState(ctx, tx); err != nil {
+		if err := lockGroupUsageRollupState(ctx, tx, false); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
-		if err := invalidateGroupUsageRollupsAt(ctx, tx, start); err != nil {
+		if err := invalidateGroupUsageRollupsAt(ctx, tx, false, start); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -296,7 +299,7 @@ func cleanupUsageLogsBatchWithRollupInvalidation(ctx context.Context, db *sql.DB
 		return 0, err
 	}
 
-	if err := lockGroupUsageRollupState(ctx, tx); err != nil {
+	if err := lockGroupUsageRollupState(ctx, tx, false); err != nil {
 		return rollback(err)
 	}
 	rows, err := tx.QueryContext(ctx, `
@@ -336,7 +339,7 @@ func cleanupUsageLogsBatchWithRollupInvalidation(ctx context.Context, db *sql.DB
 		return rollback(err)
 	}
 	if affected > 0 {
-		if err := invalidateGroupUsageRollupsAt(ctx, tx, earliestDeletedAt); err != nil {
+		if err := invalidateGroupUsageRollupsAt(ctx, tx, false, earliestDeletedAt); err != nil {
 			return rollback(err)
 		}
 	}
@@ -662,10 +665,10 @@ func dropUsageLogsPartitionWithRollupInvalidation(ctx context.Context, db *sql.D
 		return err
 	}
 
-	if err := lockGroupUsageRollupState(ctx, tx); err != nil {
+	if err := lockGroupUsageRollupState(ctx, tx, false); err != nil {
 		return rollback(err)
 	}
-	if err := invalidateGroupUsageRollupsAt(ctx, tx, monthStart); err != nil {
+	if err := invalidateGroupUsageRollupsAt(ctx, tx, false, monthStart); err != nil {
 		return rollback(err)
 	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", pq.QuoteIdentifier(name))); err != nil {

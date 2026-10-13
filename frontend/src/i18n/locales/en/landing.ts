@@ -230,8 +230,11 @@ export default {
       passwordPlaceholder: 'Password',
       enableTls: 'Enable TLS',
       enableTlsHint: 'Use TLS when connecting to Redis (public CA certs)',
+      singleInstanceHint: 'The in-memory cache supports only a single instance.',
       memory: {
-        maxCapacity: 'Max Capacity (MB)'
+        maxCapacity: 'Max Capacity (MB)',
+        persistencePath: 'Persistent State Database',
+        persistencePathHint: 'Stores refresh tokens, task state, and rate limits. Defaults to data/cache-state.db.'
       }
     },
     admin: {

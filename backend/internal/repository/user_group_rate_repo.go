@@ -10,12 +10,13 @@ import (
 )
 
 type userGroupRateRepository struct {
-	sql sqlExecutor
+	sql    sqlExecutor
+	sqlite bool
 }
 
 // NewUserGroupRateRepository 创建用户专属分组倍率/RPM 仓储
 func NewUserGroupRateRepository(sqlDB *sql.DB) service.UserGroupRateRepository {
-	return &userGroupRateRepository{sql: sqlDB}
+	return &userGroupRateRepository{sql: sqlDB, sqlite: isSQLiteDB(sqlDB)}
 }
 
 // GetByUserID 获取用户所有专属分组 rate_multiplier（仅返回非 NULL 的条目）
@@ -66,11 +67,22 @@ func (r *userGroupRateRepository) GetByUserIDs(ctx context.Context, userIDs []in
 		return result, nil
 	}
 
-	rows, err := r.sql.QueryContext(ctx, `
+	query := `
 		SELECT user_id, group_id, rate_multiplier
 		FROM user_group_rate_multipliers
 		WHERE user_id = ANY($1) AND rate_multiplier IS NOT NULL
-	`, pq.Array(uniqueIDs))
+	`
+	arg := arrayArg(r.sqlite, uniqueIDs)
+	if r.sqlite {
+		query = `SELECT user_id, group_id, rate_multiplier FROM user_group_rate_multipliers
+		WHERE user_id IN (SELECT value FROM json_each($1)) AND rate_multiplier IS NOT NULL`
+		var err error
+		arg, err = jsonArrayArg(uniqueIDs)
+		if err != nil {
+			return nil, err
+		}
+	}
+	rows, err := r.sql.QueryContext(ctx, query, arg)
 	if err != nil {
 		return nil, err
 	}
@@ -174,6 +186,9 @@ func (r *userGroupRateRepository) GetRPMOverrideByUserAndGroup(ctx context.Conte
 //   - 值为 nil：清空对应行的 rate_multiplier（保留 rpm_override）。
 //   - 值非 nil：upsert rate_multiplier（保留已有 rpm_override）。
 func (r *userGroupRateRepository) SyncUserGroupRates(ctx context.Context, userID int64, rates map[int64]*float64) error {
+	if r.sqlite {
+		return r.syncSQLiteUserRates(ctx, userID, rates)
+	}
 	if len(rates) == 0 {
 		if _, err := r.sql.ExecContext(ctx, `
 			UPDATE user_group_rate_multipliers
@@ -244,6 +259,13 @@ func (r *userGroupRateRepository) SyncUserGroupRates(ctx context.Context, userID
 //   - 未出现在 entries 中的用户行：rate_multiplier 归 NULL；若 rpm_override 也为 NULL 则整行删除。
 //   - 出现的用户行：upsert rate_multiplier。
 func (r *userGroupRateRepository) SyncGroupRateMultipliers(ctx context.Context, groupID int64, entries []service.GroupRateMultiplierInput) error {
+	if r.sqlite {
+		values := make(map[int64]any, len(entries))
+		for _, entry := range entries {
+			values[entry.UserID] = entry.RateMultiplier
+		}
+		return r.syncSQLiteGroupValues(ctx, groupID, "rate_multiplier", values)
+	}
 	keepUserIDs := make([]int64, 0, len(entries))
 	for _, e := range entries {
 		keepUserIDs = append(keepUserIDs, e.UserID)
@@ -302,6 +324,17 @@ func (r *userGroupRateRepository) SyncGroupRateMultipliers(ctx context.Context, 
 //   - 未出现的用户行：rpm_override 归 NULL；若 rate_multiplier 也为 NULL 则整行删除。
 //   - 出现的用户行：若 RPMOverride 为 nil 则清空；非 nil 则 upsert。
 func (r *userGroupRateRepository) SyncGroupRPMOverrides(ctx context.Context, groupID int64, entries []service.GroupRPMOverrideInput) error {
+	if r.sqlite {
+		values := make(map[int64]any, len(entries))
+		for _, entry := range entries {
+			if entry.RPMOverride != nil {
+				values[entry.UserID] = *entry.RPMOverride
+			} else {
+				values[entry.UserID] = nil
+			}
+		}
+		return r.syncSQLiteGroupValues(ctx, groupID, "rpm_override", values)
+	}
 	keepUserIDs := make([]int64, 0, len(entries))
 	var clearUserIDs []int64
 	upsertUserIDs := make([]int64, 0, len(entries))

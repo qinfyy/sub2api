@@ -21,7 +21,7 @@ import (
 func newAPIKeyRepoSQLite(t *testing.T) (*apiKeyRepository, *dbent.Client) {
 	t.Helper()
 
-	db, err := sql.Open("sqlite", "file:api_key_repo_last_used?mode=memory&cache=shared")
+	db, err := sql.Open("sqlite", "file:api_key_repo_last_used?mode=memory&cache=shared&_time_format=sqlite")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -32,7 +32,7 @@ func newAPIKeyRepoSQLite(t *testing.T) (*apiKeyRepository, *dbent.Client) {
 	client := enttest.NewClient(t, enttest.WithOptions(dbent.Driver(drv)))
 	t.Cleanup(func() { _ = client.Close() })
 
-	return &apiKeyRepository{client: client, sql: db}, client
+	return &apiKeyRepository{client: client, sql: db, db: db, sqlite: true}, client
 }
 
 func mustCreateAPIKeyRepoUser(t *testing.T, ctx context.Context, client *dbent.Client, email string) *service.User {

@@ -12,6 +12,11 @@ export const useAdminComplianceStore = defineStore('adminCompliance', () => {
   const submitting = ref(false)
   const initialized = ref(false)
   const forceVisible = ref(false)
+  let session = 0
+  let revision = 0
+  let pending: Promise<AdminComplianceStatus> | null = null
+  let retryAt = 0
+  let lastFailure: unknown
 
   const required = computed(() => status.value?.required === true)
   const shouldShow = computed(() => required.value || forceVisible.value)
@@ -23,35 +28,61 @@ export const useAdminComplianceStore = defineStore('adminCompliance', () => {
     return status.value?.ack_phrase_en || FALLBACK_EN_PHRASE
   })
 
-  async function fetchStatus(): Promise<AdminComplianceStatus> {
+  function fetchStatus(): Promise<AdminComplianceStatus> {
+    if (pending) return pending
+    if (Date.now() < retryAt) return Promise.reject(lastFailure)
+    const requestSession = session
+    const requestRevision = revision
     loading.value = true
-    try {
-      const nextStatus = await adminComplianceAPI.getStatus()
-      status.value = nextStatus
-      initialized.value = true
-      forceVisible.value = nextStatus.required
+    const request = adminComplianceAPI.getStatus().then((nextStatus) => {
+      if (requestSession !== session) throw new Error('Compliance session changed')
+      if (requestRevision === revision) {
+        status.value = nextStatus
+        initialized.value = true
+        forceVisible.value = nextStatus.required
+      }
+      retryAt = 0
+      lastFailure = undefined
       return nextStatus
-    } finally {
-      loading.value = false
-    }
+    }).catch((error: unknown) => {
+      if (requestSession === session && requestRevision === revision) {
+        lastFailure = error
+        retryAt = Date.now() + 5000
+      }
+      throw error
+    }).finally(() => {
+      if (pending === request) {
+        pending = null
+        loading.value = false
+      }
+    })
+    pending = request
+    return request
   }
 
   async function accept(phrase: string): Promise<AdminComplianceStatus> {
+    const requestSession = session
     submitting.value = true
     try {
       const nextStatus = await adminComplianceAPI.accept({
         phrase,
         language: currentLocale.value
       })
+      if (requestSession !== session) throw new Error('Compliance session changed')
+      revision += 1
+      retryAt = 0
+      lastFailure = undefined
       status.value = nextStatus
+      initialized.value = true
       forceVisible.value = nextStatus.required
       return nextStatus
     } finally {
-      submitting.value = false
+      if (requestSession === session) submitting.value = false
     }
   }
 
   function requireAcknowledgement(partialStatus?: Partial<AdminComplianceStatus>): void {
+    revision += 1
     status.value = {
       required: true,
       version: partialStatus?.version || status.value?.version || 'v2026.06.10',
@@ -68,6 +99,11 @@ export const useAdminComplianceStore = defineStore('adminCompliance', () => {
   }
 
   function reset(): void {
+    session += 1
+    revision += 1
+    pending = null
+    retryAt = 0
+    lastFailure = undefined
     status.value = null
     loading.value = false
     submitting.value = false

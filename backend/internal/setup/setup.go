@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -44,11 +45,16 @@ func setupDefaultAdminConcurrency() int {
 }
 
 // GetDataDir returns the data directory for storing config and lock files.
-// Priority: DATA_DIR env > /app/data (if exists and writable) > current directory
+// Priority: DATA_DIR env > /app/data (non-Windows, if writable) > current directory.
 func GetDataDir() string {
 	// Check DATA_DIR environment variable first
 	if dir := os.Getenv("DATA_DIR"); dir != "" {
 		return dir
+	}
+
+	// Container paths otherwise resolve against the current drive on Windows.
+	if runtime.GOOS == "windows" {
+		return "."
 	}
 
 	// Check if /app/data exists and is writable (Docker environment)
@@ -100,18 +106,14 @@ type DatabaseConfig struct {
 }
 
 type RedisConfig struct {
-	Type      string `json:"type" yaml:"type"`
-	Host      string `json:"host" yaml:"host"`
-	Port      int    `json:"port" yaml:"port"`
-	Username  string `json:"username" yaml:"username"`
-	Password  string `json:"password" yaml:"password"`
-	DB        int    `json:"db" yaml:"db"`
-	EnableTLS bool   `json:"enable_tls" yaml:"enable_tls"`
-	Memory    struct {
-		PersistencePath   string `json:"persistence_path" yaml:"persistence_path"`
-		MaxCapacityMB     int    `json:"max_capacity_mb" yaml:"max_capacity_mb"`
-		GCIntervalSeconds int    `json:"gc_interval_seconds" yaml:"gc_interval_seconds"`
-	} `json:"memory" yaml:"memory"`
+	Type      string                   `json:"type" yaml:"type"`
+	Host      string                   `json:"host" yaml:"host"`
+	Port      int                      `json:"port" yaml:"port"`
+	Username  string                   `json:"username" yaml:"username"`
+	Password  string                   `json:"password" yaml:"password"`
+	DB        int                      `json:"db" yaml:"db"`
+	EnableTLS bool                     `json:"enable_tls" yaml:"enable_tls"`
+	Memory    config.MemoryCacheConfig `json:"memory" yaml:"memory"`
 }
 
 type AdminConfig struct {

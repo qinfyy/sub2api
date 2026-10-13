@@ -217,6 +217,9 @@
             <p class="mt-1 text-sm text-gray-500 dark:text-dark-400">
               {{ t('setup.redis.description') }}
             </p>
+            <p v-if="isMemoryCache" class="mt-2 text-xs text-amber-600 dark:text-amber-400">
+              {{ t('setup.redis.singleInstanceHint') }}
+            </p>
           </div>
 
           <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -248,6 +251,19 @@
                 placeholder="512"
               />
             </div>
+          </div>
+
+          <div v-if="isMemoryCache && !isSQLite">
+            <label class="input-label">{{ t('setup.redis.memory.persistencePath') }}</label>
+            <input
+              v-model="formData.redis.memory.persistence_path"
+              type="text"
+              class="input"
+              placeholder="data/cache-state.db"
+            />
+            <p class="mt-1 text-xs text-gray-500 dark:text-dark-400">
+              {{ t('setup.redis.memory.persistencePathHint') }}
+            </p>
           </div>
 
           <template v-if="!isMemoryCache">
@@ -587,19 +603,9 @@ const installing = ref(false)
 const confirmPassword = ref('')
 const serviceReady = ref(false)
 
-// Default server port
-const getCurrentPort = (): number => {
-  const port = window.location.port
-  if (port) {
-    return parseInt(port, 10)
-  }
-
-  return window.location.protocol === 'https:' ? 443 : 80
-}
-
 const formData = reactive<InstallRequest>({
   database: {
-    type: 'postgres',
+    type: 'sqlite',
     host: 'localhost',
     port: 5432,
     user: 'postgres',
@@ -609,7 +615,7 @@ const formData = reactive<InstallRequest>({
     path: 'data/sub2api.db'
   },
   redis: {
-    type: 'redis',
+    type: 'memory',
     host: 'localhost',
     port: 6379,
     username: '',
@@ -617,6 +623,7 @@ const formData = reactive<InstallRequest>({
     db: 0,
     enable_tls: false,
     memory: {
+      persistence_path: 'data/cache-state.db',
       max_capacity_mb: 512,
       gc_interval_seconds: 60
     }
@@ -627,30 +634,34 @@ const formData = reactive<InstallRequest>({
   },
   server: {
     host: '0.0.0.0',
-    port: getCurrentPort(), // Use current port from browser
+    port: 8080,
     mode: 'release'
   }
 })
 
-// Switching backend resets the connection state so the wizard re-validates.
+// A response only validates the exact settings that were tested.
+let databaseRevision = 0
+let cacheRevision = 0
 watch(
-  () => formData.database.type,
-  (next, previous) => {
-    if (next !== previous) {
-      dbConnected.value = false
-      errorMessage.value = ''
-    }
-  }
+  () => formData.database,
+  () => {
+    databaseRevision++
+    cacheRevision++
+    dbConnected.value = false
+    redisConnected.value = false
+    errorMessage.value = ''
+  },
+  { deep: true, flush: 'sync' }
 )
 
 watch(
-  () => formData.redis.type,
-  (next, previous) => {
-    if (next !== previous) {
-      redisConnected.value = false
-      errorMessage.value = ''
-    }
-  }
+  () => formData.redis,
+  () => {
+    cacheRevision++
+    redisConnected.value = false
+    errorMessage.value = ''
+  },
+  { deep: true, flush: 'sync' }
 )
 
 const isSQLite = computed(() => formData.database.type === 'sqlite')
@@ -674,14 +685,16 @@ const canProceed = computed(() => {
 })
 
 async function testDatabaseConnection() {
+  const revision = databaseRevision
   testingDb.value = true
   errorMessage.value = ''
   dbConnected.value = false
 
   try {
-    await testDatabase(formData.database)
-    dbConnected.value = true
+    await testDatabase({ ...formData.database })
+    if (revision === databaseRevision) dbConnected.value = true
   } catch (error: unknown) {
+    if (revision !== databaseRevision) return
     const err = error as { response?: { data?: { detail?: string; message?: string } }; message?: string }
     errorMessage.value =
       err.response?.data?.detail || err.response?.data?.message || err.message || 'Connection failed'
@@ -691,14 +704,16 @@ async function testDatabaseConnection() {
 }
 
 async function testRedisConnection() {
+  const revision = cacheRevision
   testingRedis.value = true
   errorMessage.value = ''
   redisConnected.value = false
 
   try {
-    await testRedis(formData.redis)
-    redisConnected.value = true
+    await testRedis({ ...formData.redis, memory: { ...formData.redis.memory } })
+    if (revision === cacheRevision) redisConnected.value = true
   } catch (error: unknown) {
+    if (revision !== cacheRevision) return
     const err = error as { response?: { data?: { detail?: string; message?: string } }; message?: string }
     errorMessage.value =
       err.response?.data?.detail || err.response?.data?.message || err.message || 'Connection failed'

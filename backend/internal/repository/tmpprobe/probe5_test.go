@@ -70,7 +70,7 @@ func TestProbeModerncTimeBinding(t *testing.T) {
 	}
 	for _, e := range exprs {
 		var sv, uv, dv any
-		_ = db.QueryRow("SELECT " + e + ", unixepoch(" + e + "), datetime(" + e + ") FROM groups LIMIT 1").Scan(&sv, &uv, &dv)
+		_ = db.QueryRow("SELECT "+e+", unixepoch("+e+"), datetime("+e+") FROM groups LIMIT 1").Scan(&sv, &uv, &dv)
 		t.Logf("%-46s => %v | %v | %v", e, sv, uv, dv)
 	}
 

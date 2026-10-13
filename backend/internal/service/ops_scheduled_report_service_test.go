@@ -119,6 +119,7 @@ func TestOpsScheduledReportLegacyTemplateReceivesSummaryHTML(t *testing.T) {
 	svc := &OpsScheduledReportService{
 		opsService:   &OpsService{opsRepo: &opsRepoMock{}},
 		emailService: emailService,
+		leaderLock:   &fakeLeaderLockCache{},
 	}
 	report := &opsScheduledReport{
 		Name:       "日报",

@@ -64,5 +64,5 @@ func TestSQLiteDSNEscapesFilenameAndUsesImmediateTransactions(t *testing.T) {
 	}
 	require.Equal(t, cfg.Path, path)
 	require.Equal(t, "immediate", u.Query().Get("_txlock"))
-	require.ElementsMatch(t, []string{"busy_timeout(10000)", "journal_mode(WAL)", "foreign_keys(1)"}, u.Query()["_pragma"])
+	require.ElementsMatch(t, []string{"busy_timeout(10000)", "journal_mode(WAL)", "foreign_keys(1)", "synchronous(FULL)"}, u.Query()["_pragma"])
 }

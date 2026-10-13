@@ -3,6 +3,7 @@ package logger
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"go.uber.org/zap"
@@ -12,8 +13,12 @@ import (
 func TestResolveLogFilePath_Default(t *testing.T) {
 	t.Setenv("DATA_DIR", "")
 	got := resolveLogFilePath("")
-	if got != DefaultContainerLogPath {
-		t.Fatalf("resolveLogFilePath() = %q, want %q", got, DefaultContainerLogPath)
+	want := DefaultContainerLogPath
+	if runtime.GOOS == "windows" {
+		want = filepath.Join("logs", "sub2api.log")
+	}
+	if got != want {
+		t.Fatalf("resolveLogFilePath() = %q, want %q", got, want)
 	}
 }
 
@@ -65,7 +70,11 @@ func TestNormalizedOptions_InvalidFallback(t *testing.T) {
 	if !out.Output.ToStdout {
 		t.Fatalf("normalized output should fallback to stdout")
 	}
-	if out.Output.FilePath != DefaultContainerLogPath {
+	wantLogPath := DefaultContainerLogPath
+	if runtime.GOOS == "windows" {
+		wantLogPath = filepath.Join("logs", "sub2api.log")
+	}
+	if out.Output.FilePath != wantLogPath {
 		t.Fatalf("normalized file path = %q", out.Output.FilePath)
 	}
 	if out.Rotation.MaxSizeMB != 100 {

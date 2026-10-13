@@ -530,9 +530,10 @@ func ProvideOpsMetricsCollector(
 	concurrencyService *ConcurrencyService,
 	db *sql.DB,
 	redisClient *redis.Client,
+	leaderLock LeaderLockCache,
 	cfg *config.Config,
 ) *OpsMetricsCollector {
-	collector := NewOpsMetricsCollector(opsRepo, settingRepo, accountRepo, concurrencyService, db, redisClient, cfg)
+	collector := NewOpsMetricsCollector(opsRepo, settingRepo, accountRepo, concurrencyService, db, redisClient, leaderLock, cfg != nil && cfg.Redis.IsMemory(), cfg)
 	collector.Start()
 	return collector
 }
@@ -543,9 +544,10 @@ func ProvideOpsAggregationService(
 	settingRepo SettingRepository,
 	db *sql.DB,
 	redisClient *redis.Client,
+	leaderLock LeaderLockCache,
 	cfg *config.Config,
 ) *OpsAggregationService {
-	svc := NewOpsAggregationService(opsRepo, settingRepo, db, redisClient, cfg)
+	svc := NewOpsAggregationService(opsRepo, settingRepo, db, redisClient, leaderLock, cfg)
 	svc.Start()
 	return svc
 }
@@ -555,11 +557,13 @@ func ProvideOpsAlertEvaluatorService(
 	opsService *OpsService,
 	opsRepo OpsRepository,
 	emailService *EmailService,
+	db *sql.DB,
 	redisClient *redis.Client,
+	leaderLock LeaderLockCache,
 	cfg *config.Config,
 	proxyRepo ProxyRepository,
 ) *OpsAlertEvaluatorService {
-	svc := NewOpsAlertEvaluatorService(opsService, opsRepo, emailService, redisClient, cfg, proxyRepo)
+	svc := NewOpsAlertEvaluatorService(opsService, opsRepo, emailService, db, cfg, proxyRepo, leaderLock)
 	svc.Start()
 	return svc
 }
@@ -572,13 +576,13 @@ func ProvideOpsAlertEvaluatorService(
 func ProvideOpsCleanupService(
 	opsRepo OpsRepository,
 	db *sql.DB,
-	redisClient *redis.Client,
+	leaderLock LeaderLockCache,
 	cfg *config.Config,
 	channelMonitorSvc *ChannelMonitorService,
 	settingRepo SettingRepository,
 	opsService *OpsService,
 ) *OpsCleanupService {
-	svc := NewOpsCleanupService(opsRepo, db, redisClient, cfg, channelMonitorSvc, settingRepo)
+	svc := NewOpsCleanupService(opsRepo, db, leaderLock, cfg, channelMonitorSvc, settingRepo)
 	svc.Start()
 	if opsService != nil {
 		opsService.SetCleanupReloader(svc)
@@ -666,10 +670,12 @@ func ProvideOpsScheduledReportService(
 	opsService *OpsService,
 	userService *UserService,
 	emailService *EmailService,
-	redisClient *redis.Client,
+	leaderLock LeaderLockCache,
+	db *sql.DB,
+	lastRunStore PluginKVStore,
 	cfg *config.Config,
 ) *OpsScheduledReportService {
-	svc := NewOpsScheduledReportService(opsService, userService, emailService, redisClient, cfg)
+	svc := NewOpsScheduledReportService(opsService, userService, emailService, leaderLock, db, lastRunStore, cfg)
 	svc.Start()
 	return svc
 }

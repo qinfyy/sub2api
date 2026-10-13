@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/dbtime"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
@@ -382,7 +383,7 @@ func (r *opsRepository) listHourlyMetricsRows(ctx context.Context, filter *servi
 		return []opsHourlyMetricsRow{}, nil
 	}
 
-	where := "bucket_start >= $1 AND bucket_start < $2"
+	where := opsTimePredicate("bucket_start", ">=", 1, isSQLiteDB(r.db)) + " AND " + opsTimePredicate("bucket_start", "<", 2, isSQLiteDB(r.db))
 	args := []any{start.UTC(), end.UTC()}
 	idx := 3
 
@@ -449,7 +450,7 @@ ORDER BY bucket_start ASC`
 	for rows.Next() {
 		var row opsHourlyMetricsRow
 		if err := rows.Scan(
-			&row.bucketStart,
+			dbtime.Dest(&row.bucketStart),
 			&row.successCount,
 			&row.errorCountTotal,
 			&row.businessLimitedCount,
@@ -678,7 +679,7 @@ func (r *opsRepository) queryRawPartial(ctx context.Context, filter *service.Ops
 
 func (r *opsRepository) rawOpsDataExists(ctx context.Context, filter *service.OpsDashboardFilter, start, end time.Time) (bool, error) {
 	{
-		join, where, args, _ := buildUsageWhere(filter, start, end, 1)
+		join, where, args, _ := buildUsageWhere(filter, start, end, 1, isSQLiteDB(r.db))
 		q := `SELECT EXISTS(SELECT 1 FROM usage_logs ul ` + join + ` ` + where + ` LIMIT 1)`
 		var exists bool
 		if err := r.db.QueryRowContext(ctx, q, args...).Scan(&exists); err != nil {
@@ -690,7 +691,7 @@ func (r *opsRepository) rawOpsDataExists(ctx context.Context, filter *service.Op
 	}
 
 	{
-		where, args, _ := buildErrorWhere(filter, start, end, 1)
+		where, args, _ := buildErrorWhere(filter, start, end, 1, isSQLiteDB(r.db))
 		q := `SELECT EXISTS(SELECT 1 FROM ops_error_logs ` + where + ` LIMIT 1)`
 		var exists bool
 		if err := r.db.QueryRowContext(ctx, q, args...).Scan(&exists); err != nil {
@@ -789,7 +790,7 @@ func maxTime(a, b time.Time) time.Time {
 }
 
 func (r *opsRepository) queryUsageCounts(ctx context.Context, filter *service.OpsDashboardFilter, start, end time.Time) (successCount int64, tokenConsumed int64, err error) {
-	join, where, args, _ := buildUsageWhere(filter, start, end, 1)
+	join, where, args, _ := buildUsageWhere(filter, start, end, 1, isSQLiteDB(r.db))
 
 	q := `
 SELECT
@@ -810,7 +811,10 @@ FROM usage_logs ul
 }
 
 func (r *opsRepository) queryUsageLatency(ctx context.Context, filter *service.OpsDashboardFilter, start, end time.Time) (duration service.OpsPercentiles, ttft service.OpsPercentiles, ttftSampleCount int64, err error) {
-	join, where, args, _ := buildUsageWhere(filter, start, end, 1)
+	join, where, args, _ := buildUsageWhere(filter, start, end, 1, isSQLiteDB(r.db))
+	if isSQLiteDB(r.db) {
+		return r.queryUsageLatencySQLite(ctx, join, where, args)
+	}
 	q := `
 SELECT
   percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_ms) FILTER (WHERE duration_ms IS NOT NULL) AS duration_p50,
@@ -867,6 +871,91 @@ FROM usage_logs ul
 	return duration, ttft, tCount, nil
 }
 
+func (r *opsRepository) queryUsageLatencySQLite(ctx context.Context, join, where string, args []any) (duration service.OpsPercentiles, ttft service.OpsPercentiles, ttftSampleCount int64, err error) {
+	q := `
+SELECT
+  AVG(duration_ms) AS duration_avg,
+  MAX(duration_ms) AS duration_max,
+  AVG(first_token_ms) AS ttft_avg,
+  MAX(first_token_ms) AS ttft_max,
+  COUNT(first_token_ms) AS ttft_sample_count
+FROM usage_logs ul
+` + join + `
+` + where
+
+	var dAvg sql.NullFloat64
+	var dMax sql.NullInt64
+	var tAvg sql.NullFloat64
+	var tMax sql.NullInt64
+	if err := r.db.QueryRowContext(ctx, q, args...).Scan(&dAvg, &dMax, &tAvg, &tMax, &ttftSampleCount); err != nil {
+		return service.OpsPercentiles{}, service.OpsPercentiles{}, 0, err
+	}
+
+	duration.Avg = floatToIntPtr(dAvg)
+	if dMax.Valid {
+		v := int(dMax.Int64)
+		duration.Max = &v
+	}
+	ttft.Avg = floatToIntPtr(tAvg)
+	if tMax.Valid {
+		v := int(tMax.Int64)
+		ttft.Max = &v
+	}
+
+	// Match PostgreSQL percentile_cont with linear interpolation between ranks.
+	var p50, p90, p95, p99 sql.NullFloat64
+	pq := `
+WITH ordered AS (
+  SELECT duration_ms,
+         ROW_NUMBER() OVER (ORDER BY duration_ms) AS rn,
+         COUNT(*) OVER () AS total
+  FROM usage_logs ul
+` + join + `
+` + where + `
+    AND duration_ms IS NOT NULL
+)
+SELECT
+  ` + opsSQLitePercentileExpr("duration_ms", 0.50) + `,
+  ` + opsSQLitePercentileExpr("duration_ms", 0.90) + `,
+  ` + opsSQLitePercentileExpr("duration_ms", 0.95) + `,
+  ` + opsSQLitePercentileExpr("duration_ms", 0.99) + `
+FROM ordered`
+	if err := r.db.QueryRowContext(ctx, pq, args...).Scan(&p50, &p90, &p95, &p99); err != nil {
+		return service.OpsPercentiles{}, service.OpsPercentiles{}, 0, err
+	}
+	duration.P50 = floatToIntPtr(p50)
+	duration.P90 = floatToIntPtr(p90)
+	duration.P95 = floatToIntPtr(p95)
+	duration.P99 = floatToIntPtr(p99)
+
+	var tp50, tp90, tp95, tp99 sql.NullFloat64
+	tq := `
+WITH ordered AS (
+  SELECT first_token_ms,
+         ROW_NUMBER() OVER (ORDER BY first_token_ms) AS rn,
+         COUNT(*) OVER () AS total
+  FROM usage_logs ul
+` + join + `
+` + where + `
+    AND first_token_ms IS NOT NULL
+)
+SELECT
+  ` + opsSQLitePercentileExpr("first_token_ms", 0.50) + `,
+  ` + opsSQLitePercentileExpr("first_token_ms", 0.90) + `,
+  ` + opsSQLitePercentileExpr("first_token_ms", 0.95) + `,
+  ` + opsSQLitePercentileExpr("first_token_ms", 0.99) + `
+FROM ordered`
+	if err := r.db.QueryRowContext(ctx, tq, args...).Scan(&tp50, &tp90, &tp95, &tp99); err != nil {
+		return service.OpsPercentiles{}, service.OpsPercentiles{}, 0, err
+	}
+	ttft.P50 = floatToIntPtr(tp50)
+	ttft.P90 = floatToIntPtr(tp90)
+	ttft.P95 = floatToIntPtr(tp95)
+	ttft.P99 = floatToIntPtr(tp99)
+
+	return duration, ttft, ttftSampleCount, nil
+}
+
 func (r *opsRepository) queryErrorCounts(ctx context.Context, filter *service.OpsDashboardFilter, start, end time.Time) (
 	errorTotal int64,
 	businessLimited int64,
@@ -876,7 +965,27 @@ func (r *opsRepository) queryErrorCounts(ctx context.Context, filter *service.Op
 	upstream529 int64,
 	err error,
 ) {
-	where, args, _ := buildErrorWhere(filter, start, end, 1)
+	where, args, _ := buildErrorWhere(filter, start, end, 1, isSQLiteDB(r.db))
+
+	if isSQLiteDB(r.db) {
+		q := `
+SELECT
+  COALESCE(SUM(CASE WHEN COALESCE(status_code, 0) >= 400 THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN COALESCE(status_code, 0) >= 400 AND is_business_limited THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN COALESCE(status_code, 0) >= 400 AND NOT is_business_limited THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN error_owner = 'provider' AND NOT is_business_limited AND COALESCE(upstream_status_code, status_code, 0) NOT IN (429, 529) THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN error_owner = 'provider' AND NOT is_business_limited AND COALESCE(upstream_status_code, status_code, 0) = 429 THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN error_owner = 'provider' AND NOT is_business_limited AND COALESCE(upstream_status_code, status_code, 0) = 529 THEN 1 ELSE 0 END), 0)
+FROM ops_error_logs
+` + where
+		if err := r.db.QueryRowContext(ctx, q, args...).Scan(
+			&errorTotal, &businessLimited, &errorCountSLA,
+			&upstreamExcl429529, &upstream429, &upstream529,
+		); err != nil {
+			return 0, 0, 0, 0, 0, 0, err
+		}
+		return errorTotal, businessLimited, errorCountSLA, upstreamExcl429529, upstream429, upstream529, nil
+	}
 
 	q := `
 SELECT
@@ -920,8 +1029,55 @@ func (r *opsRepository) queryCurrentRates(ctx context.Context, filter *service.O
 }
 
 func (r *opsRepository) queryPeakRates(ctx context.Context, filter *service.OpsDashboardFilter, start, end time.Time) (qpsPeak float64, tpsPeak float64, err error) {
-	usageJoin, usageWhere, usageArgs, next := buildUsageWhere(filter, start, end, 1)
-	errorWhere, errorArgs, _ := buildErrorWhere(filter, start, end, next)
+	usageJoin, usageWhere, usageArgs, next := buildUsageWhere(filter, start, end, 1, isSQLiteDB(r.db))
+	errorWhere, errorArgs, _ := buildErrorWhere(filter, start, end, next, isSQLiteDB(r.db))
+
+	if isSQLiteDB(r.db) {
+		q := `
+WITH usage_buckets AS (
+  SELECT
+    strftime('%Y-%m-%dT%H:%M:00Z', ul.created_at) AS bucket,
+    COUNT(*) AS req_cnt,
+    COALESCE(SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens), 0) AS token_cnt
+  FROM usage_logs ul
+  ` + usageJoin + `
+  ` + usageWhere + `
+  GROUP BY 1
+),
+error_buckets AS (
+  SELECT strftime('%Y-%m-%dT%H:%M:00Z', created_at) AS bucket, COUNT(*) AS err_cnt
+  FROM ops_error_logs
+  ` + errorWhere + `
+    AND COALESCE(status_code, 0) >= 400
+  GROUP BY 1
+),
+combined AS (
+  SELECT bucket, SUM(total_req) AS total_req, SUM(total_tokens) AS total_tokens
+  FROM (
+    SELECT bucket, req_cnt AS total_req, token_cnt AS total_tokens FROM usage_buckets
+    UNION ALL
+    SELECT bucket, err_cnt, 0 FROM error_buckets
+  ) t
+  GROUP BY bucket
+)
+SELECT
+  COALESCE(MAX(total_req), 0) AS max_req_per_min,
+  COALESCE(MAX(total_tokens), 0) AS max_tokens_per_min
+FROM combined`
+
+		args := append(usageArgs, errorArgs...)
+		var maxReqPerMinute, maxTokensPerMinute sql.NullInt64
+		if err := r.db.QueryRowContext(ctx, q, args...).Scan(&maxReqPerMinute, &maxTokensPerMinute); err != nil {
+			return 0, 0, err
+		}
+		if maxReqPerMinute.Valid && maxReqPerMinute.Int64 > 0 {
+			qpsPeak = roundTo1DP(float64(maxReqPerMinute.Int64) / 60.0)
+		}
+		if maxTokensPerMinute.Valid && maxTokensPerMinute.Int64 > 0 {
+			tpsPeak = roundTo1DP(float64(maxTokensPerMinute.Int64) / 60.0)
+		}
+		return qpsPeak, tpsPeak, nil
+	}
 
 	q := `
 WITH usage_buckets AS (
@@ -972,7 +1128,7 @@ func isQueryTimeoutErr(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded)
 }
 
-func buildUsageWhere(filter *service.OpsDashboardFilter, start, end time.Time, startIndex int) (join string, where string, args []any, nextIndex int) {
+func buildUsageWhere(filter *service.OpsDashboardFilter, start, end time.Time, startIndex int, sqlite ...bool) (join string, where string, args []any, nextIndex int) {
 	platform := ""
 	groupID := (*int64)(nil)
 	if filter != nil {
@@ -985,10 +1141,10 @@ func buildUsageWhere(filter *service.OpsDashboardFilter, start, end time.Time, s
 	args = make([]any, 0, 4)
 
 	args = append(args, start)
-	clauses = append(clauses, fmt.Sprintf("ul.created_at >= $%d", idx))
+	clauses = append(clauses, opsTimePredicate("ul.created_at", ">=", idx, sqlite...))
 	idx++
 	args = append(args, end)
-	clauses = append(clauses, fmt.Sprintf("ul.created_at < $%d", idx))
+	clauses = append(clauses, opsTimePredicate("ul.created_at", "<", idx, sqlite...))
 	idx++
 
 	if groupID != nil && *groupID > 0 {
@@ -1009,7 +1165,7 @@ func buildUsageWhere(filter *service.OpsDashboardFilter, start, end time.Time, s
 	return join, where, args, idx
 }
 
-func buildErrorWhere(filter *service.OpsDashboardFilter, start, end time.Time, startIndex int) (where string, args []any, nextIndex int) {
+func buildErrorWhere(filter *service.OpsDashboardFilter, start, end time.Time, startIndex int, sqlite ...bool) (where string, args []any, nextIndex int) {
 	platform := ""
 	groupID := (*int64)(nil)
 	if filter != nil {
@@ -1022,10 +1178,10 @@ func buildErrorWhere(filter *service.OpsDashboardFilter, start, end time.Time, s
 	args = make([]any, 0, 5)
 
 	args = append(args, start)
-	clauses = append(clauses, fmt.Sprintf("created_at >= $%d", idx))
+	clauses = append(clauses, opsTimePredicate("created_at", ">=", idx, sqlite...))
 	idx++
 	args = append(args, end)
-	clauses = append(clauses, fmt.Sprintf("created_at < $%d", idx))
+	clauses = append(clauses, opsTimePredicate("created_at", "<", idx, sqlite...))
 	idx++
 
 	clauses = append(clauses, "is_count_tokens = FALSE")

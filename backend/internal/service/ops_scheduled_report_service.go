@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"strconv"
@@ -11,7 +12,6 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
 	"github.com/robfig/cron/v3"
 )
 
@@ -21,32 +21,27 @@ const (
 	opsScheduledReportLeaderLockKeyDefault = "ops:scheduled_reports:leader"
 	opsScheduledReportLeaderLockTTLDefault = 5 * time.Minute
 
-	opsScheduledReportLastRunKeyPrefix = "ops:scheduled_reports:last_run:"
+	opsScheduledReportLastRunPluginKey = "ops-scheduled-reports"
+	opsScheduledReportLastRunNamespace = "last-run"
 
 	opsScheduledReportTickInterval = 1 * time.Minute
 )
 
 var opsScheduledReportCronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 
-var opsScheduledReportReleaseScript = redis.NewScript(`
-if redis.call("GET", KEYS[1]) == ARGV[1] then
-  return redis.call("DEL", KEYS[1])
-end
-return 0
-`)
-
 type OpsScheduledReportService struct {
 	opsService   *OpsService
 	userService  *UserService
 	emailService *EmailService
-	redisClient  *redis.Client
+	leaderLock   LeaderLockCache
+	db           *sql.DB
+	lastRunStore PluginKVStore
 	cfg          *config.Config
 
 	instanceID string
 	loc        *time.Location
 
 	distributedLockOn bool
-	warnNoRedisOnce   sync.Once
 
 	startOnce sync.Once
 	stopOnce  sync.Once
@@ -59,7 +54,9 @@ func NewOpsScheduledReportService(
 	opsService *OpsService,
 	userService *UserService,
 	emailService *EmailService,
-	redisClient *redis.Client,
+	leaderLock LeaderLockCache,
+	db *sql.DB,
+	lastRunStore PluginKVStore,
 	cfg *config.Config,
 ) *OpsScheduledReportService {
 	lockOn := cfg == nil || strings.TrimSpace(cfg.RunMode) != config.RunModeSimple
@@ -74,13 +71,14 @@ func NewOpsScheduledReportService(
 		opsService:   opsService,
 		userService:  userService,
 		emailService: emailService,
-		redisClient:  redisClient,
+		leaderLock:   leaderLock,
+		db:           db,
+		lastRunStore: lastRunStore,
 		cfg:          cfg,
 
 		instanceID:        uuid.NewString(),
 		loc:               loc,
 		distributedLockOn: lockOn,
-		warnNoRedisOnce:   sync.Once{},
 		startOnce:         sync.Once{},
 		stopOnce:          sync.Once{},
 		stopCtx:           nil,
@@ -789,12 +787,6 @@ func (s *OpsScheduledReportService) tryAcquireLeaderLock(ctx context.Context) (f
 	if s == nil || !s.distributedLockOn {
 		return nil, true
 	}
-	if s.redisClient == nil {
-		s.warnNoRedisOnce.Do(func() {
-			log.Printf("[OpsScheduledReport] redis not configured; running without distributed lock")
-		})
-		return nil, true
-	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -808,35 +800,27 @@ func (s *OpsScheduledReportService) tryAcquireLeaderLock(ctx context.Context) (f
 		ttl = 5 * time.Minute
 	}
 
-	ok, err := s.redisClient.SetNX(ctx, key, s.instanceID, ttl).Result()
-	if err != nil {
-		// Prefer fail-closed to avoid duplicate report sends when Redis is flaky.
-		log.Printf("[OpsScheduledReport] leader lock SetNX failed; skipping this cycle: %v", err)
-		return nil, false
-	}
+	release, ok := tryAcquireSingletonLeaderLock(ctx, s.leaderLock, s.db, key, s.instanceID, ttl)
 	if !ok {
 		return nil, false
 	}
-	return func() {
-		_, _ = opsScheduledReportReleaseScript.Run(ctx, s.redisClient, []string{key}, s.instanceID).Result()
-	}, true
+	return release, true
 }
 
 func (s *OpsScheduledReportService) getLastRunAt(ctx context.Context, reportType string) time.Time {
-	if s == nil || s.redisClient == nil {
+	if s == nil || s.lastRunStore == nil {
 		return time.Time{}
 	}
 	kind := strings.TrimSpace(reportType)
 	if kind == "" {
 		return time.Time{}
 	}
-	key := opsScheduledReportLastRunKeyPrefix + kind
 
-	raw, err := s.redisClient.Get(ctx, key).Result()
-	if err != nil || strings.TrimSpace(raw) == "" {
+	raw, ok, err := s.lastRunStore.Get(ctx, opsScheduledReportLastRunPluginKey, opsScheduledReportLastRunNamespace, kind)
+	if err != nil || !ok || len(raw) == 0 {
 		return time.Time{}
 	}
-	sec, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	sec, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
 	if err != nil || sec <= 0 {
 		return time.Time{}
 	}
@@ -851,7 +835,7 @@ func (s *OpsScheduledReportService) getLastRunAt(ctx context.Context, reportType
 }
 
 func (s *OpsScheduledReportService) setLastRunAt(ctx context.Context, reportType string, t time.Time) {
-	if s == nil || s.redisClient == nil {
+	if s == nil || s.lastRunStore == nil {
 		return
 	}
 	kind := strings.TrimSpace(reportType)
@@ -861,8 +845,7 @@ func (s *OpsScheduledReportService) setLastRunAt(ctx context.Context, reportType
 	if t.IsZero() {
 		t = time.Now().UTC()
 	}
-	key := opsScheduledReportLastRunKeyPrefix + kind
-	_ = s.redisClient.Set(ctx, key, strconv.FormatInt(t.UTC().Unix(), 10), 14*24*time.Hour).Err()
+	_ = s.lastRunStore.Set(ctx, opsScheduledReportLastRunPluginKey, opsScheduledReportLastRunNamespace, kind, []byte(strconv.FormatInt(t.UTC().Unix(), 10)), 14*24*time.Hour)
 }
 
 func (s *OpsScheduledReportService) recordHeartbeatSuccess(runAt time.Time, duration time.Duration, result string) {

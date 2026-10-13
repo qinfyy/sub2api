@@ -69,46 +69,51 @@ func RunCLI() error {
 	// Database configuration with validation
 	fmt.Println("── Database Configuration ──")
 
-	for {
-		cfg.Database.Host = promptString(reader, "PostgreSQL Host", "localhost")
-		if cliValidateHostname(cfg.Database.Host) {
-			break
+	cfg.Database.Type = promptBackendType(reader, "Database type", "postgres", "sqlite")
+	if cfg.Database.Type == "sqlite" {
+		cfg.Database.Path = promptString(reader, "SQLite file", "data/sub2api.db")
+	} else {
+		for {
+			cfg.Database.Host = promptString(reader, "PostgreSQL Host", "localhost")
+			if cliValidateHostname(cfg.Database.Host) {
+				break
+			}
+			fmt.Println("  Invalid hostname format. Use alphanumeric, dots, hyphens only.")
 		}
-		fmt.Println("  Invalid hostname format. Use alphanumeric, dots, hyphens only.")
-	}
 
-	for {
-		cfg.Database.Port = promptInt(reader, "PostgreSQL Port", 5432)
-		if cliValidatePort(cfg.Database.Port) {
-			break
+		for {
+			cfg.Database.Port = promptInt(reader, "PostgreSQL Port", 5432)
+			if cliValidatePort(cfg.Database.Port) {
+				break
+			}
+			fmt.Println("  Invalid port. Must be between 1 and 65535.")
 		}
-		fmt.Println("  Invalid port. Must be between 1 and 65535.")
-	}
 
-	for {
-		cfg.Database.User = promptString(reader, "PostgreSQL User", "postgres")
-		if cliValidateUsername(cfg.Database.User) {
-			break
+		for {
+			cfg.Database.User = promptString(reader, "PostgreSQL User", "postgres")
+			if cliValidateUsername(cfg.Database.User) {
+				break
+			}
+			fmt.Println("  Invalid username. Use alphanumeric and underscores only.")
 		}
-		fmt.Println("  Invalid username. Use alphanumeric and underscores only.")
-	}
 
-	cfg.Database.Password = promptPassword("PostgreSQL Password")
+		cfg.Database.Password = promptPassword("PostgreSQL Password")
 
-	for {
-		cfg.Database.DBName = promptString(reader, "Database Name", "sub2api")
-		if cliValidateDBName(cfg.Database.DBName) {
-			break
+		for {
+			cfg.Database.DBName = promptString(reader, "Database Name", "sub2api")
+			if cliValidateDBName(cfg.Database.DBName) {
+				break
+			}
+			fmt.Println("  Invalid database name. Start with letter, use alphanumeric and underscores.")
 		}
-		fmt.Println("  Invalid database name. Start with letter, use alphanumeric and underscores.")
-	}
 
-	for {
-		cfg.Database.SSLMode = promptString(reader, "SSL Mode", "disable")
-		if cliValidateSSLMode(cfg.Database.SSLMode) {
-			break
+		for {
+			cfg.Database.SSLMode = promptString(reader, "SSL Mode", "disable")
+			if cliValidateSSLMode(cfg.Database.SSLMode) {
+				break
+			}
+			fmt.Println("  Invalid SSL mode. Use: disable, require, verify-ca, or verify-full.")
 		}
-		fmt.Println("  Invalid SSL mode. Use: disable, require, verify-ca, or verify-full.")
 	}
 
 	fmt.Println()
@@ -123,33 +128,39 @@ func RunCLI() error {
 	fmt.Println()
 	fmt.Println("── Redis Configuration ──")
 
-	for {
-		cfg.Redis.Host = promptString(reader, "Redis Host", "localhost")
-		if cliValidateHostname(cfg.Redis.Host) {
-			break
+	cfg.Redis.Type = promptBackendType(reader, "Cache type", "redis", "memory")
+	if cfg.Redis.Type == "memory" {
+		cfg.Redis.Memory.MaxCapacityMB = 512
+		cfg.Redis.Memory.GCIntervalSeconds = 60
+	} else {
+		for {
+			cfg.Redis.Host = promptString(reader, "Redis Host", "localhost")
+			if cliValidateHostname(cfg.Redis.Host) {
+				break
+			}
+			fmt.Println("  Invalid hostname format. Use alphanumeric, dots, hyphens only.")
 		}
-		fmt.Println("  Invalid hostname format. Use alphanumeric, dots, hyphens only.")
-	}
 
-	for {
-		cfg.Redis.Port = promptInt(reader, "Redis Port", 6379)
-		if cliValidatePort(cfg.Redis.Port) {
-			break
+		for {
+			cfg.Redis.Port = promptInt(reader, "Redis Port", 6379)
+			if cliValidatePort(cfg.Redis.Port) {
+				break
+			}
+			fmt.Println("  Invalid port. Must be between 1 and 65535.")
 		}
-		fmt.Println("  Invalid port. Must be between 1 and 65535.")
-	}
 
-	cfg.Redis.Password = promptPassword("Redis Password (optional)")
+		cfg.Redis.Password = promptPassword("Redis Password (optional)")
 
-	for {
-		cfg.Redis.DB = promptInt(reader, "Redis DB", 0)
-		if cfg.Redis.DB >= 0 && cfg.Redis.DB <= 15 {
-			break
+		for {
+			cfg.Redis.DB = promptInt(reader, "Redis DB", 0)
+			if cfg.Redis.DB >= 0 && cfg.Redis.DB <= 15 {
+				break
+			}
+			fmt.Println("  Invalid Redis DB. Must be between 0 and 15.")
 		}
-		fmt.Println("  Invalid Redis DB. Must be between 0 and 15.")
-	}
 
-	cfg.Redis.EnableTLS = promptConfirm(reader, "Enable Redis TLS?")
+		cfg.Redis.EnableTLS = promptConfirm(reader, "Enable Redis TLS?")
+	}
 
 	fmt.Println()
 	fmt.Print("Testing Redis connection... ")
@@ -205,9 +216,17 @@ func RunCLI() error {
 	// Confirm and install
 	fmt.Println()
 	fmt.Println("── Configuration Summary ──")
-	fmt.Printf("Database: %s@%s:%d/%s\n", cfg.Database.User, cfg.Database.Host, cfg.Database.Port, cfg.Database.DBName)
-	fmt.Printf("Redis: %s:%d\n", cfg.Redis.Host, cfg.Redis.Port)
-	fmt.Printf("Redis TLS: %s\n", map[bool]string{true: "enabled", false: "disabled"}[cfg.Redis.EnableTLS])
+	if cfg.Database.Type == "sqlite" {
+		fmt.Printf("SQLite: %s\n", cfg.Database.Path)
+	} else {
+		fmt.Printf("Database: %s@%s:%d/%s\n", cfg.Database.User, cfg.Database.Host, cfg.Database.Port, cfg.Database.DBName)
+	}
+	if cfg.Redis.Type == "memory" {
+		fmt.Println("Cache: memory (single instance)")
+	} else {
+		fmt.Printf("Redis: %s:%d\n", cfg.Redis.Host, cfg.Redis.Port)
+		fmt.Printf("Redis TLS: %s\n", map[bool]string{true: "enabled", false: "disabled"}[cfg.Redis.EnableTLS])
+	}
 	fmt.Printf("Admin: %s\n", cfg.Admin.Email)
 	fmt.Printf("Server: :%d\n", cfg.Server.Port)
 	fmt.Println()
@@ -237,6 +256,16 @@ func RunCLI() error {
 	fmt.Println()
 
 	return nil
+}
+
+func promptBackendType(reader *bufio.Reader, label, legacy, alternative string) string {
+	for {
+		value := strings.ToLower(promptString(reader, label+" ("+legacy+"/"+alternative+")", legacy))
+		if value == legacy || value == alternative {
+			return value
+		}
+		fmt.Printf("  Choose %s or %s.\n", legacy, alternative)
+	}
 }
 
 func promptString(reader *bufio.Reader, prompt, defaultVal string) string {

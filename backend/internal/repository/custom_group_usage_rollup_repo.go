@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/dbtime"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/usagestats"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
@@ -34,9 +35,9 @@ func (r *usageLogRepository) readGroupUsageRollupSnapshot(ctx context.Context, t
 
 	var rowCount int
 	var closedBefore sql.NullString
-	var retainedFrom sql.NullTime
+	var retainedFrom dbtime.NullTime
 	var stateTimezone sql.NullString
-	if err := scanSingleRow(ctx, r.sql, `
+	query := `
 		SELECT
 			COUNT(*),
 			MAX(closed_before)::text,
@@ -44,7 +45,11 @@ func (r *usageLogRepository) readGroupUsageRollupSnapshot(ctx context.Context, t
 			MAX(timezone_name)
 		FROM usage_group_rollup_state
 		WHERE id = 1
-	`, nil, &rowCount, &closedBefore, &retainedFrom, &stateTimezone); err != nil {
+	`
+	if isSQLiteDB(r.db) {
+		query = `SELECT COUNT(*),MAX(closed_before),MAX(retained_from),MAX(timezone_name) FROM usage_group_rollup_state WHERE id=1`
+	}
+	if err := scanSingleRow(ctx, r.sql, query, nil, &rowCount, &closedBefore, &retainedFrom, &stateTimezone); err != nil {
 		return groupUsageRollupSnapshot{}, fmt.Errorf("读取分组用量汇总水位: %w", err)
 	}
 	if rowCount != 1 || !closedBefore.Valid || !retainedFrom.Valid ||
@@ -89,7 +94,7 @@ func (r *usageLogRepository) getAllGroupUsageSummaryFromRollups(ctx context.Cont
 	// 换成参数之后走 idx_usage_logs_created_at：
 	//   Index Scan … Index Cond: (created_at >= $7)
 	//   Execution Time: 34 ms
-	const query = `
+	query := `
 		WITH historical AS (
 			SELECT
 				rollup.group_id,
@@ -126,6 +131,22 @@ func (r *usageLogRepository) getAllGroupUsageSummaryFromRollups(ctx context.Cont
 		LEFT JOIN tail ON tail.group_id = g.id
 		ORDER BY g.id
 	`
+	if isSQLiteDB(r.db) {
+		query = `WITH historical AS (
+			SELECT group_id,COALESCE(SUM(actual_cost),0) actual_cost,
+			COALESCE(SUM(actual_cost) FILTER(WHERE bucket_date=$3),0) yesterday_cost
+			FROM usage_group_daily_rollups WHERE $4 AND bucket_date>=$5 AND bucket_date<$6 GROUP BY group_id
+		),tail AS (
+			SELECT group_id,COALESCE(SUM(actual_cost),0) actual_cost,
+			COALESCE(SUM(actual_cost) FILTER(WHERE pg_rfc3339_micros(created_at)>=pg_rfc3339_micros($1)),0) today_cost,
+			COALESCE(SUM(actual_cost) FILTER(WHERE pg_rfc3339_micros(created_at)>=pg_rfc3339_micros($2)
+			AND pg_rfc3339_micros(created_at)<pg_rfc3339_micros($1)),0) yesterday_cost
+			FROM usage_logs WHERE pg_rfc3339_micros(created_at)>=pg_rfc3339_micros($7) GROUP BY group_id
+		)
+		SELECT g.id,COALESCE(h.actual_cost,0)+COALESCE(t.actual_cost,0),COALESCE(t.today_cost,0),
+		COALESCE(h.yesterday_cost,0)+COALESCE(t.yesterday_cost,0)
+		FROM groups g LEFT JOIN historical h ON h.group_id=g.id LEFT JOIN tail t ON t.group_id=g.id ORDER BY g.id`
+	}
 
 	rows, err := r.sql.QueryContext(
 		ctx,
@@ -282,7 +303,20 @@ func (r *dashboardAggregationRepository) syncGroupUsageRollupsInTx(ctx context.C
 	return nil
 }
 
-func lockGroupUsageRollupState(ctx context.Context, tx *sql.Tx) error {
+func lockGroupUsageRollupState(ctx context.Context, tx *sql.Tx, sqlite bool) error {
+	if sqlite {
+		// Acquire the writer before reading the watermark, also across connections.
+		if _, err := tx.ExecContext(ctx, `UPDATE usage_group_rollup_state SET id=id WHERE id=1`); err != nil {
+			return err
+		}
+		var id int16
+		if err := tx.QueryRowContext(ctx, `
+			SELECT id FROM usage_group_rollup_state WHERE id = 1
+		`).Scan(&id); err != nil {
+			return fmt.Errorf("锁定分组用量汇总水位: %w", err)
+		}
+		return nil
+	}
 	var id int16
 	if err := tx.QueryRowContext(ctx, `
 		SELECT id
@@ -295,8 +329,23 @@ func lockGroupUsageRollupState(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-func invalidateGroupUsageRollupsAt(ctx context.Context, tx *sql.Tx, affectedAt time.Time) error {
+func invalidateGroupUsageRollupsAt(ctx context.Context, tx *sql.Tx, sqlite bool, affectedAt time.Time) error {
 	timezoneName := service.GroupUsageTimezoneName()
+	if sqlite {
+		// SQLite 没有 AT TIME ZONE；在 Go 侧换算到目标时区后再取日期。
+		loc, err := time.LoadLocation(timezoneName)
+		if err != nil {
+			return err
+		}
+		affectedDate := affectedAt.In(loc).Format("2006-01-02")
+		_, err = tx.ExecContext(ctx, `
+			UPDATE usage_group_rollup_state
+			SET closed_before = MIN(closed_before, ?),
+				updated_at = ?
+			WHERE id = 1
+		`, affectedDate, nowSQLiteUTC())
+		return err
+	}
 	_, err := tx.ExecContext(ctx, `
 		UPDATE usage_group_rollup_state
 		SET closed_before = LEAST(

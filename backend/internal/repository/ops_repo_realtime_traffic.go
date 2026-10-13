@@ -34,8 +34,78 @@ func (r *opsRepository) GetRealtimeTrafficSummary(ctx context.Context, filter *s
 		return nil, fmt.Errorf("window too large")
 	}
 
-	usageJoin, usageWhere, usageArgs, next := buildUsageWhere(filter, start, end, 1)
-	errorWhere, errorArgs, _ := buildErrorWhere(filter, start, end, next)
+	usageJoin, usageWhere, usageArgs, next := buildUsageWhere(filter, start, end, 1, isSQLiteDB(r.db))
+	errorWhere, errorArgs, _ := buildErrorWhere(filter, start, end, next, isSQLiteDB(r.db))
+
+	if isSQLiteDB(r.db) {
+		q := `
+WITH usage_buckets AS (
+  SELECT
+    strftime('%Y-%m-%dT%H:%M:00Z', ul.created_at) AS bucket,
+    COUNT(*) AS success_count,
+    COALESCE(SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens), 0) AS token_sum
+  FROM usage_logs ul
+  ` + usageJoin + `
+  ` + usageWhere + `
+  GROUP BY 1
+),
+error_buckets AS (
+  SELECT
+    strftime('%Y-%m-%dT%H:%M:00Z', created_at) AS bucket,
+    COUNT(*) AS error_count
+  FROM ops_error_logs
+  ` + errorWhere + `
+    AND COALESCE(status_code, 0) >= 400
+  GROUP BY 1
+),
+combined AS (
+  SELECT bucket, SUM(success_count) AS success_count, SUM(token_sum) AS token_sum, SUM(error_count) AS error_count
+  FROM (
+    SELECT bucket, success_count, token_sum, 0 AS error_count FROM usage_buckets
+    UNION ALL
+    SELECT bucket, 0, 0, error_count FROM error_buckets
+  ) t
+  GROUP BY bucket
+)
+SELECT
+  COALESCE(SUM(success_count), 0),
+  COALESCE(SUM(error_count), 0),
+  COALESCE(SUM(token_sum), 0),
+  COALESCE(MAX(success_count + error_count), 0),
+  COALESCE(MAX(token_sum), 0)
+FROM combined`
+		args := append(usageArgs, errorArgs...)
+		var successCount, errorTotal, tokenConsumed, peakRequestsPerMin, peakTokensPerMin int64
+		if err := r.db.QueryRowContext(ctx, q, args...).Scan(
+			&successCount, &errorTotal, &tokenConsumed, &peakRequestsPerMin, &peakTokensPerMin,
+		); err != nil {
+			return nil, err
+		}
+		windowSeconds := window.Seconds()
+		if windowSeconds <= 0 {
+			windowSeconds = 1
+		}
+		qpsCurrent, tpsCurrent, err := r.queryCurrentRates(ctx, filter, end)
+		if err != nil {
+			return nil, err
+		}
+		return &service.OpsRealtimeTrafficSummary{
+			StartTime: start,
+			EndTime:   end,
+			Platform:  strings.TrimSpace(filter.Platform),
+			GroupID:   filter.GroupID,
+			QPS: service.OpsRateSummary{
+				Current: qpsCurrent,
+				Peak:    roundTo1DP(float64(peakRequestsPerMin) / 60.0),
+				Avg:     roundTo1DP(float64(successCount+errorTotal) / windowSeconds),
+			},
+			TPS: service.OpsRateSummary{
+				Current: tpsCurrent,
+				Peak:    roundTo1DP(float64(peakTokensPerMin) / 60.0),
+				Avg:     roundTo1DP(float64(tokenConsumed) / windowSeconds),
+			},
+		}, nil
+	}
 
 	q := `
 WITH usage_buckets AS (

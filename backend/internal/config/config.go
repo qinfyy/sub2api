@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -1613,6 +1614,11 @@ func (d *DatabaseConfig) SQLiteDSN() string {
 	q.Add("_pragma", "busy_timeout(10000)")
 	q.Add("_pragma", "journal_mode(WAL)")
 	q.Add("_pragma", "foreign_keys(1)")
+	q.Add("_pragma", "synchronous(FULL)")
+	// modernc 默认写入 Go 的 time.Time.String() 形式（"... +0000 UTC"），
+	// SQLite 的 julianday()/datetime() 无法解析。改用 SQLite 可解析的
+	// "YYYY-MM-DD HH:MM:SS[.fff][+-]HH:MM" 文本，时间窗口比较才会生效。
+	q.Set("_time_format", "sqlite")
 	q.Set("_txlock", "immediate")
 	u.RawQuery = q.Encode()
 	return u.String()
@@ -1709,11 +1715,13 @@ const (
 // MemoryCacheConfig bounds the in-process cache so a long-running gateway
 // cannot grow without limit.
 type MemoryCacheConfig struct {
-	PersistencePath string `mapstructure:"persistence_path" yaml:"persistence_path"`
+	// Deprecated: retained only to detect old PG+memory sidecar databases.
+	// Durable state now belongs to the selected primary database.
+	PersistencePath string `json:"persistence_path" mapstructure:"persistence_path" yaml:"persistence_path"`
 	// MaxCapacityMB is the estimated memory budget for cached values.
-	MaxCapacityMB int `mapstructure:"max_capacity_mb" yaml:"max_capacity_mb"`
+	MaxCapacityMB int `json:"max_capacity_mb" mapstructure:"max_capacity_mb" yaml:"max_capacity_mb"`
 	// GCIntervalSeconds controls how often expired entries are purged.
-	GCIntervalSeconds int `mapstructure:"gc_interval_seconds" yaml:"gc_interval_seconds"`
+	GCIntervalSeconds int `json:"gc_interval_seconds" mapstructure:"gc_interval_seconds" yaml:"gc_interval_seconds"`
 }
 
 // ResolvePersistencePath uses the same base directory as the main SQLite file.
@@ -2192,10 +2200,14 @@ func configureConfigSource(setConfigFile, addConfigPath func(string)) {
 	if dataDir := strings.TrimSpace(os.Getenv("DATA_DIR")); dataDir != "" {
 		addConfigPath(dataDir)
 	}
-	addConfigPath("/app/data")
+	if runtime.GOOS != "windows" {
+		addConfigPath("/app/data")
+	}
 	addConfigPath(".")
 	addConfigPath("./config")
-	addConfigPath("/etc/sub2api")
+	if runtime.GOOS != "windows" {
+		addConfigPath("/etc/sub2api")
+	}
 }
 
 func setDefaults() {
@@ -2387,7 +2399,7 @@ func applyDefaults(v *viper.Viper) {
 	v.SetDefault("database.user", "postgres")
 	v.SetDefault("database.password", "postgres")
 	v.SetDefault("database.dbname", "sub2api")
-	v.SetDefault("database.sslmode", "prefer")
+	v.SetDefault("database.sslmode", "require")
 	v.SetDefault("database.path", "data/sub2api.db")
 	v.SetDefault("database.max_open_conns", 256)
 	v.SetDefault("database.max_idle_conns", 128)
@@ -3310,6 +3322,11 @@ func (c *Config) Validate() error {
 	}
 	switch c.Database.Type {
 	case DatabaseTypePostgres:
+		switch c.Database.SSLMode {
+		case "disable", "require", "verify-ca", "verify-full":
+		default:
+			return fmt.Errorf("database.sslmode %q is unsupported; use require, verify-ca, verify-full, or explicitly disable TLS", c.Database.SSLMode)
+		}
 	case DatabaseTypeSQLite:
 		if strings.TrimSpace(c.Database.Path) == "" {
 			return fmt.Errorf("database.path must not be empty when database.type is sqlite")

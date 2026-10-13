@@ -138,6 +138,7 @@ func TestComputeRuleMetric_AccountTempUnscheduledCount(t *testing.T) {
 	svc := &OpsAlertEvaluatorService{
 		opsService: opsService,
 		opsRepo:    &stubOpsRepo{},
+		leaderLock: &fakeLeaderLockCache{},
 	}
 
 	rule := &OpsAlertRule{MetricType: "account_temp_unscheduled_count"}
@@ -178,6 +179,7 @@ func TestComputeRuleMetricNewIndicators(t *testing.T) {
 	svc := &OpsAlertEvaluatorService{
 		opsService: opsService,
 		opsRepo:    &stubOpsRepo{overview: &OpsDashboardOverview{}},
+		leaderLock: &fakeLeaderLockCache{},
 	}
 
 	start := time.Now().UTC().Add(-5 * time.Minute)

@@ -863,6 +863,26 @@ var (
 			},
 		},
 	}
+	// KvStoreColumns holds the columns for the "kv_store" table.
+	KvStoreColumns = []*schema.Column{
+		{Name: "key", Type: field.TypeString, SchemaType: map[string]string{"postgres": "text"}},
+		{Name: "value", Type: field.TypeBytes, SchemaType: map[string]string{"postgres": "bytea", "sqlite3": "blob"}},
+		{Name: "expires_at", Type: field.TypeInt64, Nullable: true},
+		{Name: "updated_at", Type: field.TypeString},
+	}
+	// KvStoreTable holds the schema information for the "kv_store" table.
+	KvStoreTable = &schema.Table{
+		Name:       "kv_store",
+		Columns:    KvStoreColumns,
+		PrimaryKey: []*schema.Column{KvStoreColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "idx_kv_store_expires_at",
+				Unique:  false,
+				Columns: []*schema.Column{KvStoreColumns[2]},
+			},
+		},
+	}
 	// ErrorPassthroughRulesColumns holds the columns for the "error_passthrough_rules" table.
 	ErrorPassthroughRulesColumns = []*schema.Column{
 		{Name: "id", Type: field.TypeInt64, Increment: true},
@@ -1094,6 +1114,27 @@ var (
 				Name:    "identityadoptiondecision_identity_id",
 				Unique:  false,
 				Columns: []*schema.Column{IdentityAdoptionDecisionsColumns[6]},
+			},
+		},
+	}
+	// MemoryBatchQueueColumns holds the columns for the "memory_batch_queue" table.
+	MemoryBatchQueueColumns = []*schema.Column{
+		{Name: "batch_id", Type: field.TypeString, SchemaType: map[string]string{"postgres": "text"}},
+		{Name: "state", Type: field.TypeEnum, Enums: []string{"ready", "delayed", "active"}, SchemaType: map[string]string{"postgres": "text"}},
+		{Name: "available_at", Type: field.TypeInt64},
+		{Name: "heartbeat_at", Type: field.TypeInt64, Default: 0},
+		{Name: "receipt", Type: field.TypeString, Default: "", SchemaType: map[string]string{"postgres": "text"}},
+	}
+	// MemoryBatchQueueTable holds the schema information for the "memory_batch_queue" table.
+	MemoryBatchQueueTable = &schema.Table{
+		Name:       "memory_batch_queue",
+		Columns:    MemoryBatchQueueColumns,
+		PrimaryKey: []*schema.Column{MemoryBatchQueueColumns[0]},
+		Indexes: []*schema.Index{
+			{
+				Name:    "idx_memory_batch_queue_ready",
+				Unique:  false,
+				Columns: []*schema.Column{MemoryBatchQueueColumns[1], MemoryBatchQueueColumns[2]},
 			},
 		},
 	}
@@ -2104,10 +2145,12 @@ var (
 		ChannelMonitorHistoriesTable,
 		ChannelMonitorRequestTemplatesTable,
 		CompositeModelRoutesTable,
+		KvStoreTable,
 		ErrorPassthroughRulesTable,
 		GroupsTable,
 		IdempotencyRecordsTable,
 		IdentityAdoptionDecisionsTable,
+		MemoryBatchQueueTable,
 		PaymentAuditLogsTable,
 		PaymentOrdersTable,
 		PaymentProviderInstancesTable,
@@ -2191,6 +2234,9 @@ func init() {
 	CompositeModelRoutesTable.Annotation = &entsql.Annotation{
 		Table: "composite_model_routes",
 	}
+	KvStoreTable.Annotation = &entsql.Annotation{
+		Table: "kv_store",
+	}
 	ErrorPassthroughRulesTable.Annotation = &entsql.Annotation{
 		Table: "error_passthrough_rules",
 	}
@@ -2204,6 +2250,9 @@ func init() {
 	IdentityAdoptionDecisionsTable.ForeignKeys[1].RefTable = PendingAuthSessionsTable
 	IdentityAdoptionDecisionsTable.Annotation = &entsql.Annotation{
 		Table: "identity_adoption_decisions",
+	}
+	MemoryBatchQueueTable.Annotation = &entsql.Annotation{
+		Table: "memory_batch_queue",
 	}
 	PaymentAuditLogsTable.Annotation = &entsql.Annotation{
 		Table: "payment_audit_logs",

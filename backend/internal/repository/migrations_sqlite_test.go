@@ -2,7 +2,9 @@ package repository
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"testing/fstest"
@@ -16,6 +18,7 @@ import (
 // API need a real file path.
 func newSQLiteTestDB(t *testing.T) *sql.DB {
 	t.Helper()
+	require.NoError(t, registerSQLiteDomainFunctions())
 
 	dsn := "file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "migrate.db")) +
 		"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
@@ -139,7 +142,7 @@ func TestApplySQLiteMigrationsFSRunsEmbeddedMigrations(t *testing.T) {
 	require.Equal(t, 1, count)
 
 	// Running again must be a no-op.
-	require.NoError(t, applySQLiteMigrationsFS(context.Background(), db))
+	require.NoError(t, applySQLiteV1Schema(context.Background(), db))
 }
 
 func TestApplyMigrationsFSDispatchesSQLiteWithoutPostgresAdvisoryLock(t *testing.T) {
@@ -171,4 +174,21 @@ func TestValidateSQLiteMigrationExecutionMode(t *testing.T) {
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "CONCURRENTLY")
 	})
+}
+
+func TestSQLiteMigrationLineEndingsPreserveLedger(t *testing.T) {
+	db := newSQLiteTestDB(t)
+	ctx := context.Background()
+	const name = "007_non_ent_extended_tables.sql"
+	const content = "CREATE TABLE preserved(id INTEGER PRIMARY KEY);\nINSERT INTO preserved VALUES (1);"
+	require.NoError(t, applySQLiteMigrationFiles(ctx, db, []sqliteMigrationFile{{name, content}}))
+	crlf := "CREATE TABLE preserved(id INTEGER PRIMARY KEY);\r\nINSERT INTO preserved VALUES (1);"
+	legacy := fmt.Sprintf("%x", sha256.Sum256([]byte(crlf)))
+	_, err := db.Exec("UPDATE ent_schema_versions SET checksum = ? WHERE filename = ?", legacy, name)
+	require.NoError(t, err)
+	require.NoError(t, applySQLiteMigrationFiles(ctx, db, []sqliteMigrationFile{{name, content}}))
+	var recorded string
+	require.NoError(t, db.QueryRow("SELECT checksum FROM ent_schema_versions WHERE filename = ?", name).Scan(&recorded))
+	require.Equal(t, legacy, recorded)
+	require.ErrorContains(t, applySQLiteMigrationFiles(ctx, db, []sqliteMigrationFile{{name, content + "\nSELECT 2;"}}), "checksum mismatch")
 }

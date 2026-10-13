@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -74,6 +75,7 @@ func jwtAuth(
 			if errors.Is(err, service.ErrUserNotFound) {
 				AbortWithError(c, 401, "USER_NOT_FOUND", "User not found")
 			} else {
+				slog.Error("jwt auth: failed to load user", "user_id", claims.UserID, "error", err)
 				AbortWithError(c, 500, "INTERNAL_ERROR", "Failed to load user")
 			}
 			return

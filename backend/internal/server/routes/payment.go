@@ -68,9 +68,12 @@ func RegisterPaymentRoutes(
 	// The anonymous verify endpoint is IP rate-limited to prevent out_trade_no
 	// enumeration. It fails open on Redis errors so an outage never blocks a
 	// user who is mid-payment from seeing their result.
-	publicRateLimiter := ratelimit.NewRateLimiter(redisClient)
-	if len(limiters) > 0 && limiters[0] != nil {
+	var publicRateLimiter *ratelimit.RateLimiter
+	if len(limiters) > 0 {
 		publicRateLimiter = limiters[0]
+	}
+	if publicRateLimiter == nil {
+		publicRateLimiter = ratelimit.NewRateLimiter(redisClient)
 	}
 	public := v1.Group("/payment/public")
 	{

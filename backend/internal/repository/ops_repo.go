@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/dbtime"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/lib/pq"
 )
@@ -222,10 +223,17 @@ func (r *opsRepository) ListErrorLogs(ctx context.Context, filter *service.OpsEr
 	}
 
 	where, args := buildOpsErrorLogsWhere(filter)
+	if isSQLiteDB(r.db) {
+		where = sqliteOpsWhere(where)
+	}
 	countSQL := "SELECT COUNT(*) FROM ops_error_logs e " + where
+	countSQL, countArgs, err := sqliteOpsBind(r.db, countSQL, args)
+	if err != nil {
+		return nil, err
+	}
 
 	var total int
-	if err := r.db.QueryRowContext(ctx, countSQL, args...).Scan(&total); err != nil {
+	if err := r.db.QueryRowContext(ctx, countSQL, countArgs...).Scan(&total); err != nil {
 		return nil, err
 	}
 
@@ -278,6 +286,13 @@ LEFT JOIN api_keys ak ON ak.id = e.api_key_id
 ORDER BY ` + opsErrorLogsOrderBy(filter) + `
 LIMIT $` + itoa(len(args)+1) + ` OFFSET $` + itoa(len(args)+2)
 
+	if isSQLiteDB(r.db) {
+		selectSQL = strings.ReplaceAll(selectSQL, "host(e.client_ip)", "e.client_ip")
+	}
+	selectSQL, argsWithLimit, err = sqliteOpsBind(r.db, selectSQL, argsWithLimit)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := r.db.QueryContext(ctx, selectSQL, argsWithLimit...)
 	if err != nil {
 		return nil, err
@@ -296,15 +311,15 @@ LIMIT $` + itoa(len(args)+1) + ` OFFSET $` + itoa(len(args)+2)
 		var groupID sql.NullInt64
 		var groupName string
 		var userEmail string
-		var resolvedAt sql.NullTime
+		var resolvedAt dbtime.NullTime
 		var resolvedBy sql.NullInt64
 		var resolvedByName string
 		var requestType sql.NullInt64
 		var apiKeyName string
-		var apiKeyDeletedAt sql.NullTime
+		var apiKeyDeletedAt dbtime.NullTime
 		if err := rows.Scan(
 			&item.ID,
-			&item.CreatedAt,
+			dbtime.Dest(&item.CreatedAt),
 			&item.Phase,
 			&item.Type,
 			&item.Owner,
@@ -424,7 +439,7 @@ SELECT
   e.upstream_status_code,
   COALESCE(e.upstream_error_message, ''),
   COALESCE(e.upstream_error_detail, ''),
-  COALESCE(e.upstream_errors::text, ''),
+  COALESCE(CAST(e.upstream_errors AS TEXT), ''),
   e.is_business_limited,
   e.user_id,
   COALESCE(u.email, ''),
@@ -459,9 +474,12 @@ WHERE e.id = $1
 LIMIT 1`
 
 	var out service.OpsErrorLogDetail
+	if isSQLiteDB(r.db) {
+		q = strings.ReplaceAll(q, "host(e.client_ip)", "e.client_ip")
+	}
 	var statusCode sql.NullInt64
 	var upstreamStatusCode sql.NullInt64
-	var resolvedAt sql.NullTime
+	var resolvedAt dbtime.NullTime
 	var resolvedBy sql.NullInt64
 	var clientIP sql.NullString
 	var userID sql.NullInt64
@@ -475,11 +493,11 @@ LIMIT 1`
 	var ttft sql.NullInt64
 	var requestType sql.NullInt64
 	var detailAPIKeyName string
-	var detailAPIKeyDeletedAt sql.NullTime
+	var detailAPIKeyDeletedAt dbtime.NullTime
 
 	err := r.db.QueryRowContext(ctx, q, id).Scan(
 		&out.ID,
-		&out.CreatedAt,
+		dbtime.Dest(&out.CreatedAt),
 		&out.Phase,
 		&out.Type,
 		&out.Owner,
@@ -641,6 +659,10 @@ func (r *opsRepository) BatchInsertSystemLogs(ctx context.Context, inputs []*ser
 		return 0, nil
 	}
 
+	if isSQLiteDB(r.db) {
+		return r.batchInsertSystemLogsSQLite(ctx, inputs)
+	}
+
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -726,6 +748,76 @@ func (r *opsRepository) BatchInsertSystemLogs(ctx context.Context, inputs []*ser
 	return inserted, nil
 }
 
+func (r *opsRepository) batchInsertSystemLogsSQLite(ctx context.Context, inputs []*service.OpsInsertSystemLogInput) (int64, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	stmt, err := tx.PrepareContext(ctx, `
+INSERT INTO ops_system_logs (
+  created_at, host, level, component, message, request_id, client_request_id,
+  user_id, api_key_id, account_id, platform, model, extra
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = stmt.Close() }()
+
+	var inserted int64
+	for _, input := range inputs {
+		if input == nil {
+			continue
+		}
+		createdAt := input.CreatedAt
+		if createdAt.IsZero() {
+			createdAt = time.Now().UTC()
+		}
+		component := strings.TrimSpace(input.Component)
+		level := strings.ToLower(strings.TrimSpace(input.Level))
+		message := strings.TrimSpace(input.Message)
+		if level == "" || message == "" {
+			continue
+		}
+		if component == "" {
+			component = "app"
+		}
+		extra := strings.TrimSpace(input.ExtraJSON)
+		if extra == "" {
+			extra = "{}"
+		}
+		if _, err = stmt.ExecContext(
+			ctx,
+			createdAt.UTC(),
+			opsNullString(input.Host),
+			level,
+			component,
+			message,
+			opsNullString(input.RequestID),
+			opsNullString(input.ClientRequestID),
+			opsNullInt64(input.UserID),
+			opsNullInt64(input.APIKeyID),
+			opsNullInt64(input.AccountID),
+			opsNullString(input.Platform),
+			opsNullString(input.Model),
+			extra,
+		); err != nil {
+			return inserted, err
+		}
+		inserted++
+	}
+
+	if err = tx.Commit(); err != nil {
+		return inserted, err
+	}
+	return inserted, nil
+}
+
 func (r *opsRepository) ListSystemLogs(ctx context.Context, filter *service.OpsSystemLogFilter) (*service.OpsSystemLogList, error) {
 	if r == nil || r.db == nil {
 		return nil, fmt.Errorf("nil ops repository")
@@ -747,9 +839,16 @@ func (r *opsRepository) ListSystemLogs(ctx context.Context, filter *service.OpsS
 	}
 
 	where, args, _ := buildOpsSystemLogsWhere(filter)
+	if isSQLiteDB(r.db) {
+		where = sqliteOpsWhere(where)
+	}
 	countSQL := "SELECT COUNT(*) FROM ops_system_logs l " + where
+	countSQL, countArgs, err := sqliteOpsBind(r.db, countSQL, args)
+	if err != nil {
+		return nil, err
+	}
 	var total int
-	if err := r.db.QueryRowContext(ctx, countSQL, args...).Scan(&total); err != nil {
+	if err := r.db.QueryRowContext(ctx, countSQL, countArgs...).Scan(&total); err != nil {
 		return nil, err
 	}
 
@@ -770,12 +869,19 @@ SELECT
   l.account_id,
   COALESCE(l.platform, ''),
   COALESCE(l.model, ''),
-  COALESCE(l.extra::text, '{}')
+  COALESCE(l.extra, '{}')
 FROM ops_system_logs l
 ` + where + `
 ORDER BY l.created_at DESC, l.id DESC
 LIMIT $` + itoa(len(args)+1) + ` OFFSET $` + itoa(len(args)+2)
 
+	if isSQLiteDB(r.db) {
+		query = strings.ReplaceAll(query, "l.extra::text", "l.extra")
+	}
+	query, argsWithLimit, err = sqliteOpsBind(r.db, query, argsWithLimit)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := r.db.QueryContext(ctx, query, argsWithLimit...)
 	if err != nil {
 		return nil, err
@@ -791,7 +897,7 @@ LIMIT $` + itoa(len(args)+1) + ` OFFSET $` + itoa(len(args)+2)
 		var extraRaw string
 		if err := rows.Scan(
 			&item.ID,
-			&item.CreatedAt,
+			dbtime.Dest(&item.CreatedAt),
 			&item.Host,
 			&item.Level,
 			&item.Component,
@@ -854,6 +960,9 @@ func (r *opsRepository) DeleteSystemLogs(ctx context.Context, filter *service.Op
 	}
 
 	query := "DELETE FROM ops_system_logs l " + where
+	if isSQLiteDB(r.db) {
+		query = "DELETE FROM ops_system_logs AS l " + where
+	}
 	res, err := r.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, err
@@ -884,6 +993,61 @@ INSERT INTO ops_system_log_cleanup_audits (
 }
 
 var likePatternReplacer = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+
+// sqliteOpsWhere rewrites PostgreSQL-only operators used by the ops filters.
+// SQLite LIKE is case-insensitive for ASCII by default, and its text values
+// have no ::text cast syntax.
+func sqliteOpsWhere(where string) string {
+	where = strings.ReplaceAll(where, "::text", "")
+	where = strings.ReplaceAll(where, " ILIKE ", " LIKE ")
+	where = strings.ReplaceAll(where, " ilike ", " LIKE ")
+	return where
+}
+
+func sqliteOpsBind(db *sql.DB, query string, args []any) (string, []any, error) {
+	if !isSQLiteDB(db) {
+		return query, args, nil
+	}
+	// Array comparisons need structural expansion first; the remaining repeated
+	// scalar placeholders are then duplicated one-for-one.
+	expanded, expandedArgs, err := bindArrayArgsForSQLite(query, args)
+	if err != nil {
+		return "", nil, err
+	}
+	return sqliteRepeatPlaceholders(expanded, expandedArgs)
+}
+
+// sqliteRepeatPlaceholders expands repeated $N references into distinct ?
+// placeholders and repeats the corresponding argument. This keeps the shared
+// PostgreSQL where-builder unchanged while satisfying SQLite drivers that bind
+// one value per placeholder.
+func sqliteRepeatPlaceholders(query string, args []any) (string, []any, error) {
+	placeholders := scanSQLLiterals(query)
+	if len(placeholders) == 0 {
+		return query, args, nil
+	}
+
+	var b strings.Builder
+	b.Grow(len(query) + len(placeholders))
+	bound := make([]any, 0, len(placeholders))
+	prev := 0
+	for _, p := range placeholders {
+		if p.number < 1 || p.number > len(args) {
+			return "", nil, &errSQLArrayExpansion{
+				reason: fmt.Sprintf(
+					"sqlite placeholder binding: placeholder $%d has no matching argument (got %d args)",
+					p.number, len(args),
+				),
+			}
+		}
+		b.WriteString(query[prev:p.start])
+		b.WriteByte('?')
+		bound = append(bound, args[p.number-1])
+		prev = p.end
+	}
+	b.WriteString(query[prev:])
+	return b.String(), bound, nil
+}
 
 // escapeLikePattern 转义 LIKE/ILIKE 通配符（\ % _），避免用户输入被当作通配符。
 // Postgres 默认以反斜杠为转义符，无需额外 ESCAPE 子句。

@@ -27,6 +27,8 @@ const (
 	UpstreamModelMetadataPartialCode          = "upstream_model_metadata_partial"
 )
 
+var errModelMetadataProviderNotMatched = errors.New("no model metadata provider matches account base URL")
+
 type UpstreamModelMetadata struct {
 	ID                       string                     `json:"id"`
 	DisplayName              string                     `json:"display_name,omitempty"`
@@ -252,7 +254,7 @@ func (s *AccountTestService) SyncUpstreamModelCatalog(ctx context.Context, accou
 					source = "models.dev"
 				}
 			}
-		} else {
+		} else if !errors.Is(registryErr, errModelMetadataProviderNotMatched) {
 			slog.Warn("upstream model capability metadata enrichment failed",
 				"account_id", upstreamModelSyncAccountID(account),
 				"platform", upstreamModelSyncPlatform(account),
@@ -502,7 +504,7 @@ func (s *AccountTestService) fetchModelsDevMetadata(
 	}
 	provider, ok := matchModelsDevProvider(registry, upstreamModelRegistryBaseURL(account))
 	if !ok {
-		return nil, fmt.Errorf("no model metadata provider matches account base URL")
+		return nil, errModelMetadataProviderNotMatched
 	}
 
 	metadata := make(map[string]UpstreamModelMetadata)

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/dbtime"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
@@ -32,11 +33,111 @@ func (r *opsRepository) GetThroughputTrend(ctx context.Context, filter *service.
 	start := filter.StartTime.UTC()
 	end := filter.EndTime.UTC()
 
-	usageJoin, usageWhere, usageArgs, next := buildUsageWhere(filter, start, end, 1)
-	errorWhere, errorArgs, _ := buildErrorWhere(filter, start, end, next)
+	usageJoin, usageWhere, usageArgs, next := buildUsageWhere(filter, start, end, 1, isSQLiteDB(r.db))
+	errorWhere, errorArgs, _ := buildErrorWhere(filter, start, end, next, isSQLiteDB(r.db))
 
 	usageBucketExpr := opsBucketExprForUsage(bucketSeconds)
 	errorBucketExpr := opsBucketExprForError(bucketSeconds)
+
+	if isSQLiteDB(r.db) {
+		usageBucketExpr = opsBucketExprForUsageSQLite(bucketSeconds)
+		errorBucketExpr = opsBucketExprForErrorSQLite(bucketSeconds)
+	}
+
+	if isSQLiteDB(r.db) {
+		q := `
+WITH usage_buckets AS (
+  SELECT ` + usageBucketExpr + ` AS bucket,
+         COUNT(*) AS success_count,
+         COALESCE(SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens), 0) AS token_consumed
+  FROM usage_logs ul
+  ` + usageJoin + `
+  ` + usageWhere + `
+  GROUP BY 1
+),
+error_buckets AS (
+  SELECT ` + errorBucketExpr + ` AS bucket,
+         COUNT(*) AS error_count
+  FROM ops_error_logs
+  ` + errorWhere + `
+    AND COALESCE(status_code, 0) >= 400
+  GROUP BY 1
+),
+switch_buckets AS (
+  SELECT ` + errorBucketExpr + ` AS bucket,
+    SUM(CASE WHEN substr(json_extract(ev.value, '$.kind'), 1, instr(json_extract(ev.value, '$.kind') || ':', ':') - 1)
+      IN ('failover','retry_exhausted_failover','failover_on_400') THEN 1 ELSE 0 END) AS switch_count
+  FROM ops_error_logs
+  CROSS JOIN json_each(CASE WHEN json_type(upstream_errors)='array' THEN upstream_errors ELSE '[]' END) ev
+  ` + errorWhere + `
+  GROUP BY 1
+),
+combined AS (
+  SELECT bucket, SUM(success_count) AS success_count, SUM(error_count) AS error_count,
+         SUM(token_consumed) AS token_consumed, SUM(switch_count) AS switch_count
+  FROM (
+    SELECT bucket, success_count, 0 AS error_count, token_consumed, 0 AS switch_count FROM usage_buckets
+    UNION ALL
+    SELECT bucket, 0, error_count, 0, 0 FROM error_buckets
+    UNION ALL
+    SELECT bucket, 0, 0, 0, switch_count FROM switch_buckets
+  ) t
+  GROUP BY bucket
+)
+SELECT
+  bucket,
+  (success_count + error_count) AS request_count,
+  token_consumed,
+  switch_count
+FROM combined
+ORDER BY bucket ASC`
+
+		args := append(usageArgs, errorArgs...)
+		rows, err := r.db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = rows.Close() }()
+
+		points := make([]*service.OpsThroughputTrendPoint, 0, 256)
+		for rows.Next() {
+			var bucket time.Time
+			var requests int64
+			var tokens sql.NullInt64
+			var switches sql.NullInt64
+			if err := rows.Scan(dbtime.Dest(&bucket), &requests, &tokens, &switches); err != nil {
+				return nil, err
+			}
+			tokenConsumed := int64(0)
+			if tokens.Valid {
+				tokenConsumed = tokens.Int64
+			}
+			switchCount := int64(0)
+			if switches.Valid {
+				switchCount = switches.Int64
+			}
+			denom := float64(bucketSeconds)
+			if denom <= 0 {
+				denom = 60
+			}
+			points = append(points, &service.OpsThroughputTrendPoint{
+				BucketStart:   bucket.UTC(),
+				RequestCount:  requests,
+				TokenConsumed: tokenConsumed,
+				SwitchCount:   switchCount,
+				QPS:           roundTo1DP(float64(requests) / denom),
+				TPS:           roundTo1DP(float64(tokenConsumed) / denom),
+			})
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		points = fillOpsThroughputBuckets(start, end, bucketSeconds, points)
+		return &service.OpsThroughputTrendResponse{
+			Bucket: opsBucketLabel(bucketSeconds),
+			Points: points,
+		}, nil
+	}
 
 	q := `
 WITH usage_buckets AS (
@@ -111,7 +212,7 @@ ORDER BY bucket ASC`
 		var requests int64
 		var tokens sql.NullInt64
 		var switches sql.NullInt64
-		if err := rows.Scan(&bucket, &requests, &tokens, &switches); err != nil {
+		if err := rows.Scan(dbtime.Dest(&bucket), &requests, &tokens, &switches); err != nil {
 			return nil, err
 		}
 		tokenConsumed := int64(0)
@@ -354,6 +455,28 @@ func opsBucketExprForError(bucketSeconds int) string {
 	}
 }
 
+func opsBucketExprForUsageSQLite(bucketSeconds int) string {
+	switch bucketSeconds {
+	case 3600:
+		return "sub2api_time_bucket(ul.created_at, 'hour', 'UTC')"
+	case 300:
+		return "strftime('%Y-%m-%dT%H:%M:00Z', datetime(((pg_rfc3339_micros(ul.created_at) / 1000000) / 300) * 300, 'unixepoch'))"
+	default:
+		return "sub2api_time_bucket(ul.created_at, 'minute', 'UTC')"
+	}
+}
+
+func opsBucketExprForErrorSQLite(bucketSeconds int) string {
+	switch bucketSeconds {
+	case 3600:
+		return "sub2api_time_bucket(created_at, 'hour', 'UTC')"
+	case 300:
+		return "strftime('%Y-%m-%dT%H:%M:00Z', datetime(((pg_rfc3339_micros(created_at) / 1000000) / 300) * 300, 'unixepoch'))"
+	default:
+		return "sub2api_time_bucket(created_at, 'minute', 'UTC')"
+	}
+}
+
 func opsBucketLabel(bucketSeconds int) string {
 	if bucketSeconds <= 0 {
 		return "1m"
@@ -445,8 +568,55 @@ func (r *opsRepository) GetErrorTrend(ctx context.Context, filter *service.OpsDa
 
 	start := filter.StartTime.UTC()
 	end := filter.EndTime.UTC()
-	where, args, _ := buildErrorWhere(filter, start, end, 1)
+	where, args, _ := buildErrorWhere(filter, start, end, 1, isSQLiteDB(r.db))
 	bucketExpr := opsBucketExprForError(bucketSeconds)
+
+	if isSQLiteDB(r.db) {
+		bucketExpr = opsBucketExprForErrorSQLite(bucketSeconds)
+		q := `
+SELECT
+  ` + bucketExpr + ` AS bucket,
+  COALESCE(SUM(CASE WHEN COALESCE(status_code, 0) >= 400 THEN 1 ELSE 0 END), 0) AS error_total,
+  COALESCE(SUM(CASE WHEN COALESCE(status_code, 0) >= 400 AND is_business_limited THEN 1 ELSE 0 END), 0) AS business_limited,
+  COALESCE(SUM(CASE WHEN COALESCE(status_code, 0) >= 400 AND NOT is_business_limited THEN 1 ELSE 0 END), 0) AS error_sla,
+  COALESCE(SUM(CASE WHEN error_owner = 'provider' AND NOT is_business_limited AND COALESCE(upstream_status_code, status_code, 0) NOT IN (429, 529) THEN 1 ELSE 0 END), 0) AS upstream_excl,
+  COALESCE(SUM(CASE WHEN error_owner = 'provider' AND NOT is_business_limited AND COALESCE(upstream_status_code, status_code, 0) = 429 THEN 1 ELSE 0 END), 0) AS upstream_429,
+  COALESCE(SUM(CASE WHEN error_owner = 'provider' AND NOT is_business_limited AND COALESCE(upstream_status_code, status_code, 0) = 529 THEN 1 ELSE 0 END), 0) AS upstream_529
+FROM ops_error_logs
+` + where + `
+GROUP BY 1
+ORDER BY 1 ASC`
+
+		rows, err := r.db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = rows.Close() }()
+		points := make([]*service.OpsErrorTrendPoint, 0, 256)
+		for rows.Next() {
+			var bucket time.Time
+			var total, businessLimited, sla, upstreamExcl, upstream429, upstream529 int64
+			if err := rows.Scan(dbtime.Dest(&bucket), &total, &businessLimited, &sla, &upstreamExcl, &upstream429, &upstream529); err != nil {
+				return nil, err
+			}
+			points = append(points, &service.OpsErrorTrendPoint{
+				BucketStart:                  bucket.UTC(),
+				ErrorCountTotal:              total,
+				BusinessLimitedCount:         businessLimited,
+				ErrorCountSLA:                sla,
+				UpstreamErrorCountExcl429529: upstreamExcl,
+				Upstream429Count:             upstream429,
+				Upstream529Count:             upstream529,
+			})
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		return &service.OpsErrorTrendResponse{
+			Bucket: opsBucketLabel(bucketSeconds),
+			Points: fillOpsErrorTrendBuckets(start, end, bucketSeconds, points),
+		}, nil
+	}
 
 	q := `
 SELECT
@@ -472,7 +642,7 @@ ORDER BY 1 ASC`
 	for rows.Next() {
 		var bucket time.Time
 		var total, businessLimited, sla, upstreamExcl, upstream429, upstream529 int64
-		if err := rows.Scan(&bucket, &total, &businessLimited, &sla, &upstreamExcl, &upstream429, &upstream529); err != nil {
+		if err := rows.Scan(dbtime.Dest(&bucket), &total, &businessLimited, &sla, &upstreamExcl, &upstream429, &upstream529); err != nil {
 			return nil, err
 		}
 		points = append(points, &service.OpsErrorTrendPoint{
@@ -558,7 +728,47 @@ func (r *opsRepository) GetErrorDistribution(ctx context.Context, filter *servic
 
 	start := filter.StartTime.UTC()
 	end := filter.EndTime.UTC()
-	where, args, _ := buildErrorWhere(filter, start, end, 1)
+	where, args, _ := buildErrorWhere(filter, start, end, 1, isSQLiteDB(r.db))
+
+	if isSQLiteDB(r.db) {
+		q := `
+SELECT
+  COALESCE(upstream_status_code, status_code, 0) AS status_code,
+  COUNT(*) AS total,
+  SUM(CASE WHEN NOT is_business_limited THEN 1 ELSE 0 END) AS sla,
+  SUM(CASE WHEN is_business_limited THEN 1 ELSE 0 END) AS business_limited
+FROM ops_error_logs
+` + where + `
+  AND COALESCE(status_code, 0) >= 400
+GROUP BY 1
+ORDER BY total DESC
+LIMIT 20`
+		rows, err := r.db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = rows.Close() }()
+		items := make([]*service.OpsErrorDistributionItem, 0, 16)
+		var total int64
+		for rows.Next() {
+			var statusCode int
+			var cntTotal, cntSLA, cntBiz int64
+			if err := rows.Scan(&statusCode, &cntTotal, &cntSLA, &cntBiz); err != nil {
+				return nil, err
+			}
+			total += cntTotal
+			items = append(items, &service.OpsErrorDistributionItem{
+				StatusCode:      statusCode,
+				Total:           cntTotal,
+				SLA:             cntSLA,
+				BusinessLimited: cntBiz,
+			})
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		return &service.OpsErrorDistributionResponse{Total: total, Items: items}, nil
+	}
 
 	q := `
 SELECT

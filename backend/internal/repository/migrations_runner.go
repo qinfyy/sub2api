@@ -117,7 +117,7 @@ func ApplyMigrations(ctx context.Context, db *sql.DB) error {
 		return errors.New("nil sql db")
 	}
 	if isSQLiteDB(db) {
-		return applySQLiteMigrationsFS(ctx, db)
+		return applySQLiteV1Schema(ctx, db)
 	}
 	return applyMigrationsFS(ctx, db, migrations.FS)
 }
@@ -144,7 +144,7 @@ func applyMigrationsFS(ctx context.Context, db *sql.DB, fsys fs.FS) error {
 	if db == nil {
 		return errors.New("nil sql db")
 	}
-	// SQLite 后端的基线 schema 由 Ent 维护，PostgreSQL 的 SQL 迁移包含
+	// SQLite 后端只执行审核过的独立迁移，PostgreSQL 的 SQL 迁移包含
 	// JSONB / 数组 / PL/pgSQL 等方言特性，不适用于 SQLite。
 	if isSQLiteDB(db) {
 		return applySQLiteSchema(ctx, db)

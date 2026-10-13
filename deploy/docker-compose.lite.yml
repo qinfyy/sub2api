@@ -59,8 +59,9 @@ services:
       # Cache Configuration (in-process memory)
       # =======================================================================
       - REDIS_TYPE=memory
-      - REDIS_MEMORY_MAX_CAPACITY_MB=${REDIS_MEMORY_MAX_CAPACITY_MB:-512}
+      - REDIS_MEMORY_MAX_CAPACITY_MB=${REDIS_MEMORY_MAX_CAPACITY_MB:-64}
       - REDIS_MEMORY_GC_INTERVAL_SECONDS=${REDIS_MEMORY_GC_INTERVAL_SECONDS:-60}
+      - GOMEMLIMIT=${GOMEMLIMIT:-384MiB}
 
       # =======================================================================
       # Admin Account (auto-created on first run)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/dbtime"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
@@ -206,7 +207,7 @@ LIMIT 1`
 
 	if err := r.db.QueryRowContext(ctx, q, windowMinutes).Scan(
 		&out.ID,
-		&out.CreatedAt,
+		dbtime.Dest(&out.CreatedAt),
 		&out.WindowMinutes,
 		&cpu,
 		&memUsed,
@@ -369,9 +370,9 @@ ORDER BY job_name ASC`
 	out := make([]*service.OpsJobHeartbeat, 0, 8)
 	for rows.Next() {
 		var item service.OpsJobHeartbeat
-		var lastRun sql.NullTime
-		var lastSuccess sql.NullTime
-		var lastErrorAt sql.NullTime
+		var lastRun dbtime.NullTime
+		var lastSuccess dbtime.NullTime
+		var lastErrorAt dbtime.NullTime
 		var lastError sql.NullString
 		var lastDuration sql.NullInt64
 
@@ -385,7 +386,7 @@ ORDER BY job_name ASC`
 			&lastError,
 			&lastDuration,
 			&lastResult,
-			&item.UpdatedAt,
+			dbtime.Dest(&item.UpdatedAt),
 		); err != nil {
 			return nil, err
 		}

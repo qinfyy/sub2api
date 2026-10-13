@@ -12,7 +12,6 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
 	"github.com/robfig/cron/v3"
 	"go.uber.org/zap"
 )
@@ -26,13 +25,6 @@ const (
 
 var opsCleanupCronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 
-var opsCleanupReleaseScript = redis.NewScript(`
-if redis.call("GET", KEYS[1]) == ARGV[1] then
-  return redis.call("DEL", KEYS[1])
-end
-return 0
-`)
-
 // OpsCleanupService periodically deletes old ops data to prevent unbounded DB growth.
 //
 // - Scheduling: 5-field cron spec (minute hour dom month dow).
@@ -44,7 +36,7 @@ return 0
 type OpsCleanupService struct {
 	opsRepo           OpsRepository
 	db                *sql.DB
-	redisClient       *redis.Client
+	leaderLock        LeaderLockCache
 	cfg               *config.Config
 	channelMonitorSvc *ChannelMonitorService
 	settingRepo       SettingRepository
@@ -59,8 +51,6 @@ type OpsCleanupService struct {
 	started   bool
 	stopped   bool
 	effective opsCleanupEffectiveConfig
-
-	warnNoRedisOnce sync.Once
 }
 
 type opsCleanupEffectiveConfig struct {
@@ -71,7 +61,7 @@ type opsCleanupEffectiveConfig struct {
 func NewOpsCleanupService(
 	opsRepo OpsRepository,
 	db *sql.DB,
-	redisClient *redis.Client,
+	leaderLock LeaderLockCache,
 	cfg *config.Config,
 	channelMonitorSvc *ChannelMonitorService,
 	settingRepo SettingRepository,
@@ -79,7 +69,7 @@ func NewOpsCleanupService(
 	return &OpsCleanupService{
 		opsRepo:           opsRepo,
 		db:                db,
-		redisClient:       redisClient,
+		leaderLock:        leaderLock,
 		cfg:               cfg,
 		channelMonitorSvc: channelMonitorSvc,
 		settingRepo:       settingRepo,
@@ -372,29 +362,7 @@ func (s *OpsCleanupService) tryAcquireLeaderLock(ctx context.Context) (func(), b
 	key := opsCleanupLeaderLockKeyDefault
 	ttl := opsCleanupLeaderLockTTLDefault
 
-	// Prefer Redis leader lock when available, but avoid stampeding the DB when Redis is flaky by
-	// falling back to a DB advisory lock.
-	if s.redisClient != nil {
-		ok, err := s.redisClient.SetNX(ctx, key, s.instanceID, ttl).Result()
-		if err == nil {
-			if !ok {
-				return nil, false
-			}
-			return func() {
-				_, _ = opsCleanupReleaseScript.Run(ctx, s.redisClient, []string{key}, s.instanceID).Result()
-			}, true
-		}
-		// Redis error: fall back to DB advisory lock.
-		s.warnNoRedisOnce.Do(func() {
-			logger.LegacyPrintf("service.ops_cleanup", "[OpsCleanup] leader lock SetNX failed; falling back to DB advisory lock: %v", err)
-		})
-	} else {
-		s.warnNoRedisOnce.Do(func() {
-			logger.LegacyPrintf("service.ops_cleanup", "[OpsCleanup] redis not configured; using DB advisory lock")
-		})
-	}
-
-	release, ok := tryAcquireDBAdvisoryLock(ctx, s.db, hashAdvisoryLockID(key))
+	release, ok := tryAcquireSingletonLeaderLock(ctx, s.leaderLock, s.db, key, s.instanceID, ttl)
 	if !ok {
 		return nil, false
 	}

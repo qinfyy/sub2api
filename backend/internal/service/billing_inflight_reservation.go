@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"math"
 	"strings"
 	"sync"
@@ -269,6 +270,11 @@ func (s *BillingCacheService) reserveInflight(ctx context.Context, user *User, g
 	allowed, inflight, err := rc.ReserveInflightBalance(reserveCtx, user.ID, requestID, estimate, balance, ttl)
 	cancel()
 	if err != nil {
+		var capacityErr interface{ CacheCapacityExhausted() bool }
+		if errors.As(err, &capacityErr) && capacityErr.CacheCapacityExhausted() {
+			logger.LegacyPrintf("service.billing_cache", "inflight reservation rejected for user %d: memory cache capacity exhausted", user.ID)
+			return nil, ErrBillingServiceUnavailable
+		}
 		logger.LegacyPrintf("service.billing_cache", "Warning: inflight reservation failed for user %d (fail-open): %v", user.ID, err)
 		return nil, nil
 	}

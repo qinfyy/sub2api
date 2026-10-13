@@ -142,6 +142,7 @@ type usageLogRepository struct {
 	client *dbent.Client
 	sql    sqlExecutor
 	db     *sql.DB
+	sqlite bool
 
 	createBatchOnce     sync.Once
 	createBatchCh       chan usageLogCreateRequest
@@ -159,6 +160,10 @@ func newUsageLogRepositoryWithSQL(client *dbent.Client, sqlq sqlExecutor) *usage
 	repo := &usageLogRepository{client: client, sql: sqlq}
 	if db, ok := sqlq.(*sql.DB); ok {
 		repo.db = db
+		repo.sqlite = isSQLiteDB(db)
+	}
+	if client != nil {
+		repo.sqlite = client.Driver().Dialect() == "sqlite3"
 	}
 	repo.bestEffortRecent = gocache.New(usageLogBestEffortRecentTTL, time.Minute)
 	return repo

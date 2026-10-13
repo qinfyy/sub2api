@@ -695,6 +695,10 @@ func (r *usageLogRepository) GetStatsWithFilters(ctx context.Context, filters Us
 		args = append(args, *filters.EndTime)
 	}
 
+	if isSQLiteDB(r.db) {
+		return r.getStatsWithFiltersSQLite(ctx, conditions, args, filters)
+	}
+
 	query := fmt.Sprintf(`
 		WITH scoped AS (
 			SELECT
@@ -733,6 +737,178 @@ func (r *usageLogRepository) GetStatsWithFilters(ctx context.Context, filters Us
 			(inbound_endpoint, upstream_endpoint)
 		)
 	`, buildWhere(conditions))
+
+	stats := &UsageStats{}
+	var totalAccountCost float64
+	useAccountCostForEndpoint := filters.AccountID > 0 && filters.UserID == 0 && filters.APIKeyID == 0
+	rows, err := r.sql.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var (
+			inboundGrouped, upstreamGrouped                                      int
+			inboundEndpoint, upstreamEndpoint                                    sql.NullString
+			requests, inputTokens, outputTokens, cacheCreationTokens, cacheReads int64
+			cost, actualCost, accountCost, averageDurationMs                     float64
+		)
+		if err := rows.Scan(
+			&inboundGrouped,
+			&upstreamGrouped,
+			&inboundEndpoint,
+			&upstreamEndpoint,
+			&requests,
+			&inputTokens,
+			&outputTokens,
+			&cacheCreationTokens,
+			&cacheReads,
+			&cost,
+			&actualCost,
+			&accountCost,
+			&averageDurationMs,
+		); err != nil {
+			return nil, err
+		}
+
+		totalTokens := inputTokens + outputTokens + cacheCreationTokens + cacheReads
+		endpointActualCost := actualCost
+		if useAccountCostForEndpoint {
+			endpointActualCost = accountCost
+		}
+
+		switch {
+		case inboundGrouped == 1 && upstreamGrouped == 1:
+			stats.TotalRequests = requests
+			stats.TotalInputTokens = inputTokens
+			stats.TotalOutputTokens = outputTokens
+			stats.TotalCacheCreationTokens = cacheCreationTokens
+			stats.TotalCacheReadTokens = cacheReads
+			stats.TotalCacheTokens = cacheCreationTokens + cacheReads
+			stats.TotalCost = cost
+			stats.TotalActualCost = actualCost
+			totalAccountCost = accountCost
+			stats.AverageDurationMs = averageDurationMs
+		case inboundGrouped == 0 && upstreamGrouped == 1:
+			stats.Endpoints = append(stats.Endpoints, EndpointStat{
+				Endpoint: inboundEndpoint.String, Requests: requests, TotalTokens: totalTokens,
+				Cost: cost, ActualCost: endpointActualCost,
+			})
+		case inboundGrouped == 1 && upstreamGrouped == 0:
+			stats.UpstreamEndpoints = append(stats.UpstreamEndpoints, EndpointStat{
+				Endpoint: upstreamEndpoint.String, Requests: requests, TotalTokens: totalTokens,
+				Cost: cost, ActualCost: endpointActualCost,
+			})
+		case inboundGrouped == 0 && upstreamGrouped == 0:
+			stats.EndpointPaths = append(stats.EndpointPaths, EndpointStat{
+				Endpoint: inboundEndpoint.String + " -> " + upstreamEndpoint.String,
+				Requests: requests, TotalTokens: totalTokens, Cost: cost, ActualCost: endpointActualCost,
+			})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	sortEndpointStats := func(values []EndpointStat) {
+		sort.Slice(values, func(i, j int) bool {
+			if values[i].Requests != values[j].Requests {
+				return values[i].Requests > values[j].Requests
+			}
+			return values[i].Endpoint < values[j].Endpoint
+		})
+	}
+	sortEndpointStats(stats.Endpoints)
+	sortEndpointStats(stats.UpstreamEndpoints)
+	sortEndpointStats(stats.EndpointPaths)
+
+	stats.TotalAccountCost = &totalAccountCost
+	stats.TotalTokens = stats.TotalInputTokens + stats.TotalOutputTokens + stats.TotalCacheTokens
+
+	return stats, nil
+}
+
+// getStatsWithFiltersSQLite implements the PostgreSQL GROUPING SETS query with
+// four UNION ALL branches. SQLite has no GROUPING SETS/GROUPING support, but
+// the branch marker columns preserve the exact result shape.
+func (r *usageLogRepository) getStatsWithFiltersSQLite(
+	ctx context.Context,
+	conditions []string,
+	args []any,
+	filters UsageLogFilters,
+) (*UsageStats, error) {
+	whereClause := buildWhere(conditions)
+
+	type aggregateSet struct {
+		inboundGrouped  int
+		upstreamGrouped int
+		groupBy         string
+		endpointSelect  string
+	}
+	sets := []aggregateSet{
+		{
+			inboundGrouped:  1,
+			upstreamGrouped: 1,
+			endpointSelect:  "NULL AS inbound_endpoint, NULL AS upstream_endpoint",
+		},
+		{
+			inboundGrouped:  0,
+			upstreamGrouped: 1,
+			groupBy:         "GROUP BY inbound_endpoint",
+			endpointSelect:  "inbound_endpoint, NULL AS upstream_endpoint",
+		},
+		{
+			inboundGrouped:  1,
+			upstreamGrouped: 0,
+			groupBy:         "GROUP BY upstream_endpoint",
+			endpointSelect:  "NULL AS inbound_endpoint, upstream_endpoint",
+		},
+		{
+			inboundGrouped:  0,
+			upstreamGrouped: 0,
+			groupBy:         "GROUP BY inbound_endpoint, upstream_endpoint",
+			endpointSelect:  "inbound_endpoint, upstream_endpoint",
+		},
+	}
+
+	queries := make([]string, 0, len(sets))
+	for _, set := range sets {
+		queries = append(queries, fmt.Sprintf(`
+			SELECT
+				%d AS inbound_grouped,
+				%d AS upstream_grouped,
+				%s,
+				COUNT(*) AS requests,
+				COALESCE(SUM(input_tokens), 0) AS input_tokens,
+				COALESCE(SUM(output_tokens), 0) AS output_tokens,
+				COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+				COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+				COALESCE(SUM(total_cost), 0) AS cost,
+				COALESCE(SUM(actual_cost), 0) AS actual_cost,
+				COALESCE(SUM(account_cost), 0) AS account_cost,
+				COALESCE(AVG(duration_ms), 0) AS avg_duration_ms
+			FROM scoped
+			%s
+		`, set.inboundGrouped, set.upstreamGrouped, set.endpointSelect, set.groupBy))
+	}
+
+	query := `WITH scoped AS (
+			SELECT
+				COALESCE(NULLIF(TRIM(inbound_endpoint), ''), 'unknown') AS inbound_endpoint,
+				COALESCE(NULLIF(TRIM(upstream_endpoint), ''), 'unknown') AS upstream_endpoint,
+				input_tokens,
+				output_tokens,
+				cache_creation_tokens,
+				cache_read_tokens,
+				total_cost,
+				actual_cost,
+				COALESCE(account_stats_cost, total_cost) * COALESCE(account_rate_multiplier, 1) AS account_cost,
+				duration_ms
+			FROM usage_logs
+			` + whereClause + `
+		)
+		` + strings.Join(queries, "\nUNION ALL\n")
 
 	stats := &UsageStats{}
 	var totalAccountCost float64

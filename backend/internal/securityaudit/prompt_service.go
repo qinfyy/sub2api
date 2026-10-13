@@ -15,7 +15,7 @@ import (
 type PromptService struct {
 	config    ConfigStore
 	repo      *PostgreSQLRepository
-	payload   *RedisPayloadStore
+	payload   PayloadStore
 	enqueuer  *Enqueuer
 	runner    *Runner
 	evaluator *GuardEvaluator
@@ -35,7 +35,7 @@ type PromptService struct {
 func NewPromptService(
 	config ConfigStore,
 	repo *PostgreSQLRepository,
-	payload *RedisPayloadStore,
+	payload PayloadStore,
 	scanner *OpenAICompatibleScanner,
 	metrics *AtomicMetrics,
 ) *PromptService {

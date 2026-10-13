@@ -5,12 +5,10 @@ import (
 	"database/sql"
 	"fmt"
 	"hash/fnv"
-	"reflect"
 	"sort"
 	"strings"
 	"sync"
 	"time"
-	"unsafe"
 
 	"entgo.io/ent/dialect"
 	entsql "entgo.io/ent/dialect/sql"
@@ -232,21 +230,7 @@ func lockRepositoryScopedKeys(ctx context.Context, client *dbent.Client, exec sq
 }
 
 func (r *userRepository) WithUserProfileIdentityTx(ctx context.Context, fn func(txCtx context.Context) error) error {
-	if dbent.TxFromContext(ctx) != nil {
-		return fn(ctx)
-	}
-
-	tx, err := r.client.Tx(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	txCtx := dbent.NewTxContext(ctx, tx)
-	if err := fn(txCtx); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return NewTransactionRunner(r.client).WithinTransaction(ctx, fn)
 }
 
 func (r *userRepository) CreateAuthIdentity(ctx context.Context, input CreateAuthIdentityInput) (*CreateAuthIdentityResult, error) {
@@ -840,8 +824,8 @@ func validateAuthIdentityChannelProviderMatch(canonical AuthIdentityKey, channel
 }
 
 func txAwareSQLExecutor(ctx context.Context, fallback sqlExecutor, client *dbent.Client) sqlQueryExecutor {
-	if tx := dbent.TxFromContext(ctx); tx != nil {
-		if exec := sqlExecutorFromEntClient(tx.Client()); exec != nil {
+	if txClient := transactionClientFromContext(ctx); txClient != nil {
+		if exec := sqlExecutorFromEntClient(txClient); exec != nil {
 			return exec
 		}
 	}
@@ -864,17 +848,5 @@ func sqlExecutorFromEntClient(client *dbent.Client) sqlQueryExecutor {
 		return nil
 	}
 
-	clientValue := reflect.ValueOf(client).Elem()
-	configValue := clientValue.FieldByName("config")
-	driverValue := configValue.FieldByName("driver")
-	if !driverValue.IsValid() {
-		return nil
-	}
-
-	driver := reflect.NewAt(driverValue.Type(), unsafe.Pointer(driverValue.UnsafeAddr())).Elem().Interface()
-	exec, ok := driver.(sqlQueryExecutor)
-	if !ok {
-		return nil
-	}
-	return exec
+	return client
 }

@@ -6,17 +6,29 @@ import (
 	"errors"
 	"time"
 
+	"entgo.io/ent/dialect"
+	entsql "entgo.io/ent/dialect/sql"
+	dbent "github.com/Wei-Shaw/sub2api/ent"
+	"github.com/Wei-Shaw/sub2api/ent/imagequeueentry"
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
 type memoryBatchImageQueue struct {
-	db   *sql.DB
-	core *memoryCacheCore
+	client *dbent.Client
+	core   *memoryCacheCore
 }
 
 func NewMemoryBatchImageQueue(core *memoryCacheCore, db *sql.DB) service.BatchImageQueue {
-	return &memoryBatchImageQueue{db: db, core: memoryAssertCore(core)}
+	q := &memoryBatchImageQueue{core: memoryAssertCore(core)}
+	if db != nil {
+		name := dialect.SQLite
+		if isPostgresDB(db) {
+			name = dialect.Postgres
+		}
+		q.client = dbent.NewClient(dbent.Driver(entsql.OpenDB(name, db)))
+	}
+	return q
 }
 
 var _ service.BatchImageQueue = (*memoryBatchImageQueue)(nil)
@@ -25,7 +37,7 @@ func (q *memoryBatchImageQueue) validate(ctx context.Context, id string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if q.db == nil {
+	if q.client == nil {
 		return errors.New("durable image queue is unavailable")
 	}
 	if !service.IsValidBatchImageID(id) {
@@ -37,7 +49,7 @@ func (q *memoryBatchImageQueue) Enqueue(ctx context.Context, id string) error {
 	if err := q.validate(ctx, id); err != nil {
 		return err
 	}
-	r, err := q.db.ExecContext(ctx, `INSERT INTO memory_batch_queue(batch_id,state,available_at) VALUES(?, 'ready', ?) ON CONFLICT(batch_id) DO NOTHING`, id, time.Now().UnixMilli())
+	r, err := clientFromContext(ctx, q.client).ExecContext(ctx, `INSERT INTO memory_batch_queue(batch_id,state,available_at) VALUES($1, 'ready', $2) ON CONFLICT(batch_id) DO NOTHING`, id, time.Now().UnixMilli())
 	if err != nil {
 		return err
 	}
@@ -48,7 +60,7 @@ func (q *memoryBatchImageQueue) Enqueue(ctx context.Context, id string) error {
 	return err
 }
 func (q *memoryBatchImageQueue) Reserve(ctx context.Context, timeout time.Duration) (service.ReservedBatchImageJob, error) {
-	if q.db == nil {
+	if q.client == nil {
 		return service.ReservedBatchImageJob{}, errors.New("durable image queue is unavailable")
 	}
 	deadline := time.Now().Add(timeout)
@@ -60,8 +72,7 @@ func (q *memoryBatchImageQueue) Reserve(ctx context.Context, timeout time.Durati
 		if err != nil {
 			return service.ReservedBatchImageJob{}, err
 		}
-		var job service.ReservedBatchImageJob
-		err = q.db.QueryRowContext(ctx, `UPDATE memory_batch_queue SET state='active', heartbeat_at=?, receipt=? WHERE batch_id=(SELECT batch_id FROM memory_batch_queue WHERE state='ready' ORDER BY available_at,batch_id LIMIT 1) AND state='ready' RETURNING batch_id,receipt`, time.Now().UnixMilli(), receipt).Scan(&job.BatchID, &job.Receipt)
+		job, err := q.claim(ctx, receipt)
 		if err == nil {
 			return job, nil
 		}
@@ -85,12 +96,38 @@ func (q *memoryBatchImageQueue) Reserve(ctx context.Context, timeout time.Durati
 		}
 	}
 }
-func queueClaimResult(r sql.Result, err error) error {
+func (q *memoryBatchImageQueue) claim(ctx context.Context, receipt string) (service.ReservedBatchImageJob, error) {
+	client := clientFromContext(ctx, q.client)
+	selectReady := `SELECT batch_id FROM memory_batch_queue WHERE state='ready' ORDER BY available_at,batch_id LIMIT 1`
+	if client.Driver().Dialect() == dialect.Postgres {
+		selectReady += ` FOR UPDATE SKIP LOCKED`
+	}
+	rows, err := client.QueryContext(ctx, `UPDATE memory_batch_queue SET state='active', heartbeat_at=$1, receipt=$2 WHERE batch_id=(`+selectReady+`) AND state='ready' RETURNING batch_id,receipt`, time.Now().UnixMilli(), receipt)
+	var job service.ReservedBatchImageJob
+	if err != nil {
+		return job, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return job, err
+		}
+		return job, sql.ErrNoRows
+	}
+	if err := rows.Scan(&job.BatchID, &job.Receipt); err != nil {
+		return job, err
+	}
+	if rows.Next() {
+		return job, errors.New("multiple jobs returned for one queue claim")
+	}
+	return job, rows.Err()
+}
+
+func queueClaimCount(n int, err error) error {
 	if err != nil {
 		return err
 	}
-	n, err := r.RowsAffected()
-	if err == nil && n == 0 {
+	if n == 0 {
 		return service.ErrBatchImageLockNotAcquired
 	}
 	return err
@@ -103,11 +140,13 @@ func (q *memoryBatchImageQueue) RequeueAfter(ctx context.Context, id string, del
 	if receipt == "" {
 		return service.ErrBatchImageLockNotAcquired
 	}
-	state := "ready"
+	state := imagequeueentry.StateReady
 	if delay > 0 {
-		state = "delayed"
+		state = imagequeueentry.StateDelayed
 	}
-	return queueClaimResult(q.db.ExecContext(ctx, `UPDATE memory_batch_queue SET state=?,available_at=?,heartbeat_at=0,receipt='' WHERE batch_id=? AND state='active' AND receipt=?`, state, time.Now().Add(delay).UnixMilli(), id, receipt))
+	return queueClaimCount(clientFromContext(ctx, q.client).ImageQueueEntry.Update().
+		Where(imagequeueentry.IDEQ(id), imagequeueentry.StateEQ(imagequeueentry.StateActive), imagequeueentry.ReceiptEQ(receipt)).
+		SetState(state).SetAvailableAt(time.Now().Add(delay).UnixMilli()).SetHeartbeatAt(0).SetReceipt("").Save(ctx))
 }
 func (q *memoryBatchImageQueue) Ack(ctx context.Context, id string) error {
 	if err := q.validate(ctx, id); err != nil {
@@ -117,7 +156,8 @@ func (q *memoryBatchImageQueue) Ack(ctx context.Context, id string) error {
 	if receipt == "" {
 		return service.ErrBatchImageLockNotAcquired
 	}
-	return queueClaimResult(q.db.ExecContext(ctx, `DELETE FROM memory_batch_queue WHERE batch_id=? AND state='active' AND receipt=?`, id, receipt))
+	return queueClaimCount(clientFromContext(ctx, q.client).ImageQueueEntry.Delete().
+		Where(imagequeueentry.IDEQ(id), imagequeueentry.StateEQ(imagequeueentry.StateActive), imagequeueentry.ReceiptEQ(receipt)).Exec(ctx))
 }
 func (q *memoryBatchImageQueue) Heartbeat(ctx context.Context, id string) error {
 	if err := q.validate(ctx, id); err != nil {
@@ -127,16 +167,18 @@ func (q *memoryBatchImageQueue) Heartbeat(ctx context.Context, id string) error 
 	if receipt == "" {
 		return service.ErrBatchImageLockNotAcquired
 	}
-	return queueClaimResult(q.db.ExecContext(ctx, `UPDATE memory_batch_queue SET heartbeat_at=? WHERE batch_id=? AND state='active' AND receipt=?`, time.Now().UnixMilli(), id, receipt))
+	return queueClaimCount(clientFromContext(ctx, q.client).ImageQueueEntry.Update().
+		Where(imagequeueentry.IDEQ(id), imagequeueentry.StateEQ(imagequeueentry.StateActive), imagequeueentry.ReceiptEQ(receipt)).
+		SetHeartbeatAt(time.Now().UnixMilli()).Save(ctx))
 }
 func (q *memoryBatchImageQueue) MoveDueDelayedToReady(ctx context.Context, limit int) (int, error) {
-	if q.db == nil {
+	if q.client == nil {
 		return 0, errors.New("durable image queue is unavailable")
 	}
 	if limit <= 0 {
 		limit = 100
 	}
-	r, err := q.db.ExecContext(ctx, `UPDATE memory_batch_queue SET state='ready' WHERE batch_id IN (SELECT batch_id FROM memory_batch_queue WHERE state='delayed' AND available_at<=? ORDER BY available_at,batch_id LIMIT ?)`, time.Now().UnixMilli(), limit)
+	r, err := clientFromContext(ctx, q.client).ExecContext(ctx, `UPDATE memory_batch_queue SET state='ready' WHERE state='delayed' AND available_at<=$1 AND batch_id IN (SELECT batch_id FROM memory_batch_queue WHERE state='delayed' AND available_at<=$1 ORDER BY available_at,batch_id LIMIT $2)`, time.Now().UnixMilli(), limit)
 	if err != nil {
 		return 0, err
 	}
@@ -144,7 +186,7 @@ func (q *memoryBatchImageQueue) MoveDueDelayedToReady(ctx context.Context, limit
 	return int(n), err
 }
 func (q *memoryBatchImageQueue) RecoverStaleActive(ctx context.Context, stale time.Duration, limit int) (int, error) {
-	if q.db == nil {
+	if q.client == nil {
 		return 0, errors.New("durable image queue is unavailable")
 	}
 	if stale <= 0 {
@@ -153,7 +195,7 @@ func (q *memoryBatchImageQueue) RecoverStaleActive(ctx context.Context, stale ti
 	if limit <= 0 {
 		limit = 100
 	}
-	r, err := q.db.ExecContext(ctx, `UPDATE memory_batch_queue SET state='ready',available_at=?,receipt='' WHERE batch_id IN (SELECT batch_id FROM memory_batch_queue WHERE state='active' AND heartbeat_at<=? ORDER BY heartbeat_at,batch_id LIMIT ?)`, time.Now().UnixMilli(), time.Now().Add(-stale).UnixMilli(), limit)
+	r, err := clientFromContext(ctx, q.client).ExecContext(ctx, `UPDATE memory_batch_queue SET state='ready',available_at=$1,receipt='' WHERE state='active' AND heartbeat_at<=$2 AND batch_id IN (SELECT batch_id FROM memory_batch_queue WHERE state='active' AND heartbeat_at<=$2 ORDER BY heartbeat_at,batch_id LIMIT $3)`, time.Now().UnixMilli(), time.Now().Add(-stale).UnixMilli(), limit)
 	if err != nil {
 		return 0, err
 	}

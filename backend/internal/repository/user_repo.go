@@ -3,8 +3,10 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -20,6 +22,7 @@ import (
 	dbuser "github.com/Wei-Shaw/sub2api/ent/user"
 	"github.com/Wei-Shaw/sub2api/ent/userallowedgroup"
 	"github.com/Wei-Shaw/sub2api/ent/usersubscription"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/dbtime"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/lib/pq"
@@ -30,6 +33,8 @@ import (
 type userRepository struct {
 	client *dbent.Client
 	sql    sqlExecutor
+	db     *sql.DB
+	sqlite bool
 }
 
 var _ service.RedeemUserAdjustmentRepository = (*userRepository)(nil)
@@ -39,7 +44,8 @@ func NewUserRepository(client *dbent.Client, sqlDB *sql.DB) service.UserReposito
 }
 
 func newUserRepositoryWithSQL(client *dbent.Client, sqlq sqlExecutor) *userRepository {
-	return &userRepository{client: client, sql: sqlq}
+	db, _ := sqlq.(*sql.DB)
+	return &userRepository{client: client, sql: sqlq, db: db, sqlite: isSQLiteDB(db)}
 }
 
 func (r *userRepository) Create(ctx context.Context, userIn *service.User) error {
@@ -727,7 +733,19 @@ func (r *userRepository) GetLatestUsedAtByUserIDs(ctx context.Context, userIDs [
 		GROUP BY user_id
 	`
 
-	rows, err := r.sql.QueryContext(ctx, query, pq.Array(userIDs))
+	if r.sqlite {
+		sqliteQuery, args, err := bindArrayArgs(r.db, query, []any{userIDs})
+		if err != nil {
+			return nil, err
+		}
+		return r.scanLatestUsedAtByUserIDs(ctx, sqliteQuery, args...)
+	}
+	return r.scanLatestUsedAtByUserIDs(ctx, query, pq.Array(userIDs))
+}
+
+func (r *userRepository) scanLatestUsedAtByUserIDs(ctx context.Context, query string, args ...any) (map[int64]*time.Time, error) {
+	result := make(map[int64]*time.Time)
+	rows, err := r.sql.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -738,7 +756,7 @@ func (r *userRepository) GetLatestUsedAtByUserIDs(ctx context.Context, userIDs [
 			userID     int64
 			lastUsedAt time.Time
 		)
-		if scanErr := rows.Scan(&userID, &lastUsedAt); scanErr != nil {
+		if scanErr := rows.Scan(&userID, dbtime.Dest(&lastUsedAt)); scanErr != nil {
 			return nil, scanErr
 		}
 		ts := lastUsedAt.UTC()
@@ -845,6 +863,26 @@ func (r *userRepository) UpdateBalance(ctx context.Context, id int64, amount flo
 }
 
 func (r *userRepository) ApplyRedeemBalanceAdjustment(ctx context.Context, id int64, delta float64) error {
+	if r.sqlite {
+		const updateSQL = `
+			UPDATE users
+			SET balance = MAX(balance + ?, 0), updated_at = ?
+			WHERE id = ? AND deleted_at IS NULL
+		`
+		client := clientFromContext(ctx, r.client)
+		result, err := client.ExecContext(ctx, updateSQL, delta, nowSQLiteUTC(), id)
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			return service.ErrUserNotFound
+		}
+		return nil
+	}
 	const updateSQL = `
 		UPDATE users
 		SET balance = GREATEST(balance + $1, 0), updated_at = NOW()
@@ -901,6 +939,9 @@ func (r *userRepository) DeductAvailableBalance(ctx context.Context, id int64, a
 	if amount < 0 {
 		return 0, fmt.Errorf("deduction amount must be nonnegative")
 	}
+	if r.sqlite {
+		return r.deductAvailableBalanceSQLite(ctx, id, amount)
+	}
 	const updateSQL = `
 		WITH target AS (
 			SELECT id, balance
@@ -937,10 +978,51 @@ func (r *userRepository) DeductAvailableBalance(ctx context.Context, id int64, a
 	return deducted, rows.Err()
 }
 
+// deductAvailableBalanceSQLite 是 DeductAvailableBalance 的 SQLite 方言实现。
+//
+// SQLite 的 UPDATE ... FROM 不支持在 FROM 子查询里引用被更新的表，因此先用
+// 条件更新原子扣除，再用同一事务内的 RETURNING 读取旧值。整个操作在
+// BEGIN IMMEDIATE 事务内完成，避免并发扣款相互覆盖。
+func (r *userRepository) deductAvailableBalanceSQLite(ctx context.Context, id int64, amount float64) (float64, error) {
+	if r.db == nil {
+		return 0, errors.New("user repository db is nil")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var oldBalance float64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT balance FROM users WHERE id = ? AND deleted_at IS NULL`, id,
+	).Scan(&oldBalance); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, service.ErrUserNotFound
+		}
+		return 0, err
+	}
+
+	deduct := math.Min(amount, math.Max(oldBalance, 0))
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE users SET balance = balance - ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+		deduct, nowSQLiteUTC(), id,
+	); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return deduct, nil
+}
+
 // AdjustBalance 原子地把 delta 累加到余额上，结果为负时整条语句不生效。
 // 相比"读余额 → 算新值 → 整行写回"，这里把读与写压进同一条 UPDATE，
 // 并发的计费扣款不会被旧快照覆盖。
 func (r *userRepository) AdjustBalance(ctx context.Context, id int64, delta float64) (service.BalanceChange, error) {
+	if r.sqlite {
+		return r.adjustBalanceSQLite(ctx, id, delta)
+	}
 	const updateSQL = `
 		UPDATE users
 		SET balance = balance + $1, updated_at = NOW()
@@ -963,6 +1045,46 @@ func (r *userRepository) AdjustBalance(ctx context.Context, id int64, delta floa
 	return service.BalanceChange{Old: current, New: current + delta}, service.ErrBalanceNegative
 }
 
+// adjustBalanceSQLite 是 AdjustBalance 的 SQLite 方言实现。
+//
+// SQLite 支持 UPDATE ... RETURNING，但不支持在 RETURNING 里读取更新前的值，
+// 因此在同一事务内先读旧余额，再条件更新；余额不足时返回 ErrBalanceNegative。
+func (r *userRepository) adjustBalanceSQLite(ctx context.Context, id int64, delta float64) (service.BalanceChange, error) {
+	if r.db == nil {
+		return service.BalanceChange{}, errors.New("user repository db is nil")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return service.BalanceChange{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var oldBalance float64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT balance FROM users WHERE id = ? AND deleted_at IS NULL`, id,
+	).Scan(&oldBalance); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return service.BalanceChange{}, service.ErrUserNotFound
+		}
+		return service.BalanceChange{}, err
+	}
+
+	newBalance := oldBalance + delta
+	if newBalance < 0 {
+		return service.BalanceChange{Old: oldBalance, New: newBalance}, service.ErrBalanceNegative
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE users SET balance = balance + ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+		delta, nowSQLiteUTC(), id,
+	); err != nil {
+		return service.BalanceChange{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return service.BalanceChange{}, err
+	}
+	return service.BalanceChange{Old: oldBalance, New: newBalance}, nil
+}
+
 // SetBalance 原子地把余额置为 value，并返回变更前后的值。
 func (r *userRepository) SetBalance(ctx context.Context, id int64, value float64) (service.BalanceChange, error) {
 	if value < 0 {
@@ -972,6 +1094,9 @@ func (r *userRepository) SetBalance(ctx context.Context, id int64, value float64
 			return service.BalanceChange{}, err
 		}
 		return service.BalanceChange{Old: current, New: value}, service.ErrBalanceNegative
+	}
+	if r.sqlite {
+		return r.setBalanceSQLite(ctx, id, value)
 	}
 	const updateSQL = `
 		UPDATE users AS u
@@ -988,6 +1113,38 @@ func (r *userRepository) SetBalance(ctx context.Context, id int64, value float64
 		return service.BalanceChange{}, service.ErrUserNotFound
 	}
 	return change, nil
+}
+
+// setBalanceSQLite 是 SetBalance 的 SQLite 方言实现。
+func (r *userRepository) setBalanceSQLite(ctx context.Context, id int64, value float64) (service.BalanceChange, error) {
+	if r.db == nil {
+		return service.BalanceChange{}, errors.New("user repository db is nil")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return service.BalanceChange{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var oldBalance float64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT balance FROM users WHERE id = ? AND deleted_at IS NULL`, id,
+	).Scan(&oldBalance); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return service.BalanceChange{}, service.ErrUserNotFound
+		}
+		return service.BalanceChange{}, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE users SET balance = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL`,
+		value, nowSQLiteUTC(), id,
+	); err != nil {
+		return service.BalanceChange{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return service.BalanceChange{}, err
+	}
+	return service.BalanceChange{Old: oldBalance, New: value}, nil
 }
 
 // currentBalance 读取用户当前余额，用户不存在时返回 ErrUserNotFound。
@@ -1050,6 +1207,25 @@ func (r *userRepository) UpdateConcurrency(ctx context.Context, id int64, amount
 }
 
 func (r *userRepository) ApplyRedeemConcurrencyAdjustment(ctx context.Context, id int64, delta int) error {
+	if r.sqlite {
+		const updateSQL = `
+			UPDATE users
+			SET concurrency = MAX(concurrency + ?, 0), updated_at = ?
+			WHERE id = ? AND deleted_at IS NULL
+		`
+		result, err := r.sql.ExecContext(ctx, updateSQL, delta, nowSQLiteUTC(), id)
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			return service.ErrUserNotFound
+		}
+		return nil
+	}
 	const updateSQL = `
 		UPDATE users
 		SET concurrency = GREATEST(concurrency + $1, 0), updated_at = NOW()
@@ -1077,6 +1253,20 @@ func (r *userRepository) BatchSetConcurrency(ctx context.Context, userIDs []int6
 	if value < 0 {
 		value = 0
 	}
+	if r.sqlite {
+		query, args, err := bindArrayArgs(r.db,
+			"UPDATE users SET concurrency = $1, updated_at = $2 WHERE id = ANY($3) AND deleted_at IS NULL",
+			[]any{value, nowSQLiteUTC(), userIDs})
+		if err != nil {
+			return 0, fmt.Errorf("batch set concurrency: %w", err)
+		}
+		res, err := r.sql.ExecContext(ctx, query, args...)
+		if err != nil {
+			return 0, fmt.Errorf("batch set concurrency: %w", err)
+		}
+		affected, _ := res.RowsAffected()
+		return int(affected), nil
+	}
 	res, err := r.sql.ExecContext(ctx,
 		"UPDATE users SET concurrency = $1, updated_at = NOW() WHERE id = ANY($2) AND deleted_at IS NULL",
 		value, pq.Array(userIDs))
@@ -1090,6 +1280,20 @@ func (r *userRepository) BatchSetConcurrency(ctx context.Context, userIDs []int6
 func (r *userRepository) BatchAddConcurrency(ctx context.Context, userIDs []int64, delta int) (int, error) {
 	if len(userIDs) == 0 {
 		return 0, nil
+	}
+	if r.sqlite {
+		query, args, err := bindArrayArgs(r.db,
+			"UPDATE users SET concurrency = MAX(concurrency + $1, 0), updated_at = $2 WHERE id = ANY($3) AND deleted_at IS NULL",
+			[]any{delta, nowSQLiteUTC(), userIDs})
+		if err != nil {
+			return 0, fmt.Errorf("batch add concurrency: %w", err)
+		}
+		res, err := r.sql.ExecContext(ctx, query, args...)
+		if err != nil {
+			return 0, fmt.Errorf("batch add concurrency: %w", err)
+		}
+		affected, _ := res.RowsAffected()
+		return int(affected), nil
 	}
 	res, err := r.sql.ExecContext(ctx,
 		"UPDATE users SET concurrency = GREATEST(concurrency + $1, 0), updated_at = NOW() WHERE id = ANY($2) AND deleted_at IS NULL",
@@ -1111,12 +1315,38 @@ func (r *userRepository) BatchUpdateLimits(ctx context.Context, userIDs []int64,
 	if concurrency != nil {
 		value := max(*concurrency, 0)
 		args = append(args, value)
-		setClauses = append(setClauses, fmt.Sprintf("concurrency = $%d", len(args)))
+		if r.sqlite {
+			setClauses = append(setClauses, "concurrency = ?")
+		} else {
+			setClauses = append(setClauses, fmt.Sprintf("concurrency = $%d", len(args)))
+		}
 	}
 	if rpmLimit != nil {
 		value := max(*rpmLimit, 0)
 		args = append(args, value)
-		setClauses = append(setClauses, fmt.Sprintf("rpm_limit = $%d", len(args)))
+		if r.sqlite {
+			setClauses = append(setClauses, "rpm_limit = ?")
+		} else {
+			setClauses = append(setClauses, fmt.Sprintf("rpm_limit = $%d", len(args)))
+		}
+	}
+	if r.sqlite {
+		setClauses = append(setClauses, "updated_at = ?")
+		userIDsJSON, err := json.Marshal(userIDs)
+		if err != nil {
+			return 0, fmt.Errorf("marshal user ids: %w", err)
+		}
+		args = append(args, nowSQLiteUTC(), string(userIDsJSON))
+		query := fmt.Sprintf(
+			"UPDATE users SET %s WHERE id IN (SELECT value FROM json_each(?)) AND deleted_at IS NULL",
+			strings.Join(setClauses, ", "),
+		)
+		res, err := r.sql.ExecContext(ctx, query, args...)
+		if err != nil {
+			return 0, fmt.Errorf("batch update user limits: %w", err)
+		}
+		affected, _ := res.RowsAffected()
+		return int(affected), nil
 	}
 	setClauses = append(setClauses, "updated_at = NOW()")
 	args = append(args, pq.Array(userIDs))

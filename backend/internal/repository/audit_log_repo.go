@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/dbtime"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/lib/pq"
 )
@@ -66,6 +67,10 @@ func (r *auditLogRepository) BatchInsert(ctx context.Context, logs []*service.Au
 		return 0, nil
 	}
 
+	if isSQLiteDB(r.db) {
+		return r.batchInsertSQLite(ctx, logs)
+	}
+
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -109,6 +114,40 @@ func (r *auditLogRepository) BatchInsert(ctx context.Context, logs []*service.Au
 	return inserted, nil
 }
 
+func (r *auditLogRepository) batchInsertSQLite(ctx context.Context, logs []*service.AuditLog) (int64, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO audit_logs (`+auditLogInsertColumns+`)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = stmt.Close() }()
+
+	var inserted int64
+	for _, log := range logs {
+		if log == nil {
+			continue
+		}
+		if _, err = stmt.ExecContext(ctx, auditLogInsertValues(log)...); err != nil {
+			return inserted, err
+		}
+		inserted++
+	}
+	if err = tx.Commit(); err != nil {
+		return inserted, err
+	}
+	return inserted, nil
+}
+
 func (r *auditLogRepository) Insert(ctx context.Context, log *service.AuditLog) error {
 	if r == nil || r.db == nil {
 		return fmt.Errorf("nil audit log repository")
@@ -122,7 +161,7 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`
 	return err
 }
 
-func buildAuditLogsWhere(filter *service.AuditLogFilter) (string, []any) {
+func buildAuditLogsWhere(filter *service.AuditLogFilter, sqlite bool) (string, []any) {
 	clauses := make([]string, 0, 10)
 	args := make([]any, 0, 10)
 	clauses = append(clauses, "1=1")
@@ -141,7 +180,7 @@ func buildAuditLogsWhere(filter *service.AuditLogFilter) (string, []any) {
 	}
 	if v := strings.TrimSpace(filter.ActorEmail); v != "" {
 		args = append(args, "%"+escapeLikePattern(v)+"%")
-		clauses = append(clauses, "l.actor_email ILIKE $"+itoa(len(args)))
+		clauses = append(clauses, auditLike("l.actor_email", sqlite, itoa(len(args))))
 	}
 	if v := strings.TrimSpace(filter.AuthMethod); v != "" {
 		args = append(args, v)
@@ -149,7 +188,7 @@ func buildAuditLogsWhere(filter *service.AuditLogFilter) (string, []any) {
 	}
 	if v := strings.TrimSpace(filter.Action); v != "" {
 		args = append(args, "%"+escapeLikePattern(v)+"%")
-		clauses = append(clauses, "l.action ILIKE $"+itoa(len(args)))
+		clauses = append(clauses, auditLike("l.action", sqlite, itoa(len(args))))
 	}
 	if v := strings.TrimSpace(filter.Method); v != "" {
 		args = append(args, strings.ToUpper(v))
@@ -169,10 +208,20 @@ func buildAuditLogsWhere(filter *service.AuditLogFilter) (string, []any) {
 	if v := strings.TrimSpace(filter.Query); v != "" {
 		args = append(args, "%"+escapeLikePattern(v)+"%")
 		idx := itoa(len(args))
-		clauses = append(clauses, "(l.path ILIKE $"+idx+" OR l.action ILIKE $"+idx+" OR l.actor_email ILIKE $"+idx+")")
+		clauses = append(clauses,
+			"("+auditLike("l.path", sqlite, idx)+
+				" OR "+auditLike("l.action", sqlite, idx)+
+				" OR "+auditLike("l.actor_email", sqlite, idx)+")")
 	}
 
 	return "WHERE " + strings.Join(clauses, " AND "), args
+}
+
+func auditLike(column string, sqlite bool, placeholder string) string {
+	if sqlite {
+		return "LOWER(" + column + ") LIKE LOWER($" + placeholder + ")"
+	}
+	return column + " ILIKE $" + placeholder
 }
 
 const auditLogSelectColumns = `
@@ -192,7 +241,7 @@ const auditLogSelectColumns = `
   COALESCE(l.request_body, ''),
   l.status_code,
   l.latency_ms,
-  COALESCE(l.extra::text, '{}')`
+  COALESCE(l.extra, '{}')`
 
 func scanAuditLogRow(scan func(dest ...any) error) (*service.AuditLog, error) {
 	item := &service.AuditLog{}
@@ -200,7 +249,7 @@ func scanAuditLogRow(scan func(dest ...any) error) (*service.AuditLog, error) {
 	var extraRaw string
 	if err := scan(
 		&item.ID,
-		&item.CreatedAt,
+		dbtime.Dest(&item.CreatedAt),
 		&actorUserID,
 		&item.ActorEmail,
 		&item.ActorRole,
@@ -253,7 +302,7 @@ func (r *auditLogRepository) List(ctx context.Context, filter *service.AuditLogF
 		pageSize = 200
 	}
 
-	where, args := buildAuditLogsWhere(filter)
+	where, args := buildAuditLogsWhere(filter, isSQLiteDB(r.db))
 	countSQL := "SELECT COUNT(*) FROM audit_logs l " + where
 	var total int
 	if err := r.db.QueryRowContext(ctx, countSQL, args...).Scan(&total); err != nil {
@@ -325,7 +374,11 @@ func (r *auditLogRepository) TruncateAll(ctx context.Context) error {
 	if r == nil || r.db == nil {
 		return fmt.Errorf("nil audit log repository")
 	}
-	_, err := r.db.ExecContext(ctx, "TRUNCATE TABLE audit_logs")
+	query := "TRUNCATE TABLE audit_logs"
+	if isSQLiteDB(r.db) {
+		query = "DELETE FROM audit_logs"
+	}
+	_, err := r.db.ExecContext(ctx, query)
 	return err
 }
 

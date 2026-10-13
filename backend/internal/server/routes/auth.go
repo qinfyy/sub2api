@@ -24,9 +24,12 @@ func RegisterAuthRoutes(
 	limiters ...*middleware.RateLimiter,
 ) {
 	// 创建速率限制器
-	rateLimiter := middleware.NewRateLimiter(redisClient)
-	if len(limiters) > 0 && limiters[0] != nil {
+	var rateLimiter *middleware.RateLimiter
+	if len(limiters) > 0 {
 		rateLimiter = limiters[0]
+	}
+	if rateLimiter == nil {
+		rateLimiter = middleware.NewRateLimiter(redisClient)
 	}
 
 	// 公开接口

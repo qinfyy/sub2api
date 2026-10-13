@@ -31,7 +31,7 @@ func (r *opsRepository) GetOpenAITokenStats(ctx context.Context, filter *service
 		GroupID:   filter.GroupID,
 	}
 
-	join, where, baseArgs, next := buildUsageWhere(dashboardFilter, dashboardFilter.StartTime, dashboardFilter.EndTime, 1)
+	join, where, baseArgs, next := buildUsageWhere(dashboardFilter, dashboardFilter.StartTime, dashboardFilter.EndTime, 1, isSQLiteDB(r.db))
 
 	baseCTE := `
 WITH stats AS (

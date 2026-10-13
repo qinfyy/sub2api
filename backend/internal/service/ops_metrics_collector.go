@@ -37,8 +37,6 @@ const (
 	bytesPerMB = 1024 * 1024
 )
 
-var opsMetricsCollectorAdvisoryLockID = hashAdvisoryLockID(opsMetricsCollectorLeaderLockKey)
-
 type opsSchedulableAccountLoadRepository interface {
 	ListSchedulableAccountLoads(ctx context.Context) ([]AccountWithConcurrency, error)
 }
@@ -54,6 +52,9 @@ type OpsMetricsCollector struct {
 	db          *sql.DB
 	redisClient *redis.Client
 	instanceID  string
+	leaderLock  LeaderLockCache
+	memoryCache bool
+	sqlite      bool
 
 	lastCgroupCPUUsageNanos uint64
 	lastCgroupCPUSampleAt   time.Time
@@ -73,6 +74,8 @@ func NewOpsMetricsCollector(
 	concurrencyService *ConcurrencyService,
 	db *sql.DB,
 	redisClient *redis.Client,
+	leaderLock LeaderLockCache,
+	memoryCache bool,
 	cfg *config.Config,
 ) *OpsMetricsCollector {
 	return &OpsMetricsCollector{
@@ -83,8 +86,21 @@ func NewOpsMetricsCollector(
 		concurrencyService: concurrencyService,
 		db:                 db,
 		redisClient:        redisClient,
+		leaderLock:         leaderLock,
+		memoryCache:        memoryCache,
+		sqlite:             cfg != nil && cfg.Database.IsSQLite(),
 		instanceID:         uuid.NewString(),
 	}
+}
+
+// SetLeaderLock lets tests and legacy constructors inject the shared lock
+// backend after construction.
+func (c *OpsMetricsCollector) SetLeaderLock(lock LeaderLockCache, memoryCache bool) {
+	if c == nil {
+		return
+	}
+	c.leaderLock = lock
+	c.memoryCache = memoryCache
 }
 
 func (c *OpsMetricsCollector) Start() {
@@ -270,7 +286,7 @@ func (c *OpsMetricsCollector) collectAndPersist(ctx context.Context) error {
 	}
 
 	dbOK := c.checkDB(ctx)
-	redisOK := c.checkRedis(ctx)
+	redisOK := c.checkCache(ctx)
 	active, idle := c.dbPoolStats()
 	redisTotal, redisIdle, redisStatsOK := c.redisPoolStats()
 
@@ -444,6 +460,9 @@ type opsCollectedPercentiles struct {
 }
 
 func (c *OpsMetricsCollector) queryUsageCounts(ctx context.Context, start, end time.Time) (successCount int64, tokenConsumed int64, err error) {
+	if c.sqlite {
+		return c.queryUsageCountsSQLite(ctx, start, end)
+	}
 	q := `
 SELECT
   COALESCE(COUNT(*), 0) AS success_count,
@@ -462,6 +481,9 @@ WHERE created_at >= $1 AND created_at < $2`
 }
 
 func (c *OpsMetricsCollector) queryUsageLatency(ctx context.Context, start, end time.Time) (duration opsCollectedPercentiles, ttft opsCollectedPercentiles, err error) {
+	if c.sqlite {
+		return c.queryUsageLatencySQLite(ctx, start, end)
+	}
 	{
 		q := `
 SELECT
@@ -540,6 +562,9 @@ func (c *OpsMetricsCollector) queryErrorCounts(ctx context.Context, start, end t
 	upstream529 int64,
 	err error,
 ) {
+	if c.sqlite {
+		return c.queryErrorCountsSQLite(ctx, start, end)
+	}
 	q := `
 SELECT
   COALESCE(COUNT(*) FILTER (WHERE COALESCE(status_code, 0) >= 400), 0) AS error_total,
@@ -566,6 +591,9 @@ WHERE created_at >= $1 AND created_at < $2
 }
 
 func (c *OpsMetricsCollector) queryAccountSwitchCount(ctx context.Context, start, end time.Time) (int64, error) {
+	if c.sqlite {
+		return c.queryAccountSwitchCountSQLite(ctx, start, end)
+	}
 	q := `
 SELECT
   COALESCE(SUM(CASE
@@ -578,6 +606,118 @@ CROSS JOIN LATERAL jsonb_array_elements(
 ) AS ev
 WHERE o.created_at >= $1 AND o.created_at < $2
   AND o.is_count_tokens = FALSE`
+
+	var count int64
+	if err := c.db.QueryRowContext(ctx, q, start, end).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (c *OpsMetricsCollector) queryUsageCountsSQLite(ctx context.Context, start, end time.Time) (successCount int64, tokenConsumed int64, err error) {
+	q := `
+SELECT
+  COUNT(*),
+  COALESCE(SUM(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens), 0)
+FROM usage_logs
+WHERE created_at >= ? AND created_at < ?`
+	var tokens sql.NullInt64
+	if err := c.db.QueryRowContext(ctx, q, start, end).Scan(&successCount, &tokens); err != nil {
+		return 0, 0, err
+	}
+	if tokens.Valid {
+		tokenConsumed = tokens.Int64
+	}
+	return successCount, tokenConsumed, nil
+}
+
+func (c *OpsMetricsCollector) queryUsageLatencySQLite(ctx context.Context, start, end time.Time) (duration opsCollectedPercentiles, ttft opsCollectedPercentiles, err error) {
+	query := func(column string) (opsCollectedPercentiles, error) {
+		q := `
+SELECT
+  AVG(` + column + `),
+  MAX(` + column + `),
+  COUNT(` + column + `)
+FROM usage_logs
+WHERE created_at >= ? AND created_at < ?
+  AND ` + column + ` IS NOT NULL`
+		var avg sql.NullFloat64
+		var max sql.NullInt64
+		var count int64
+		if err := c.db.QueryRowContext(ctx, q, start, end).Scan(&avg, &max, &count); err != nil {
+			return opsCollectedPercentiles{}, err
+		}
+		out := opsCollectedPercentiles{}
+		if avg.Valid {
+			v := roundTo1DP(avg.Float64)
+			out.avg = &v
+		}
+		if max.Valid {
+			v := int(max.Int64)
+			out.max = &v
+		}
+		return out, nil
+	}
+	duration, err = query("duration_ms")
+	if err != nil {
+		return opsCollectedPercentiles{}, opsCollectedPercentiles{}, err
+	}
+	ttft, err = query("first_token_ms")
+	if err != nil {
+		return opsCollectedPercentiles{}, opsCollectedPercentiles{}, err
+	}
+	return duration, ttft, nil
+}
+
+func (c *OpsMetricsCollector) queryErrorCountsSQLite(ctx context.Context, start, end time.Time) (
+	errorTotal int64,
+	businessLimited int64,
+	errorSLA int64,
+	upstreamExcl429529 int64,
+	upstream429 int64,
+	upstream529 int64,
+	err error,
+) {
+	q := `
+SELECT
+  COALESCE(SUM(CASE WHEN COALESCE(status_code, 0) >= 400 THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN COALESCE(status_code, 0) >= 400 AND is_business_limited = 1 THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN COALESCE(status_code, 0) >= 400 AND is_business_limited = 0 THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN error_owner = 'provider' AND is_business_limited = 0 AND COALESCE(upstream_status_code, status_code, 0) NOT IN (429, 529) THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN error_owner = 'provider' AND is_business_limited = 0 AND COALESCE(upstream_status_code, status_code, 0) = 429 THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN error_owner = 'provider' AND is_business_limited = 0 AND COALESCE(upstream_status_code, status_code, 0) = 529 THEN 1 ELSE 0 END), 0)
+FROM ops_error_logs
+WHERE created_at >= ? AND created_at < ?
+  AND is_count_tokens = 0`
+
+	if err := c.db.QueryRowContext(ctx, q, start, end).Scan(
+		&errorTotal,
+		&businessLimited,
+		&errorSLA,
+		&upstreamExcl429529,
+		&upstream429,
+		&upstream529,
+	); err != nil {
+		return 0, 0, 0, 0, 0, 0, err
+	}
+	return errorTotal, businessLimited, errorSLA, upstreamExcl429529, upstream429, upstream529, nil
+}
+
+func (c *OpsMetricsCollector) queryAccountSwitchCountSQLite(ctx context.Context, start, end time.Time) (int64, error) {
+	q := `
+SELECT COALESCE(SUM(
+  CASE
+    WHEN instr(COALESCE(upstream_errors, ''), '"kind"') > 0
+     AND (instr(COALESCE(upstream_errors, ''), 'failover') > 0
+       OR instr(COALESCE(upstream_errors, ''), 'retry_exhausted_failover') > 0
+       OR instr(COALESCE(upstream_errors, ''), 'failover_on_400') > 0)
+    THEN 1
+    ELSE 0
+  END
+), 0)
+FROM ops_error_logs
+WHERE created_at >= ? AND created_at < ?
+  AND is_count_tokens = 0`
 
 	var count int64
 	if err := c.db.QueryRowContext(ctx, q, start, end).Scan(&count); err != nil {
@@ -848,8 +988,14 @@ func (c *OpsMetricsCollector) checkDB(ctx context.Context) bool {
 	return one == 1
 }
 
-func (c *OpsMetricsCollector) checkRedis(ctx context.Context) bool {
-	if c == nil || c.redisClient == nil {
+func (c *OpsMetricsCollector) checkCache(ctx context.Context) bool {
+	if c == nil {
+		return false
+	}
+	if c.memoryCache {
+		return true
+	}
+	if c.redisClient == nil {
 		return false
 	}
 	if ctx == nil {
@@ -877,41 +1023,14 @@ func (c *OpsMetricsCollector) dbPoolStats() (active int, idle int) {
 	return stats.InUse, stats.Idle
 }
 
-var opsMetricsCollectorReleaseScript = redis.NewScript(`
-if redis.call("GET", KEYS[1]) == ARGV[1] then
-  return redis.call("DEL", KEYS[1])
-end
-return 0
-`)
-
 func (c *OpsMetricsCollector) tryAcquireLeaderLock(ctx context.Context) (func(), bool) {
-	if c == nil || c.redisClient == nil {
-		return nil, true
+	if c == nil {
+		return nil, false
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	ok, err := c.redisClient.SetNX(ctx, opsMetricsCollectorLeaderLockKey, c.instanceID, opsMetricsCollectorLeaderLockTTL).Result()
-	if err != nil {
-		// Prefer fail-closed to avoid stampeding the database when Redis is flaky.
-		// Fallback to a DB advisory lock when Redis is present but unavailable.
-		release, ok := tryAcquireDBAdvisoryLock(ctx, c.db, opsMetricsCollectorAdvisoryLockID)
-		if !ok {
-			c.maybeLogSkip()
-			return nil, false
-		}
-		return release, true
-	}
+	release, ok := tryAcquireSingletonLeaderLock(ctx, c.leaderLock, c.db, opsMetricsCollectorLeaderLockKey, c.instanceID, opsMetricsCollectorLeaderLockTTL)
 	if !ok {
 		c.maybeLogSkip()
 		return nil, false
-	}
-
-	release := func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_, _ = opsMetricsCollectorReleaseScript.Run(ctx, c.redisClient, []string{opsMetricsCollectorLeaderLockKey}, c.instanceID).Result()
 	}
 	return release, true
 }

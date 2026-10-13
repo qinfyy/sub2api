@@ -3,6 +3,7 @@ package logger
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -99,6 +100,9 @@ func resolveLogFilePath(explicit string) string {
 	dataDir := strings.TrimSpace(os.Getenv("DATA_DIR"))
 	if dataDir != "" {
 		return filepath.Join(dataDir, "logs", defaultLogFilename)
+	}
+	if runtime.GOOS == "windows" {
+		return filepath.Join("logs", defaultLogFilename)
 	}
 	return DefaultContainerLogPath
 }

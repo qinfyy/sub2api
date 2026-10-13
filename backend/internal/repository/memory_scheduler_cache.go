@@ -32,10 +32,7 @@ const memoryBucketPrefix = "memory:scheduler:bucket:"
 
 func NewMemorySchedulerCache(core *memoryCacheCore, db *sql.DB) service.SchedulerCache {
 	core = memoryAssertCore(core)
-	c := &memorySchedulerCache{core: core, state: memoryKVBackend{core: core}}
-	if db != nil {
-		c.state.db = db
-	}
+	c := &memorySchedulerCache{core: core, state: *newMemoryKVBackend(core, db)}
 	return c
 }
 func (c *memorySchedulerCache) bucketState(ctx context.Context, b service.SchedulerBucket) (memoryBucketState, error) {
@@ -241,7 +238,7 @@ func (c *memorySchedulerCache) UnlockBucket(ctx context.Context, b service.Sched
 func (c *memorySchedulerCache) ListBuckets(ctx context.Context) ([]service.SchedulerBucket, error) {
 	var keys []string
 	if c.state.db != nil {
-		rows, err := c.state.db.QueryContext(ctx, `SELECT key FROM kv_store WHERE key>=? AND key<? ORDER BY key`, memoryBucketPrefix, memoryBucketPrefix+"\uffff")
+		rows, err := c.state.db.QueryContext(ctx, `SELECT key FROM kv_store WHERE key>=$1 AND key<$2 ORDER BY key`, memoryBucketPrefix, memoryBucketPrefix+"\uffff")
 		if err != nil {
 			return nil, err
 		}

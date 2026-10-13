@@ -20,10 +20,7 @@ type memoryBillingCache struct {
 
 func NewMemoryBillingCache(core *memoryCacheCore, db *sql.DB) service.BillingCache {
 	core = memoryAssertCore(core)
-	c := &memoryBillingCache{core: core, state: memoryKVBackend{core: core}}
-	if db != nil {
-		c.state.db = db
-	}
+	c := &memoryBillingCache{core: core, state: *newMemoryKVBackend(core, db)}
 	return c
 }
 
@@ -294,7 +291,11 @@ func (c *memoryBillingCache) PopDirtyUserPlatformQuotaKeys(ctx context.Context, 
 	const prefix = "billing:user_platform_quota:"
 	var candidates []string
 	if c.state.db != nil {
-		rows, err := c.state.db.QueryContext(ctx, `SELECT key FROM kv_store WHERE key >= ? AND key < ? AND (expires_at IS NULL OR expires_at > ?) AND json_extract(CAST(value AS TEXT), '$.Dirty') = 1 AND COALESCE(json_extract(CAST(value AS TEXT), '$.ClaimedUntil'), 0) <= ? ORDER BY key LIMIT ?`, prefix, prefix+"\uffff", time.Now().UnixMilli(), time.Now().UnixMilli(), n)
+		query := `SELECT key FROM kv_store WHERE key >= $1 AND key < $2 AND (expires_at IS NULL OR expires_at > $3) AND json_extract(CAST(value AS TEXT), '$.Dirty') = 1 AND COALESCE(json_extract(CAST(value AS TEXT), '$.ClaimedUntil'), 0) <= $4 ORDER BY key LIMIT $5`
+		if db, ok := c.state.db.(*sql.DB); ok && isPostgresDB(db) {
+			query = `SELECT key FROM kv_store WHERE key >= $1 AND key < $2 AND (expires_at IS NULL OR expires_at > $3) AND (convert_from(value, 'UTF8')::jsonb->>'Dirty')::boolean IS TRUE AND COALESCE((convert_from(value, 'UTF8')::jsonb->>'ClaimedUntil')::bigint, 0) <= $4 ORDER BY key LIMIT $5`
+		}
+		rows, err := c.state.db.QueryContext(ctx, query, prefix, prefix+"\uffff", time.Now().UnixMilli(), time.Now().UnixMilli(), n)
 		if err != nil {
 			return nil, err
 		}

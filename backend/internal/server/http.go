@@ -12,6 +12,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/handler"
 	ratelimit "github.com/Wei-Shaw/sub2api/internal/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/websearch"
+	"github.com/Wei-Shaw/sub2api/internal/repository"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 
@@ -43,6 +44,7 @@ func ProvideRouter(
 	settingService *service.SettingService,
 	compositeResolver *service.CompositeRouteResolver,
 	redisClient *redis.Client,
+	resources *repository.BackendResources,
 	limiter *ratelimit.RateLimiter,
 ) *gin.Engine {
 	if cfg.Server.Mode == "release" {
@@ -52,6 +54,16 @@ func ProvideRouter(
 	r := gin.New()
 	r.Use(middleware2.Recovery())
 	configureTrustedProxies(r, cfg.Server)
+
+	// Build the quota store once. In memory mode the manager is rebuilt on every
+	// config save, so recreating the store here would silently drop counters and
+	// proxy-unavailable state on each save.
+	var webSearchQuotaStore websearch.QuotaStore
+	if resources != nil && resources.MemoryCacheEnabled() {
+		webSearchQuotaStore = websearch.NewMemoryQuotaStore()
+	} else {
+		webSearchQuotaStore = websearch.NewRedisQuotaStore(redisClient)
+	}
 
 	// Wire up websearch Manager builder so it initializes on startup and rebuilds on config save.
 	settingService.SetWebSearchManagerBuilder(context.Background(), func(cfg *service.WebSearchEmulationConfig, proxyURLs map[int64]string) {
@@ -86,7 +98,7 @@ func ProvideRouter(
 			}
 			configs = append(configs, pc)
 		}
-		service.SetWebSearchManager(websearch.NewManager(configs, redisClient))
+		service.SetWebSearchManager(websearch.NewManagerWithStore(configs, webSearchQuotaStore))
 	})
 
 	return SetupRouter(r, handlers, jwtAuth, optionalJWTAuth, adminAuth, apiKeyAuth, auditLog, stepUpAuth, apiKeyService, subscriptionService, opsService, settingService, compositeResolver, cfg, redisClient, limiter)

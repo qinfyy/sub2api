@@ -2,8 +2,10 @@ package repository
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
@@ -47,6 +49,25 @@ const (
 	AND type = 'apikey'
 	AND jsonb_typeof(credentials -> 'api_key') = 'string'
 `
+	sqliteOpenCodeGoUsageEligibleSQL = `
+	(
+		(platform = 'opencode_go'
+			AND COALESCE(btrim(credentials ->> 'account_mode') <> 'zen', true))
+		OR (platform IN (` + opencodeGoUsageMountPlatformsSQL + `)
+			AND lower(btrim(COALESCE(credentials ->> 'base_url', ''))) IN (
+				'https://opencode.ai/zen/go',
+				'https://opencode.ai/zen/go/',
+				'https://opencode.ai/zen/go/v1',
+				'https://opencode.ai/zen/go/v1/',
+				'https://opencode.ai:443/zen/go',
+				'https://opencode.ai:443/zen/go/',
+				'https://opencode.ai:443/zen/go/v1',
+				'https://opencode.ai:443/zen/go/v1/'
+			))
+	)
+	AND type = 'apikey'
+	AND jsonb_typeof(credentials -> 'api_key') = 'string'
+`
 )
 
 // ListOpenCodeGoUsageGroupAccounts resolves every sibling for all supplied
@@ -75,14 +96,27 @@ func (r *accountRepository) ListOpenCodeGoUsageGroupAccounts(ctx context.Context
 	if len(keys) == 0 {
 		return []service.Account{}, nil
 	}
-	rows, err := r.sql.QueryContext(ctx, `
+	eligible := opencodeGoUsageEligibleSQL
+	if r.sqlite {
+		eligible = sqliteOpenCodeGoUsageEligibleSQL
+	}
+	query := `
 		SELECT id
 		FROM accounts
 		WHERE deleted_at IS NULL
-			AND `+opencodeGoUsageEligibleSQL+`
+			AND ` + eligible + `
 			AND credentials ->> 'api_key' = ANY($1)
 		ORDER BY id
-	`, pq.Array(keys))
+	`
+	args := []any{arrayArg(r.sqlite, keys)}
+	if r.sqlite {
+		var err error
+		query, args, err = bindArrayArgsForSQLite(query, args)
+		if err != nil {
+			return nil, err
+		}
+	}
+	rows, err := r.sql.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +241,7 @@ func (r *accountRepository) updateOpenCodeGoUsageGroup(
 		if !matchesProxy {
 			return service.ErrOpenCodeGoUsageIdentityChanged
 		}
-		members, err := lockOpenCodeGoUsageGroup(txCtx, client, account, apiKey)
+		members, err := r.lockOpenCodeGoUsageGroup(txCtx, client, account, apiKey)
 		if err != nil {
 			return err
 		}
@@ -247,20 +281,46 @@ func (r *accountRepository) updateOpenCodeGoUsageGroup(
 		for index := range members {
 			memberIDs[index] = members[index].id
 		}
-		mergeExpr := "COALESCE(extra, '{}'::jsonb)"
-		for _, key := range deleteKeys {
-			mergeExpr += " - " + pq.QuoteLiteral(key)
+		var result interface {
+			RowsAffected() (int64, error)
 		}
-		mergeExpr += " || $1::jsonb"
-		result, err := client.ExecContext(txCtx, `
-			UPDATE accounts
-			SET extra = `+mergeExpr+`,
-				updated_at = NOW()
-			WHERE deleted_at IS NULL
-				AND `+opencodeGoUsageEligibleSQL+`
-				AND credentials ->> 'api_key' = $2
-				AND id = ANY($3)
-		`, string(encoded), apiKey, pq.Array(memberIDs))
+		if r.sqlite {
+			memberJSON, err := jsonArrayArg(memberIDs)
+			if err != nil {
+				return err
+			}
+			removePaths := ""
+			for _, key := range deleteKeys {
+				removePaths += ", '$." + strings.ReplaceAll(key, "'", "''") + "'"
+			}
+			result, err = client.ExecContext(txCtx, `
+				UPDATE accounts
+				SET extra = json_patch(
+						json_remove(COALESCE(extra, '{}')`+removePaths+`),
+						?
+					),
+					updated_at = NOW()
+				WHERE deleted_at IS NULL
+					AND `+sqliteOpenCodeGoUsageEligibleSQL+`
+					AND credentials ->> 'api_key' = ?
+					AND id IN (SELECT value FROM json_each(?))
+			`, string(encoded), apiKey, memberJSON)
+		} else {
+			mergeExpr := "COALESCE(extra, '{}'::jsonb)"
+			for _, key := range deleteKeys {
+				mergeExpr += " - " + pq.QuoteLiteral(key)
+			}
+			mergeExpr += " || $1::jsonb"
+			result, err = client.ExecContext(txCtx, `
+				UPDATE accounts
+				SET extra = `+mergeExpr+`,
+					updated_at = NOW()
+				WHERE deleted_at IS NULL
+					AND `+opencodeGoUsageEligibleSQL+`
+					AND credentials ->> 'api_key' = $2
+					AND id = ANY($3)
+			`, string(encoded), apiKey, pq.Array(memberIDs))
+		}
 		if err != nil {
 			return err
 		}
@@ -291,7 +351,7 @@ func (r *accountRepository) updateOpenCodeGoUsageGroup(
 	return tx.Commit()
 }
 
-func lockOpenCodeGoUsageGroup(
+func (r *accountRepository) lockOpenCodeGoUsageGroup(
 	ctx context.Context,
 	client *dbent.Client,
 	account *service.Account,
@@ -304,6 +364,29 @@ func lockOpenCodeGoUsageGroup(
 	var proxyID any
 	if account.ProxyID != nil {
 		proxyID = *account.ProxyID
+	}
+	if r.sqlite {
+		rows, err := client.QueryContext(ctx, `
+			SELECT
+				id,
+				id = ?
+					AND platform = ?
+					AND type = ?
+					AND json(credentials) = json(?)
+					AND proxy_id IS ?,
+				COALESCE(extra -> 'opencode_go_usage_auto_refresh', 'null'),
+				COALESCE(extra -> 'opencode_go_usage_snapshot', 'null')
+			FROM accounts
+			WHERE deleted_at IS NULL
+				AND `+sqliteOpenCodeGoUsageEligibleSQL+`
+				AND credentials ->> 'api_key' = ?
+			ORDER BY id
+		`, account.ID, account.Platform, account.Type, string(credentials), proxyID, apiKey)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = rows.Close() }()
+		return scanLockedOpenCodeGoUsageMembers(rows)
 	}
 	rows, err := client.QueryContext(ctx, `
 		SELECT
@@ -326,6 +409,10 @@ func lockOpenCodeGoUsageGroup(
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
+	return scanLockedOpenCodeGoUsageMembers(rows)
+}
+
+func scanLockedOpenCodeGoUsageMembers(rows *sql.Rows) ([]lockedOpenCodeGoUsageMember, error) {
 	members := make([]lockedOpenCodeGoUsageMember, 0, 1)
 	for rows.Next() {
 		var member lockedOpenCodeGoUsageMember
@@ -372,6 +459,14 @@ func (r *accountRepository) ListDueOpenCodeGoUsageAccounts(
 	}
 	if maxWait <= 0 {
 		maxWait = 15 * time.Minute
+	}
+	if r.sqlite {
+		return r.listDueSQLiteUsageAccounts(ctx, now, debounce, maxWait, limit, sqliteDueUsageQuery{
+			eligibleSQL:      sqliteOpenCodeGoUsageEligibleSQL,
+			snapshotKey:      service.OpenCodeGoUsageSnapshotExtraKey,
+			autoRefreshKey:   service.OpenCodeGoUsageAutoRefreshExtraKey,
+			minFetchInterval: service.OpenCodeGoUsageMinFetchInterval,
+		})
 	}
 	debounceSeconds := debounce.Seconds()
 	maxWaitSeconds := maxWait.Seconds()

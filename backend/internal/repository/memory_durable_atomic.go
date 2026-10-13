@@ -8,6 +8,9 @@ import (
 )
 
 func (b *memoryKVBackend) setNX(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+	if b.state != nil {
+		return b.state.setNX(ctx, key, value, ttl)
+	}
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -19,9 +22,9 @@ func (b *memoryKVBackend) setNX(ctx context.Context, key string, value []byte, t
 		expires = time.Now().Add(ttl).UnixMilli()
 	}
 	var returned string
-	err := b.db.QueryRowContext(ctx, `INSERT INTO kv_store(key,value,expires_at,updated_at) VALUES(?,?,?,?)
+	err := b.db.QueryRowContext(ctx, `INSERT INTO kv_store(key,value,expires_at,updated_at) VALUES($1,$2,$3,$4)
 ON CONFLICT(key) DO UPDATE SET value=excluded.value,expires_at=excluded.expires_at,updated_at=excluded.updated_at
-WHERE kv_store.expires_at IS NOT NULL AND kv_store.expires_at<=?
+WHERE kv_store.expires_at IS NOT NULL AND kv_store.expires_at<=$5
 RETURNING key`, key, value, expires, time.Now().UTC().Format(time.RFC3339Nano), time.Now().UnixMilli()).Scan(&returned)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil

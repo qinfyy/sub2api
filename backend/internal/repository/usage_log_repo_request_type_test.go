@@ -899,6 +899,13 @@ func (s usageLogScannerStub) Scan(dest ...any) error {
 	for i := range dest {
 		dv := reflect.ValueOf(dest[i])
 		if dv.Kind() != reflect.Pointer {
+			// database/sql also accepts Scanner implementations with value receivers.
+			if scanner, ok := dest[i].(sql.Scanner); ok {
+				if err := scanner.Scan(s.values[i]); err != nil {
+					return err
+				}
+				continue
+			}
 			return fmt.Errorf("dest[%d] is not pointer", i)
 		}
 		dv.Elem().Set(reflect.ValueOf(s.values[i]))

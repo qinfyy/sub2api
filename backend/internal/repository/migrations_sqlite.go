@@ -105,7 +105,7 @@ func applySQLiteMigrationFiles(ctx context.Context, db *sql.DB, files []sqliteMi
 			continue
 		}
 
-		sum := sha256.Sum256([]byte(content))
+		sum := sha256.Sum256([]byte(strings.ReplaceAll(content, "\r\n", "\n")))
 		checksum := hex.EncodeToString(sum[:])
 
 		var existing string
@@ -116,11 +116,13 @@ func applySQLiteMigrationFiles(ctx context.Context, db *sql.DB, files []sqliteMi
 		switch {
 		case rowErr == nil:
 			if existing != checksum {
-				return fmt.Errorf(
-					"migration %s checksum mismatch (db=%s file=%s)\n"+
-						"SQLite 迁移与已应用记录不一致，请新增迁移文件而不是修改历史迁移",
-					file.name, existing, checksum,
-				)
+				if !matchesSQLiteMigrationLineEndings(content, existing) {
+					return fmt.Errorf(
+						"migration %s checksum mismatch (db=%s file=%s)\n"+
+							"SQLite 迁移与已应用记录不一致，请新增迁移文件而不是修改历史迁移",
+						file.name, existing, checksum,
+					)
+				}
 			}
 			continue
 		case errors.Is(rowErr, sql.ErrNoRows):
@@ -138,7 +140,7 @@ func applySQLiteMigrationFiles(ctx context.Context, db *sql.DB, files []sqliteMi
 			return fmt.Errorf("begin migration %s: %w", file.name, err)
 		}
 
-		if _, err := tx.ExecContext(ctx, content); err != nil {
+		if err := execSQLiteMigrationContent(ctx, tx, content); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("apply migration %s: %w", file.name, err)
 		}
@@ -158,6 +160,74 @@ func applySQLiteMigrationFiles(ctx context.Context, db *sql.DB, files []sqliteMi
 	}
 
 	return nil
+}
+
+// Earlier builds hashed checkout line endings. Accept the exact same SQL in
+// LF/CRLF form without rewriting the ledger or accepting actual schema changes.
+func matchesSQLiteMigrationLineEndings(content, recorded string) bool {
+	lf := strings.ReplaceAll(content, "\r\n", "\n")
+	for _, variant := range []string{lf, strings.ReplaceAll(lf, "\n", "\r\n")} {
+		sum := sha256.Sum256([]byte(variant))
+		if hex.EncodeToString(sum[:]) == recorded {
+			return true
+		}
+	}
+	return false
+}
+
+// execSQLiteMigrationContent executes SQLite migration DDL. SQLite does not
+// support ADD COLUMN IF NOT EXISTS, so the runner skips an ADD COLUMN when the
+// target column already exists. The rest of the file executes as one script.
+func execSQLiteMigrationContent(ctx context.Context, tx *sql.Tx, content string) error {
+	statements := splitSQLStatements(content)
+	for _, statement := range statements {
+		statement = strings.TrimSpace(statement)
+		if statement == "" {
+			continue
+		}
+		if table, column, ok := parseSQLiteAddColumn(statement); ok {
+			exists, err := sqliteColumnExists(ctx, tx, table, column)
+			if err != nil {
+				return err
+			}
+			if exists {
+				continue
+			}
+		}
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func parseSQLiteAddColumn(statement string) (table, column string, ok bool) {
+	normalized := strings.Join(strings.Fields(statement), " ")
+	upper := strings.ToUpper(normalized)
+	const prefix = "ALTER TABLE "
+	if !strings.HasPrefix(upper, prefix) {
+		return "", "", false
+	}
+	rest := strings.TrimSpace(normalized[len(prefix):])
+	parts := strings.SplitN(rest, " ", 4)
+	if len(parts) < 4 || !strings.EqualFold(parts[1], "ADD") || !strings.EqualFold(parts[2], "COLUMN") {
+		return "", "", false
+	}
+	table = strings.Trim(parts[0], `"`)
+	column = strings.Trim(parts[3], `"`)
+	if idx := strings.IndexAny(column, " \t\r\n("); idx >= 0 {
+		column = column[:idx]
+	}
+	return table, column, table != "" && column != ""
+}
+
+func sqliteColumnExists(ctx context.Context, tx *sql.Tx, table, column string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, "SELECT 1 FROM pragma_table_info(?) WHERE name = ? LIMIT 1", table, column)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = rows.Close() }()
+	return rows.Next(), rows.Err()
 }
 
 // validateSQLiteMigrationExecutionMode 校验 SQLite 增量迁移的执行约束。

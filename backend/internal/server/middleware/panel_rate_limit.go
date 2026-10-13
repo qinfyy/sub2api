@@ -39,9 +39,12 @@ type PanelRateLimiter struct {
 
 // NewPanelRateLimiter 创建面板限流器。
 func NewPanelRateLimiter(redisClient *redis.Client, settingService *service.SettingService, limiters ...*middleware.RateLimiter) *PanelRateLimiter {
-	limiter := middleware.NewRateLimiter(redisClient)
-	if len(limiters) > 0 && limiters[0] != nil {
+	var limiter *middleware.RateLimiter
+	if len(limiters) > 0 {
 		limiter = limiters[0]
+	}
+	if limiter == nil {
+		limiter = middleware.NewRateLimiter(redisClient)
 	}
 	return &PanelRateLimiter{
 		limiter:        limiter,

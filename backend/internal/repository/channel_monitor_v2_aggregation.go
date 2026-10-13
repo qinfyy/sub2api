@@ -97,6 +97,9 @@ func (r *channelMonitorV2Repository) pruneChannelMonitorV2Retention(ctx context.
 }
 
 func (r *channelMonitorV2Repository) RecomputeRange(ctx context.Context, start, end time.Time) (err error) {
+	if r.sqlite {
+		return r.recomputeRangeSQLite(ctx, start, end)
+	}
 	start = start.UTC().Truncate(time.Minute)
 	end = end.UTC().Truncate(time.Minute)
 	now := time.Now().UTC().Truncate(time.Minute)
@@ -392,6 +395,10 @@ func sameFixedRollupBucket(start, end time.Time, seconds int) bool {
 		return true
 	}
 	interval := time.Duration(seconds) * time.Second
+	// Reaching the boundary closes a bucket, including an exact full-day backfill.
+	if end.Equal(end.Truncate(interval)) {
+		return false
+	}
 	return start.Truncate(interval).Equal(end.Add(-time.Nanosecond).Truncate(interval))
 }
 
@@ -401,7 +408,10 @@ func sameFixedRollupBucket(start, end time.Time, seconds int) bool {
 // any other non-UTC timezone).
 const channelMonitorV2DateBinOrigin = "TIMESTAMPTZ '1970-01-01 00:00:00+00'"
 
-func channelMonitorV2DateBinExpr(column string) string {
+func channelMonitorV2DateBinExpr(column string, sqlite ...bool) string {
+	if len(sqlite) > 0 && sqlite[0] {
+		return "strftime('%Y-%m-%dT%H:%M:%SZ', (pg_rfc3339_micros(" + column + ") / (CAST($1 AS INTEGER) * 1000000)) * CAST($1 AS INTEGER), 'unixepoch')"
+	}
 	return "date_bin($1::interval," + column + "," + channelMonitorV2DateBinOrigin + ")"
 }
 

@@ -37,7 +37,7 @@ func TestProbeTypes(t *testing.T) {
 		if err := rows.Scan(&src, &a, &b, &c, &d, &e, &f, &g, &h, &i); err != nil {
 			t.Fatal(err)
 		}
-	t.Logf("%-14s int=%-7v real=%-6v str=%-6v bool=%-6v boolf=%-6v null=%-6v arr=%-6v obj=%-6v miss=%v", src, a, b, c, d, e, f, g, h, i)
+		t.Logf("%-14s int=%-7v real=%-6v str=%-6v bool=%-6v boolf=%-6v null=%-6v arr=%-6v obj=%-6v miss=%v", src, a, b, c, d, e, f, g, h, i)
 	}
 }
 

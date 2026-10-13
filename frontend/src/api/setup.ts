@@ -38,6 +38,7 @@ export interface RedisConfig {
   db: number
   enable_tls: boolean
   memory: {
+    persistence_path: string
     max_capacity_mb: number
     gc_interval_seconds: number
   }

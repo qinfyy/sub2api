@@ -218,7 +218,12 @@ func bindArrayArgs(db *sql.DB, query string, args []any) (string, []any, error) 
 	if !isSQLiteDB(db) {
 		return query, args, nil
 	}
+	return bindArrayArgsForSQLite(query, args)
+}
 
+// bindArrayArgsForSQLite 是 bindArrayArgs 的方言已知版本：调用方已经确认当前
+// 连接是 SQLite，无需再次做驱动类型探测（例如执行器被事务客户端包装时）。
+func bindArrayArgsForSQLite(query string, args []any) (string, []any, error) {
 	placeholders := scanSQLLiterals(query)
 	if len(placeholders) == 0 {
 		return query, args, nil
@@ -333,6 +338,29 @@ func bindSQLArray(db *sql.DB, value any) any {
 	return pq.Array(value)
 }
 
+// arrayArg 返回适合当前方言的数组绑定参数：SQLite 保留原始切片（由
+// bindArrayArgsForSQLite 展开成多个占位符），PostgreSQL 用 pq.Array 包装。
+func arrayArg(sqlite bool, value any) any {
+	if sqlite {
+		return value
+	}
+	return pq.Array(value)
+}
+
+// jsonArrayArg 把切片编码成 JSON 数组文本，供 SQLite 的 json_each 使用。
+// 数字、字符串、布尔等标量元素均按 JSON 语义绑定，避免依赖驱动对切片的支持。
+func jsonArrayArg(value any) (string, error) {
+	elements, ok := arrayElements(value)
+	if !ok {
+		return "", &errSQLArrayExpansion{reason: fmt.Sprintf("json array binding requires a slice, got %T", value)}
+	}
+	encoded, err := json.Marshal(elements)
+	if err != nil {
+		return "", &errSQLArrayExpansion{reason: fmt.Sprintf("marshal json array: %v", err)}
+	}
+	return string(encoded), nil
+}
+
 // sqliteAnyArrayPlaceholder 用于把 PostgreSQL 的 `= ANY($N)` 改写成 SQLite 的
 // `IN (SELECT value FROM json_each(?))`，用于无法静态展开元素个数的场景。
 func sqliteAnyArrayPlaceholder(query string) string {
@@ -428,8 +456,9 @@ type rewrittenArrayComparison struct {
 // rewriteArrayComparison 把 `ANY` / `ALL` 语义改写成 SQLite 的 IN 子查询。
 //
 // 语义映射（等价，无需展开元素个数）：
-//   x = ANY(arr)   ⟺  x IN (arr)
-//   x <> ALL(arr) ⟺  x NOT IN (arr)
+//
+//	x = ANY(arr)   ⟺  x IN (arr)
+//	x <> ALL(arr) ⟺  x NOT IN (arr)
 //
 // 只有这两个形式在 SQLite 中有严格等价写法。`ALL`（正向）与
 // `ANY`（反向）没有等价形式，遇到时返回错误而不是给出错误语义。

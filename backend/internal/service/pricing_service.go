@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/util/urlvalidator"
+	modelpricing "github.com/Wei-Shaw/sub2api/resources/model-pricing"
 	"go.uber.org/zap"
 )
 
@@ -1045,7 +1047,14 @@ func (s *PricingService) loadPricingData(filePath string) error {
 	if err != nil {
 		return fmt.Errorf("read file failed: %w", err)
 	}
+	updated := time.Now()
+	if info, err := os.Stat(filePath); err == nil {
+		updated = info.ModTime()
+	}
+	return s.loadPricingBytes(data, filePath, updated)
+}
 
+func (s *PricingService) loadPricingBytes(data []byte, source string, updated time.Time) error {
 	pricingData, customFilesHash, err := s.buildPricingData(data)
 	if err != nil {
 		return fmt.Errorf("parse pricing data: %w", err)
@@ -1061,15 +1070,10 @@ func (s *PricingService) loadPricingData(filePath string) error {
 	s.localHash = hashStr
 	s.customFilesHash = customFilesHash
 
-	info, _ := os.Stat(filePath)
-	if info != nil {
-		s.lastUpdated = info.ModTime()
-	} else {
-		s.lastUpdated = time.Now()
-	}
+	s.lastUpdated = updated
 	s.mu.Unlock()
 
-	logger.LegacyPrintf("service.pricing", "[Pricing] Loaded %d models from %s", len(pricingData), filePath)
+	logger.LegacyPrintf("service.pricing", "[Pricing] Loaded %d models from %s", len(pricingData), source)
 	return nil
 }
 
@@ -1080,7 +1084,7 @@ func (s *PricingService) mergeFallbackPricingData(data map[string]*LiteLLMModelP
 	if s == nil || s.cfg == nil || strings.TrimSpace(s.cfg.Pricing.FallbackFile) == "" {
 		return data
 	}
-	fallbackBody, err := os.ReadFile(s.cfg.Pricing.FallbackFile)
+	fallbackBody, _, err := s.readFallbackPricing()
 	if err != nil {
 		logger.LegacyPrintf("service.pricing", "[Pricing] Fallback merge skipped: %v", err)
 		return data
@@ -1134,26 +1138,35 @@ func warnDroppedLongContextLadders(old, next map[string]*LiteLLMModelPricing) {
 
 // useFallbackPricing 使用回退价格文件
 func (s *PricingService) useFallbackPricing() error {
-	fallbackFile := s.cfg.Pricing.FallbackFile
-
-	if _, err := os.Stat(fallbackFile); os.IsNotExist(err) {
-		return fmt.Errorf("fallback file not found: %s", fallbackFile)
-	}
-
-	logger.LegacyPrintf("service.pricing", "[Pricing] Using fallback file: %s", fallbackFile)
-
-	// 复制到数据目录
-	data, err := os.ReadFile(fallbackFile)
+	data, source, err := s.readFallbackPricing()
 	if err != nil {
 		return fmt.Errorf("read fallback failed: %w", err)
 	}
+	// Validate before writing the local cache; invalid explicit files remain errors.
+	if _, _, err := s.buildPricingData(data); err != nil {
+		return err
+	}
+	logger.LegacyPrintf("service.pricing", "[Pricing] Using fallback: %s", source)
 
 	pricingFile := s.getPricingFilePath()
 	if err := os.WriteFile(pricingFile, data, 0644); err != nil { //nolint:gosec // G703: 路径为配置的数据目录 + 硬编码文件名，非请求输入
 		logger.LegacyPrintf("service.pricing", "[Pricing] Failed to copy fallback: %v", err)
 	}
 
-	return s.loadPricingData(fallbackFile)
+	return s.loadPricingBytes(data, source, time.Now())
+}
+
+func (s *PricingService) readFallbackPricing() ([]byte, string, error) {
+	path := s.cfg.Pricing.FallbackFile
+	data, err := os.ReadFile(path)
+	if err == nil {
+		return data, path, nil
+	}
+	const defaultPath = "resources/model-pricing/model_prices_and_context_window.json"
+	if errors.Is(err, os.ErrNotExist) && filepath.Clean(path) == filepath.FromSlash(defaultPath) {
+		return modelpricing.Catalog(), "embedded default catalog", nil
+	}
+	return nil, path, err
 }
 
 // fetchRemoteHash 从远程获取哈希值

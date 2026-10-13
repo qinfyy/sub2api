@@ -27,6 +27,8 @@ import (
 type apiKeyRepository struct {
 	client *dbent.Client
 	sql    sqlExecutor
+	db     *sql.DB
+	sqlite bool
 }
 
 func NewAPIKeyRepository(client *dbent.Client, sqlDB *sql.DB) service.APIKeyRepository {
@@ -34,7 +36,8 @@ func NewAPIKeyRepository(client *dbent.Client, sqlDB *sql.DB) service.APIKeyRepo
 }
 
 func newAPIKeyRepositoryWithSQL(client *dbent.Client, sqlq sqlExecutor) *apiKeyRepository {
-	return &apiKeyRepository{client: client, sql: sqlq}
+	db, _ := sqlq.(*sql.DB)
+	return &apiKeyRepository{client: client, sql: sqlq, db: db, sqlite: isSQLiteDB(db)}
 }
 
 func (r *apiKeyRepository) activeQuery() *dbent.APIKeyQuery {
@@ -783,6 +786,9 @@ func (r *apiKeyRepository) IncrementQuotaUsed(ctx context.Context, id int64, amo
 // IncrementQuotaUsedAndGetState atomically increments quota_used, conditionally marks the key
 // as quota_exhausted, and returns the latest quota state in one round trip.
 func (r *apiKeyRepository) IncrementQuotaUsedAndGetState(ctx context.Context, id int64, amount float64) (*service.APIKeyQuotaUsageState, error) {
+	if r.sqlite {
+		return r.incrementQuotaUsedAndGetStateSQLite(ctx, id, amount)
+	}
 	query := `
 		UPDATE api_keys
 		SET
@@ -806,6 +812,52 @@ func (r *apiKeyRepository) IncrementQuotaUsedAndGetState(ctx context.Context, id
 	return state, nil
 }
 
+func (r *apiKeyRepository) incrementQuotaUsedAndGetStateSQLite(ctx context.Context, id int64, amount float64) (*service.APIKeyQuotaUsageState, error) {
+	if r.db == nil {
+		return nil, errors.New("api key repository database not configured")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE api_keys
+		SET
+			quota_used = quota_used + ?,
+			status = CASE
+				WHEN quota > 0 AND quota_used + ? >= quota THEN ?
+				ELSE status
+			END,
+			updated_at = NOW()
+		WHERE id = ? AND deleted_at IS NULL
+	`, amount, amount, service.StatusAPIKeyQuotaExhausted, id)
+	if err != nil {
+		return nil, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if affected == 0 {
+		return nil, service.ErrAPIKeyNotFound
+	}
+
+	state := &service.APIKeyQuotaUsageState{}
+	if err := tx.QueryRowContext(ctx, `
+		SELECT quota_used, quota, key, status
+		FROM api_keys
+		WHERE id = ? AND deleted_at IS NULL
+	`, id).Scan(&state.QuotaUsed, &state.Quota, &state.Key, &state.Status); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
 func (r *apiKeyRepository) UpdateLastUsed(ctx context.Context, id int64, usedAt time.Time) error {
 	affected, err := r.client.APIKey.Update().
 		Where(apikey.IDEQ(id), apikey.DeletedAtIsNil()).
@@ -824,6 +876,20 @@ func (r *apiKeyRepository) UpdateLastUsed(ctx context.Context, id int64, usedAt 
 // IncrementRateLimitUsage atomically increments all rate limit usage counters and initializes
 // window start times via COALESCE if not already set.
 func (r *apiKeyRepository) IncrementRateLimitUsage(ctx context.Context, id int64, cost float64) error {
+	if r.sqlite {
+		_, err := r.sql.ExecContext(ctx, `
+			UPDATE api_keys SET
+				usage_5h = CASE WHEN window_5h_start IS NOT NULL AND julianday(window_5h_start, '+5 hours') <= julianday(NOW()) THEN ? ELSE usage_5h + ? END,
+				usage_1d = CASE WHEN window_1d_start IS NOT NULL AND julianday(window_1d_start, '+24 hours') <= julianday(NOW()) THEN ? ELSE usage_1d + ? END,
+				usage_7d = CASE WHEN window_7d_start IS NOT NULL AND julianday(window_7d_start, '+7 days') <= julianday(NOW()) THEN ? ELSE usage_7d + ? END,
+				window_5h_start = CASE WHEN window_5h_start IS NULL OR julianday(window_5h_start, '+5 hours') <= julianday(NOW()) THEN NOW() ELSE window_5h_start END,
+				window_1d_start = CASE WHEN window_1d_start IS NULL OR julianday(window_1d_start, '+24 hours') <= julianday(NOW()) THEN strftime('%Y-%m-%dT00:00:00Z', NOW()) ELSE window_1d_start END,
+				window_7d_start = CASE WHEN window_7d_start IS NULL OR julianday(window_7d_start, '+7 days') <= julianday(NOW()) THEN strftime('%Y-%m-%dT00:00:00Z', NOW()) ELSE window_7d_start END,
+				updated_at = NOW()
+			WHERE id = ? AND deleted_at IS NULL`,
+			cost, cost, cost, cost, cost, cost, id)
+		return err
+	}
 	_, err := r.sql.ExecContext(ctx, `
 		UPDATE api_keys SET
 			usage_5h = CASE WHEN window_5h_start IS NOT NULL AND window_5h_start + INTERVAL '5 hours' <= NOW() THEN $1 ELSE usage_5h + $1 END,
@@ -840,6 +906,20 @@ func (r *apiKeyRepository) IncrementRateLimitUsage(ctx context.Context, id int64
 
 // ResetRateLimitWindows resets expired rate limit windows atomically.
 func (r *apiKeyRepository) ResetRateLimitWindows(ctx context.Context, id int64) error {
+	if r.sqlite {
+		_, err := r.sql.ExecContext(ctx, `
+			UPDATE api_keys SET
+				usage_5h = CASE WHEN window_5h_start IS NOT NULL AND julianday(window_5h_start, '+5 hours') <= julianday(NOW()) THEN 0 ELSE usage_5h END,
+				window_5h_start = CASE WHEN window_5h_start IS NOT NULL AND julianday(window_5h_start, '+5 hours') <= julianday(NOW()) THEN NOW() ELSE window_5h_start END,
+				usage_1d = CASE WHEN window_1d_start IS NOT NULL AND julianday(window_1d_start, '+24 hours') <= julianday(NOW()) THEN 0 ELSE usage_1d END,
+				window_1d_start = CASE WHEN window_1d_start IS NOT NULL AND julianday(window_1d_start, '+24 hours') <= julianday(NOW()) THEN strftime('%Y-%m-%dT00:00:00Z', NOW()) ELSE window_1d_start END,
+				usage_7d = CASE WHEN window_7d_start IS NOT NULL AND julianday(window_7d_start, '+7 days') <= julianday(NOW()) THEN 0 ELSE usage_7d END,
+				window_7d_start = CASE WHEN window_7d_start IS NOT NULL AND julianday(window_7d_start, '+7 days') <= julianday(NOW()) THEN strftime('%Y-%m-%dT00:00:00Z', NOW()) ELSE window_7d_start END,
+				updated_at = NOW()
+			WHERE id = ? AND deleted_at IS NULL`,
+			id)
+		return err
+	}
 	_, err := r.sql.ExecContext(ctx, `
 		UPDATE api_keys SET
 			usage_5h = CASE WHEN window_5h_start IS NOT NULL AND window_5h_start + INTERVAL '5 hours' <= NOW() THEN 0 ELSE usage_5h END,

@@ -2,8 +2,8 @@ package repository
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/dbtime"
 	"time"
 )
 
@@ -17,6 +17,10 @@ func (r *opsRepository) UpsertHourlyMetrics(ctx context.Context, startTime, endT
 
 	start := startTime.UTC()
 	end := endTime.UTC()
+
+	if isSQLiteDB(r.db) {
+		return r.upsertHourlyMetricsSQLite(ctx, start, end)
+	}
 
 	// NOTE:
 	// - We aggregate usage_logs + ops_error_logs into ops_metrics_hourly.
@@ -239,6 +243,10 @@ func (r *opsRepository) UpsertDailyMetrics(ctx context.Context, startTime, endTi
 	start := startTime.UTC()
 	end := endTime.UTC()
 
+	if isSQLiteDB(r.db) {
+		return r.upsertDailyMetricsSQLite(ctx, start, end)
+	}
+
 	q := `
 INSERT INTO ops_metrics_daily (
   bucket_date,
@@ -346,7 +354,7 @@ func (r *opsRepository) GetLatestHourlyBucketStart(ctx context.Context) (time.Ti
 		return time.Time{}, false, fmt.Errorf("nil ops repository")
 	}
 
-	var value sql.NullTime
+	var value dbtime.NullTime
 	if err := r.db.QueryRowContext(ctx, `SELECT MAX(bucket_start) FROM ops_metrics_hourly`).Scan(&value); err != nil {
 		return time.Time{}, false, err
 	}
@@ -361,7 +369,7 @@ func (r *opsRepository) GetLatestDailyBucketDate(ctx context.Context) (time.Time
 		return time.Time{}, false, fmt.Errorf("nil ops repository")
 	}
 
-	var value sql.NullTime
+	var value dbtime.NullTime
 	if err := r.db.QueryRowContext(ctx, `SELECT MAX(bucket_date) FROM ops_metrics_daily`).Scan(&value); err != nil {
 		return time.Time{}, false, err
 	}

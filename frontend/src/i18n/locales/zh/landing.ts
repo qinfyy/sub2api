@@ -196,10 +196,10 @@ export default {
     description: '配置您的 Sub2API 实例',
     database: {
       title: '数据库配置',
-      description: '选择 PostgreSQL 或内嵌的 SQLite 文件',
+      description: '选择 PostgreSQL 服务器或 SQLite 文件',
       type: '数据库类型',
       typePostgres: 'PostgreSQL',
-      typeSqlite: 'SQLite（内嵌）',
+      typeSqlite: 'SQLite',
       path: '数据库文件',
       host: '主机',
       port: '端口',
@@ -220,7 +220,7 @@ export default {
       description: '使用外部 Redis 服务器或进程内缓存',
       type: '缓存类型',
       typeRedis: 'Redis',
-      typeMemory: '内存缓存（单实例）',
+      typeMemory: '内存缓存',
       host: '主机',
       port: '端口',
       username: '用户名（可选）',
@@ -230,8 +230,11 @@ export default {
       passwordPlaceholder: '密码',
       enableTls: '启用 TLS',
       enableTlsHint: '连接 Redis 时使用 TLS（公共 CA 证书）',
+      singleInstanceHint: '内存缓存仅支持单实例运行。',
       memory: {
-        maxCapacity: '最大容量（MB）'
+        maxCapacity: '最大容量（MB）',
+        persistencePath: '持久状态数据库',
+        persistencePathHint: '用于保存刷新令牌、任务状态和限流数据，默认 data/cache-state.db。'
       }
     },
     admin: {

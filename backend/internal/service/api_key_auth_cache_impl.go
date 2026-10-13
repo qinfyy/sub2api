@@ -119,20 +119,26 @@ func (s *APIKeyService) StartAuthCacheInvalidationSubscriber(ctx context.Context
 			defer s.authInvalidationWG.Done()
 			backoff := time.Second
 			for {
+				// SubscribeAuthCacheInvalidation is a one-shot registration:
+				// Redis blocks until the subscription ends, while the in-memory
+				// implementation returns after registering a live callback.
+				// Both cases are a successful subscription until the context ends.
 				err := s.cache.SubscribeAuthCacheInvalidation(subscriberCtx, func(cacheKey string) {
 					s.invalidateLocalAuthCache(cacheKey)
 				})
-				wasConnected := s.authInvalidationConnected.Swap(false)
 				if subscriberCtx.Err() != nil {
 					return
 				}
+				if err == nil {
+					s.authInvalidationConnected.Store(true)
+					<-subscriberCtx.Done()
+					return
+				}
+				wasConnected := s.authInvalidationConnected.Swap(false)
 				if wasConnected {
 					backoff = time.Second
 				}
 				s.authInvalidationFailures.Add(1)
-				if err == nil {
-					err = errors.New("auth cache invalidation subscription closed")
-				}
 				slog.Warn("failed to start auth cache invalidation subscriber; retrying", "error", err, "retry_in", backoff)
 				timer := time.NewTimer(backoff)
 				select {

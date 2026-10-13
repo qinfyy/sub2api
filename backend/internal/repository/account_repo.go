@@ -30,6 +30,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/lib/pq"
 
+	"entgo.io/ent/dialect"
 	entsql "entgo.io/ent/dialect/sql"
 	"entgo.io/ent/dialect/sql/sqljson"
 )
@@ -44,6 +45,8 @@ import (
 type accountRepository struct {
 	client *dbent.Client // Ent ORM 客户端
 	sql    sqlExecutor   // 原生 SQL 执行接口
+	db     *sql.DB
+	sqlite bool
 	// schedulerCache 用于在账号状态变更时主动同步快照到缓存，
 	// 确保粘性会话能及时感知账号不可用状态。
 	// Used to proactively sync account snapshot to cache when status changes,
@@ -89,6 +92,27 @@ func ensureCodexFingerprintSeedSQL(extraExpr string) string {
 		"ELSE " + extraExpr + " END"
 }
 
+func ensureCodexFingerprintSeedSQLSQLite(extraExpr string) string {
+	return "CASE WHEN platform = 'openai' AND type = 'oauth' THEN " +
+		"json_set(" + extraExpr + ", '$.codex_fingerprint_seed', " +
+		"CASE WHEN " + codexFingerprintSeedValidSQLSQLite("extra") +
+		" THEN extra ->> 'codex_fingerprint_seed' ELSE gen_random_uuid() END) " +
+		"ELSE " + extraExpr + " END"
+}
+
+func codexFingerprintSeedValidSQLSQLite(extraExpr string) string {
+	value := "(" + extraExpr + " ->> 'codex_fingerprint_seed')"
+	return "(" + value + " IS NOT NULL AND length(" + value + ") = 36 AND " +
+		value + " GLOB '[0-9a-fA-F]*-*-*-*-*' AND " + value + " <> '" + codexFingerprintNilSeed + "')"
+}
+
+func sqlitePlaceholderOrDollar(sqlite bool, index int) string {
+	if sqlite {
+		return "?"
+	}
+	return "$" + itoa(index)
+}
+
 func stripCodexFingerprintSeedFromExtraUpdate(extra map[string]any) map[string]any {
 	if extra == nil {
 		return nil
@@ -121,16 +145,30 @@ func NewAdminAccountRepository(client *dbent.Client, sqlDB *sql.DB, schedulerCac
 // newAccountRepositoryWithSQL 是内部构造函数，支持依赖注入 SQL 执行器。
 // 这种设计便于单元测试时注入 mock 对象。
 func newAccountRepositoryWithSQL(client *dbent.Client, sqlq sqlExecutor, schedulerCache service.SchedulerCache) *accountRepository {
-	return &accountRepository{client: client, sql: sqlq, schedulerCache: schedulerCache}
+	db, _ := sqlq.(*sql.DB)
+	sqlite := isSQLiteDB(db)
+	if client != nil {
+		sqlite = client.Driver().Dialect() == dialect.SQLite
+	}
+	return &accountRepository{client: client, sql: sqlq, db: db, sqlite: sqlite, schedulerCache: schedulerCache}
 }
 
 func (r *accountRepository) Create(ctx context.Context, account *service.Account) error {
-	if err := createAccountRecord(ctx, r.client, account); err != nil {
+	if account == nil {
+		return service.ErrAccountNilInput
+	}
+	persisted := *account
+	err := NewTransactionRunner(r.client).WithinTransaction(ctx, func(ctx context.Context) error {
+		client := clientFromContext(ctx, r.client)
+		if err := createAccountRecord(ctx, client, &persisted); err != nil {
+			return err
+		}
+		return enqueueSchedulerOutbox(ctx, client, service.SchedulerOutboxEventAccountChanged, &persisted.ID, nil, buildSchedulerGroupPayload(persisted.GroupIDs))
+	})
+	if err != nil {
 		return err
 	}
-	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &account.ID, nil, buildSchedulerGroupPayload(account.GroupIDs)); err != nil {
-		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue account create failed: account=%d err=%v", account.ID, err)
-	}
+	*account = persisted
 	return nil
 }
 
@@ -197,8 +235,14 @@ func createAccountRecord(ctx context.Context, client *dbent.Client, account *ser
 	if err != nil {
 		return translatePersistenceError(err, service.ErrAccountNotFound, nil)
 	}
+	// AFTER triggers can normalize extra after INSERT RETURNING was evaluated.
+	created, err = client.Account.Get(ctx, created.ID)
+	if err != nil {
+		return err
+	}
 
 	account.ID = created.ID
+	account.Extra = created.Extra
 	account.CreatedAt = created.CreatedAt
 	account.UpdatedAt = created.UpdatedAt
 	return nil
@@ -210,55 +254,42 @@ func (r *accountRepository) CreateWithAccountGroups(ctx context.Context, account
 	if account == nil {
 		return service.ErrAccountNilInput
 	}
-	tx, err := r.client.Tx(ctx)
-	if err != nil && !errors.Is(err, dbent.ErrTxStarted) {
-		return err
-	}
-
-	var txClient *dbent.Client
-	if err == nil {
-		defer func() { _ = tx.Rollback() }()
-		txClient = tx.Client()
-	} else {
-		// Reuse a caller-owned transaction when this repository is already transactional.
-		txClient = r.client
-	}
+	persisted := *account
+	groups = append([]service.AccountGroup(nil), groups...)
 	groupIDs := make([]int64, 0, len(groups))
 	for i := range groups {
 		groupIDs = append(groupIDs, groups[i].GroupID)
 	}
-	if err := lockLiveGroups(ctx, txClient, groupIDs); err != nil {
-		return err
-	}
-
-	if err := createAccountRecord(ctx, txClient, account); err != nil {
-		return err
-	}
-	if len(groups) > 0 {
-		builders := make([]*dbent.AccountGroupCreate, 0, len(groups))
-		for i := range groups {
-			groups[i].AccountID = account.ID
-			builders = append(builders, txClient.AccountGroup.Create().
-				SetAccountID(account.ID).
-				SetGroupID(groups[i].GroupID).
-				SetPriority(groups[i].Priority),
-			)
-		}
-		if _, err := txClient.AccountGroup.CreateBulk(builders...).Save(ctx); err != nil {
+	err := NewTransactionRunner(r.client).WithinTransaction(ctx, func(ctx context.Context) error {
+		txClient := clientFromContext(ctx, r.client)
+		if err := lockLiveGroups(ctx, txClient, r.sqlite, groupIDs); err != nil {
 			return err
 		}
-	}
-	account.GroupIDs = groupIDs
-	account.AccountGroups = append([]service.AccountGroup(nil), groups...)
-	if err := enqueueSchedulerOutbox(ctx, txClient, service.SchedulerOutboxEventAccountChanged, &account.ID, nil, buildSchedulerGroupPayload(groupIDs)); err != nil {
-		return err
-	}
-
-	if tx != nil {
-		if err := tx.Commit(); err != nil {
+		if err := createAccountRecord(ctx, txClient, &persisted); err != nil {
 			return err
 		}
+		if len(groups) > 0 {
+			builders := make([]*dbent.AccountGroupCreate, 0, len(groups))
+			for i := range groups {
+				groups[i].AccountID = persisted.ID
+				builders = append(builders, txClient.AccountGroup.Create().
+					SetAccountID(persisted.ID).
+					SetGroupID(groups[i].GroupID).
+					SetPriority(groups[i].Priority),
+				)
+			}
+			if _, err := txClient.AccountGroup.CreateBulk(builders...).Save(ctx); err != nil {
+				return err
+			}
+		}
+		return enqueueSchedulerOutbox(ctx, txClient, service.SchedulerOutboxEventAccountChanged, &persisted.ID, nil, buildSchedulerGroupPayload(groupIDs))
+	})
+	if err != nil {
+		return err
 	}
+	persisted.GroupIDs = groupIDs
+	persisted.AccountGroups = groups
+	*account = persisted
 	return nil
 }
 
@@ -467,11 +498,11 @@ func (r *accountRepository) updateAccount(
 	}
 
 	baseCtx := ctx
-	contextTx := dbent.TxFromContext(ctx)
+	contextClient := transactionClientFromContext(ctx)
 	client := r.client
 	var tx *dbent.Tx
-	if contextTx != nil {
-		client = contextTx.Client()
+	if contextClient != nil {
+		client = contextClient
 	} else {
 		var err error
 		tx, err = r.client.Tx(ctx)
@@ -506,9 +537,10 @@ func (r *accountRepository) updateAccount(
 	}
 
 	account.UpdatedAt = updated.UpdatedAt
+	account.Extra = updated.Extra
 	// 普通账号编辑（如 model_mapping / credentials）也需要立即刷新单账号快照，
 	// 否则网关在 outbox worker 延迟或异常时仍可能读到旧配置。
-	if contextTx == nil {
+	if tx != nil {
 		r.syncSchedulerAccountSnapshot(baseCtx, account.ID)
 	}
 	return nil
@@ -608,7 +640,14 @@ func (r *accountRepository) updateLockedAccount(
 	builder.SetQuotaDimension(dbaccount.QuotaDimension(account.QuotaDimensionOrDefault()))
 	builder.SetNillableParentAccountID(account.ParentAccountID)
 
-	return builder.Save(ctx)
+	updated, err := builder.Save(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if client.Driver().Dialect() != dialect.SQLite {
+		return updated, nil
+	}
+	return client.Account.Get(ctx, updated.ID)
 }
 
 func lockAndMergeAccountProbeExtra(
@@ -618,13 +657,152 @@ func lockAndMergeAccountProbeExtra(
 	explicitProbeEnabled *bool,
 	explicitRateSyncEnabled *bool,
 ) (map[string]any, error) {
-	credentials, err := json.Marshal(normalizeJSONMap(account.Credentials))
+	state, err := queryLockedAccountProbeState(ctx, client, account)
 	if err != nil {
 		return nil, err
+	}
+	return mergeAccountProbeExtra(account, state, explicitProbeEnabled, explicitRateSyncEnabled)
+}
+
+type lockedAccountProbeState struct {
+	identityUnchanged              bool
+	ollamaGroupIdentityUnchanged   bool
+	ollamaProxyIdentityUnchanged   bool
+	opencodeGroupIdentityUnchanged bool
+	currentEnabled                 []byte
+	currentRateSyncEnabled         []byte
+	currentSnapshot                []byte
+	currentOllamaSession           []byte
+	currentOllamaAutoRefresh       []byte
+	currentOllamaSnapshot          []byte
+	currentOpenCodeAutoRefresh     []byte
+	currentOpenCodeSnapshot        []byte
+}
+
+func queryLockedAccountProbeState(
+	ctx context.Context,
+	client *dbent.Client,
+	account *service.Account,
+) (lockedAccountProbeState, error) {
+	var state lockedAccountProbeState
+	credentials, err := json.Marshal(normalizeJSONMap(account.Credentials))
+	if err != nil {
+		return state, err
 	}
 	var proxyID any
 	if account.ProxyID != nil {
 		proxyID = *account.ProxyID
+	}
+	if client.Driver().Dialect() == dialect.SQLite {
+		rows, err := client.QueryContext(ctx, `
+			SELECT
+				platform = ?
+					AND type = ?
+					AND credentials = ?
+					AND proxy_id IS ?,
+				COALESCE(
+					platform IN (`+ollamaCloudUsagePlatformsSQL+`)
+					AND ? IN (`+ollamaCloudUsagePlatformsSQL+`)
+					AND type = 'apikey'
+					AND ? = 'apikey'
+					AND json_extract(credentials, '$.api_key') IS json_extract(?, '$.api_key')
+					AND lower(btrim(COALESCE(credentials ->> 'base_url', ''))) IN (
+						'https://ollama.com',
+						'https://ollama.com:443',
+						'https://ollama.com/v1',
+						'https://ollama.com:443/v1',
+						'https://www.ollama.com',
+						'https://www.ollama.com:443',
+						'https://www.ollama.com/v1',
+						'https://www.ollama.com:443/v1'
+					)
+					AND lower(btrim(COALESCE(json_extract(?, '$.base_url'), ''))) IN (
+						'https://ollama.com',
+						'https://ollama.com:443',
+						'https://ollama.com/v1',
+						'https://ollama.com:443/v1',
+						'https://www.ollama.com',
+						'https://www.ollama.com:443',
+						'https://www.ollama.com/v1',
+						'https://www.ollama.com:443/v1'
+					),
+					false
+				),
+				proxy_id IS ?,
+				extra -> 'upstream_billing_probe_enabled',
+				extra -> 'upstream_billing_rate_sync_enabled',
+				extra -> 'upstream_billing_probe',
+				extra -> 'ollama_cloud_usage_session',
+				extra -> 'ollama_cloud_usage_auto_refresh',
+				extra -> 'ollama_cloud_usage_snapshot',
+				COALESCE(
+					(
+						(platform = 'opencode_go' AND ? = 'opencode_go'
+							AND COALESCE(btrim(credentials ->> 'account_mode') <> 'zen', true)
+							AND COALESCE(btrim(json_extract(?, '$.account_mode')) <> 'zen', true))
+						OR (platform IN (`+opencodeGoUsageMountPlatformsSQL+`)
+							AND ? IN (`+opencodeGoUsageMountPlatformsSQL+`)
+							AND lower(btrim(COALESCE(credentials ->> 'base_url', ''))) IN (
+								'https://opencode.ai/zen/go',
+								'https://opencode.ai/zen/go/',
+								'https://opencode.ai/zen/go/v1',
+								'https://opencode.ai/zen/go/v1/',
+								'https://opencode.ai:443/zen/go',
+								'https://opencode.ai:443/zen/go/',
+								'https://opencode.ai:443/zen/go/v1',
+								'https://opencode.ai:443/zen/go/v1/'
+							)
+							AND lower(btrim(COALESCE(json_extract(?, '$.base_url'), ''))) IN (
+								'https://opencode.ai/zen/go',
+								'https://opencode.ai/zen/go/',
+								'https://opencode.ai/zen/go/v1',
+								'https://opencode.ai/zen/go/v1/',
+								'https://opencode.ai:443/zen/go',
+								'https://opencode.ai:443/zen/go/',
+								'https://opencode.ai:443/zen/go/v1',
+								'https://opencode.ai:443/zen/go/v1/'
+							))
+					)
+					AND type = 'apikey'
+					AND ? = 'apikey'
+					AND json_extract(credentials, '$.api_key') IS json_extract(?, '$.api_key'),
+					false
+				),
+				extra -> 'opencode_go_usage_auto_refresh',
+				extra -> 'opencode_go_usage_snapshot'
+			FROM accounts
+			WHERE id = ? AND deleted_at IS NULL
+		`, account.Platform, account.Type, string(credentials), proxyID,
+			account.Platform, account.Type, string(credentials), string(credentials), proxyID,
+			account.Platform, string(credentials), account.Platform, string(credentials),
+			account.Type, string(credentials), account.ID)
+		if err != nil {
+			return state, err
+		}
+		defer func() { _ = rows.Close() }()
+		if !rows.Next() {
+			if err := rows.Err(); err != nil {
+				return state, err
+			}
+			return state, service.ErrAccountNotFound
+		}
+		if err := rows.Scan(
+			&state.identityUnchanged,
+			&state.ollamaGroupIdentityUnchanged,
+			&state.ollamaProxyIdentityUnchanged,
+			&state.currentEnabled,
+			&state.currentRateSyncEnabled,
+			&state.currentSnapshot,
+			&state.currentOllamaSession,
+			&state.currentOllamaAutoRefresh,
+			&state.currentOllamaSnapshot,
+			&state.opencodeGroupIdentityUnchanged,
+			&state.currentOpenCodeAutoRefresh,
+			&state.currentOpenCodeSnapshot,
+		); err != nil {
+			return state, err
+		}
+		return state, rows.Err()
 	}
 	rows, err := client.QueryContext(ctx, `
 		SELECT
@@ -676,50 +854,40 @@ func lockAndMergeAccountProbeExtra(
 		FOR NO KEY UPDATE
 	`, account.ID, account.Platform, account.Type, string(credentials), proxyID)
 	if err != nil {
-		return nil, err
+		return state, err
 	}
 	defer func() { _ = rows.Close() }()
 	if !rows.Next() {
 		if err := rows.Err(); err != nil {
-			return nil, err
+			return state, err
 		}
-		return nil, service.ErrAccountNotFound
+		return state, service.ErrAccountNotFound
 	}
-
-	var (
-		identityUnchanged              bool
-		ollamaGroupIdentityUnchanged   bool
-		ollamaProxyIdentityUnchanged   bool
-		opencodeGroupIdentityUnchanged bool
-		currentEnabled                 []byte
-		currentRateSyncEnabled         []byte
-		currentSnapshot                []byte
-		currentOllamaSession           []byte
-		currentOllamaAutoRefresh       []byte
-		currentOllamaSnapshot          []byte
-		currentOpenCodeAutoRefresh     []byte
-		currentOpenCodeSnapshot        []byte
-	)
 	if err := rows.Scan(
-		&identityUnchanged,
-		&ollamaGroupIdentityUnchanged,
-		&ollamaProxyIdentityUnchanged,
-		&currentEnabled,
-		&currentRateSyncEnabled,
-		&currentSnapshot,
-		&currentOllamaSession,
-		&currentOllamaAutoRefresh,
-		&currentOllamaSnapshot,
-		&opencodeGroupIdentityUnchanged,
-		&currentOpenCodeAutoRefresh,
-		&currentOpenCodeSnapshot,
+		&state.identityUnchanged,
+		&state.ollamaGroupIdentityUnchanged,
+		&state.ollamaProxyIdentityUnchanged,
+		&state.currentEnabled,
+		&state.currentRateSyncEnabled,
+		&state.currentSnapshot,
+		&state.currentOllamaSession,
+		&state.currentOllamaAutoRefresh,
+		&state.currentOllamaSnapshot,
+		&state.opencodeGroupIdentityUnchanged,
+		&state.currentOpenCodeAutoRefresh,
+		&state.currentOpenCodeSnapshot,
 	); err != nil {
-		return nil, err
+		return state, err
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
+	return state, rows.Err()
+}
 
+func mergeAccountProbeExtra(
+	account *service.Account,
+	state lockedAccountProbeState,
+	explicitProbeEnabled *bool,
+	explicitRateSyncEnabled *bool,
+) (map[string]any, error) {
 	extra := copyJSONMap(normalizeJSONMap(account.Extra))
 	for _, key := range []string{
 		service.UpstreamBillingProbeEnabledExtraKey,
@@ -737,7 +905,7 @@ func lockAndMergeAccountProbeExtra(
 	probeEnabled := false
 	probeEnabledPresent := false
 	if probeAccount {
-		if enabled, ok, err := decodeAccountExtraJSON(currentEnabled); err != nil {
+		if enabled, ok, err := decodeAccountExtraJSON(state.currentEnabled); err != nil {
 			return nil, err
 		} else if value, isBool := enabled.(bool); ok && isBool {
 			probeEnabled = value
@@ -751,7 +919,7 @@ func lockAndMergeAccountProbeExtra(
 	rateSyncEnabled := false
 	rateSyncEnabledPresent := false
 	if probeAccount {
-		if enabled, ok, err := decodeAccountExtraJSON(currentRateSyncEnabled); err != nil {
+		if enabled, ok, err := decodeAccountExtraJSON(state.currentRateSyncEnabled); err != nil {
 			return nil, err
 		} else if value, isBool := enabled.(bool); ok && isBool {
 			rateSyncEnabled = value
@@ -780,18 +948,18 @@ func lockAndMergeAccountProbeExtra(
 		}
 	}
 	probeExplicitlyDisabled := probeEnabledPresent && !probeEnabled
-	if identityUnchanged && !probeExplicitlyDisabled {
-		if snapshot, ok, err := decodeAccountExtraJSON(currentSnapshot); err != nil {
+	if state.identityUnchanged && !probeExplicitlyDisabled {
+		if snapshot, ok, err := decodeAccountExtraJSON(state.currentSnapshot); err != nil {
 			return nil, err
 		} else if ok {
 			extra[service.UpstreamBillingProbeExtraKey] = snapshot
 		}
 	}
 
-	if service.IsOllamaCloudUsageAccount(account) && ollamaGroupIdentityUnchanged {
+	if service.IsOllamaCloudUsageAccount(account) && state.ollamaGroupIdentityUnchanged {
 		for key, raw := range map[string][]byte{
-			service.OllamaCloudUsageSessionExtraKey:     currentOllamaSession,
-			service.OllamaCloudUsageAutoRefreshExtraKey: currentOllamaAutoRefresh,
+			service.OllamaCloudUsageSessionExtraKey:     state.currentOllamaSession,
+			service.OllamaCloudUsageAutoRefreshExtraKey: state.currentOllamaAutoRefresh,
 		} {
 			if value, ok, err := decodeAccountExtraJSON(raw); err != nil {
 				return nil, err
@@ -799,8 +967,8 @@ func lockAndMergeAccountProbeExtra(
 				extra[key] = value
 			}
 		}
-		if ollamaProxyIdentityUnchanged {
-			if snapshot, ok, err := decodeAccountExtraJSON(currentOllamaSnapshot); err != nil {
+		if state.ollamaProxyIdentityUnchanged {
+			if snapshot, ok, err := decodeAccountExtraJSON(state.currentOllamaSnapshot); err != nil {
 				return nil, err
 			} else if ok {
 				extra[service.OllamaCloudUsageSnapshotExtraKey] = snapshot
@@ -812,14 +980,14 @@ func lockAndMergeAccountProbeExtra(
 	// 回填，客户端 DTO 脱敏或并发 refresh 写入都无法覆盖/丢失；身份改变或不再
 	// eligible 时既不回填，写出的 extra 即清除旧状态。
 	// 代理不属于组身份，但 snapshot 外呼与 CAS 经代理，故代理变化时快照失效而开关保留。
-	if service.IsOpenCodeGoUsageAccount(account) && opencodeGroupIdentityUnchanged {
-		if value, ok, err := decodeAccountExtraJSON(currentOpenCodeAutoRefresh); err != nil {
+	if service.IsOpenCodeGoUsageAccount(account) && state.opencodeGroupIdentityUnchanged {
+		if value, ok, err := decodeAccountExtraJSON(state.currentOpenCodeAutoRefresh); err != nil {
 			return nil, err
 		} else if ok {
 			extra[service.OpenCodeGoUsageAutoRefreshExtraKey] = value
 		}
-		if ollamaProxyIdentityUnchanged {
-			if snapshot, ok, err := decodeAccountExtraJSON(currentOpenCodeSnapshot); err != nil {
+		if state.ollamaProxyIdentityUnchanged {
+			if snapshot, ok, err := decodeAccountExtraJSON(state.currentOpenCodeSnapshot); err != nil {
 				return nil, err
 			} else if ok {
 				extra[service.OpenCodeGoUsageSnapshotExtraKey] = snapshot
@@ -862,6 +1030,9 @@ func (r *accountRepository) UpdateCredentials(ctx context.Context, id int64, cre
 			ctx = dbent.NewTxContext(ctx, tx)
 			client = tx.Client()
 		}
+	}
+	if r.sqlite {
+		return r.updateCredentialsSQLite(ctx, baseCtx, client, contextTx, tx, id, string(payload))
 	}
 	result, err := client.ExecContext(ctx, `
 		UPDATE accounts
@@ -933,6 +1104,131 @@ func (r *accountRepository) UpdateCredentials(ctx context.Context, id int64, cre
 			updated_at = NOW()
 		WHERE id = $2 AND deleted_at IS NULL
 	`, string(payload), id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return service.ErrAccountNotFound
+	}
+	if err := enqueueSchedulerOutbox(ctx, client, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+		return err
+	}
+	if tx != nil {
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+	if contextTx == nil {
+		r.syncSchedulerAccountSnapshot(baseCtx, id)
+	}
+	return nil
+}
+
+// updateCredentialsSQLite mirrors the PostgreSQL conditional cleanup with
+// SQLite JSON functions. Keeping the branch separate avoids trying to translate
+// jsonb operators such as `||`, `-`, and `->` through generic string rewriting.
+func (r *accountRepository) updateCredentialsSQLite(
+	ctx context.Context,
+	baseCtx context.Context,
+	client *dbent.Client,
+	contextTx *dbent.Tx,
+	tx *dbent.Tx,
+	id int64,
+	payload string,
+) error {
+	result, err := client.ExecContext(ctx, `
+		UPDATE accounts
+		SET credentials = ?,
+			extra = CASE
+				WHEN type = 'apikey'
+					AND json(credentials) IS NOT json(?)
+					AND (
+						(platform = 'opencode_go'
+							AND COALESCE(btrim(credentials ->> 'account_mode') <> 'zen', true))
+						OR (platform IN (`+opencodeGoUsageMountPlatformsSQL+`)
+							AND lower(btrim(COALESCE(credentials ->> 'base_url', ''))) IN (
+								'https://opencode.ai/zen/go',
+								'https://opencode.ai/zen/go/',
+								'https://opencode.ai/zen/go/v1',
+								'https://opencode.ai/zen/go/v1/',
+								'https://opencode.ai:443/zen/go',
+								'https://opencode.ai:443/zen/go/',
+								'https://opencode.ai:443/zen/go/v1',
+								'https://opencode.ai:443/zen/go/v1/'
+							))
+					)
+					AND (
+						json_extract(credentials, '$.api_key') IS NOT json_extract(?, '$.api_key')
+						OR (platform = 'opencode_go'
+							AND COALESCE(btrim(json_extract(?, '$.account_mode')) <> 'zen', true) IS NOT TRUE)
+						OR (platform IN (`+opencodeGoUsageMountPlatformsSQL+`)
+							AND (lower(btrim(COALESCE(json_extract(?, '$.base_url'), ''))) IN (
+								'https://opencode.ai/zen/go',
+								'https://opencode.ai/zen/go/',
+								'https://opencode.ai/zen/go/v1',
+								'https://opencode.ai/zen/go/v1/',
+								'https://opencode.ai:443/zen/go',
+								'https://opencode.ai:443/zen/go/',
+								'https://opencode.ai:443/zen/go/v1',
+								'https://opencode.ai:443/zen/go/v1/'
+							)) IS NOT TRUE)
+					)
+				THEN json_remove(
+						COALESCE(extra, '{}'),
+						'$.upstream_billing_probe',
+						'$.opencode_go_usage_auto_refresh',
+						'$.opencode_go_usage_snapshot',
+						'$.ollama_cloud_usage_session',
+						'$.ollama_cloud_usage_auto_refresh',
+						'$.ollama_cloud_usage_snapshot'
+					)
+				WHEN platform IN (`+ollamaCloudUsagePlatformsSQL+`)
+					AND type = 'apikey'
+					AND json(credentials) IS NOT json(?)
+					AND (
+						json_extract(credentials, '$.api_key') IS NOT json_extract(?, '$.api_key')
+						OR NOT (
+							lower(btrim(COALESCE(credentials ->> 'base_url', ''))) IN (
+								'https://ollama.com',
+								'https://ollama.com:443',
+								'https://ollama.com/v1',
+								'https://ollama.com:443/v1',
+								'https://www.ollama.com',
+								'https://www.ollama.com:443',
+								'https://www.ollama.com/v1',
+								'https://www.ollama.com:443/v1'
+							)
+							AND lower(btrim(COALESCE(json_extract(?, '$.base_url'), ''))) IN (
+								'https://ollama.com',
+								'https://ollama.com:443',
+								'https://ollama.com/v1',
+								'https://ollama.com:443/v1',
+								'https://www.ollama.com',
+								'https://www.ollama.com:443',
+								'https://www.ollama.com/v1',
+								'https://www.ollama.com:443/v1'
+							)
+						)
+					)
+				THEN json_remove(
+						COALESCE(extra, '{}'),
+						'$.upstream_billing_probe',
+						'$.ollama_cloud_usage_session',
+						'$.ollama_cloud_usage_auto_refresh',
+						'$.ollama_cloud_usage_snapshot'
+					)
+				WHEN type = 'apikey'
+					AND json(credentials) IS NOT json(?)
+				THEN json_remove(COALESCE(extra, '{}'), '$.upstream_billing_probe')
+				ELSE extra
+			END,
+			updated_at = NOW()
+		WHERE id = ? AND deleted_at IS NULL
+	`, payload, payload, payload, payload, payload, payload, payload, payload, payload, id)
 	if err != nil {
 		return err
 	}
@@ -1113,8 +1409,12 @@ func (r *accountRepository) ListWithFilters(ctx context.Context, params paginati
 	accountsQuery := q.
 		Offset(params.Offset()).
 		Limit(params.Limit())
-	for _, order := range accountListOrder(params) {
-		accountsQuery = accountsQuery.Order(order)
+	if r.sqlite {
+		accountsQuery = accountsQuery.Order(sqliteAccountListOrder(params))
+	} else {
+		for _, order := range accountListOrder(params) {
+			accountsQuery = accountsQuery.Order(order)
+		}
 	}
 
 	accounts, err := accountsQuery.All(ctx)
@@ -1230,6 +1530,61 @@ func accountListOrder(params pagination.PaginationParams) []func(*entsql.Selecto
 	return []func(*entsql.Selector){dbent.Asc(field), dbent.Asc(dbaccount.FieldID)}
 }
 
+func sqliteAccountListOrder(params pagination.PaginationParams) func(*entsql.Selector) {
+	sortOrder := params.NormalizedSortOrder(pagination.SortOrderAsc)
+	direction := "ASC"
+	tieDirection := "ASC"
+	if sortOrder == pagination.SortOrderDesc {
+		direction = "DESC"
+		tieDirection = "DESC"
+	}
+	return func(s *entsql.Selector) {
+		extra := s.C(dbaccount.FieldExtra)
+		s.OrderExpr(entsql.Expr(sqliteUpstreamBillingRateSortExpression(extra) + " " + direction + " NULLS LAST"))
+		s.OrderExpr(entsql.Expr(s.C(dbaccount.FieldID) + " " + tieDirection))
+	}
+}
+
+// sqliteUpstreamBillingRateSortExpression mirrors upstreamBillingRateSortExpression
+// for the admin account list. SQLite has no jsonb #>/#>>, AT TIME ZONE or
+// pg_timezone_names; JSON values are extracted with json_extract and compared
+// as numeric text. Peak windows use a fixed UTC+0 offset only when the stored
+// timezone is UTC; unknown or non-UTC timezones leave the current rate NULL,
+// which is the safe ordering result rather than failing the whole page.
+func sqliteUpstreamBillingRateSortExpression(extra string) string {
+	status := "json_extract(" + extra + ", '$.upstream_billing_probe.status')"
+	resolvedType := "json_type(" + extra + ", '$.upstream_billing_probe.data.resolved_rate_multiplier')"
+	effectiveType := "json_type(" + extra + ", '$.upstream_billing_probe.data.effective_rate_multiplier')"
+	peakEnabledType := "json_type(" + extra + ", '$.upstream_billing_probe.data.peak_rate_enabled')"
+	resolvedJSON := "json_extract(" + extra + ", '$.upstream_billing_probe.data.resolved_rate_multiplier')"
+	effectiveJSON := "json_extract(" + extra + ", '$.upstream_billing_probe.data.effective_rate_multiplier')"
+	peakEnabledJSON := "json_extract(" + extra + ", '$.upstream_billing_probe.data.peak_rate_enabled')"
+	peakStart := "json_extract(" + extra + ", '$.upstream_billing_probe.data.peak_start')"
+	peakEnd := "json_extract(" + extra + ", '$.upstream_billing_probe.data.peak_end')"
+	peakMultiplierJSON := "json_extract(" + extra + ", '$.upstream_billing_probe.data.peak_rate_multiplier')"
+	billingScope := "json_extract(" + extra + ", '$.upstream_billing_probe.data.billing_scope')"
+	timezone := "json_extract(" + extra + ", '$.upstream_billing_probe.data.timezone')"
+	validClock := "'^([01][0-9]|2[0-3]):[0-5][0-9]$'"
+	startMinute := "(CASE WHEN " + peakStart + " GLOB '[0-2][0-9]:[0-5][0-9]' THEN CAST(substr(" + peakStart + ", 1, 2) AS INTEGER) * 60 + CAST(substr(" + peakStart + ", 4, 2) AS INTEGER) END)"
+	endMinute := "(CASE WHEN " + peakEnd + " GLOB '[0-2][0-9]:[0-5][0-9]' THEN CAST(substr(" + peakEnd + ", 1, 2) AS INTEGER) * 60 + CAST(substr(" + peakEnd + ", 4, 2) AS INTEGER) END)"
+	localMinute := "(CAST(strftime('%H', 'now', 'utc') AS INTEGER) * 60 + CAST(strftime('%M', 'now', 'utc') AS INTEGER))"
+	validPeakWindow := peakStart + " GLOB " + validClock + " AND " +
+		peakEnd + " GLOB " + validClock + " AND " +
+		startMinute + " < " + endMinute
+	validPeakConfig := validPeakWindow + " AND CAST(" + peakMultiplierJSON + " AS REAL) >= 0 AND " +
+		timezone + " = 'UTC'"
+	dynamicRate := "CASE WHEN " + peakEnabledJSON + " = 0 THEN CAST(" + resolvedJSON + " AS REAL) WHEN " + peakEnabledJSON + " = 1 AND " + validPeakConfig +
+		" THEN CAST(" + resolvedJSON + " AS REAL) * CASE WHEN " + localMinute + " >= " + startMinute + " AND " + localMinute + " < " + endMinute +
+		" THEN CAST(" + peakMultiplierJSON + " AS REAL) ELSE 1 END ELSE NULL END"
+	legacySnapshot := "(" + resolvedJSON + " IS NULL AND " + peakEnabledJSON + " IS NULL)"
+
+	numericType := " IN ('integer', 'real')"
+	return "CASE WHEN " + status + " IN ('ok', 'failed') AND " + effectiveType + numericType + " AND " + resolvedType + " IS NULL THEN CAST(" + effectiveJSON + " AS REAL) " +
+		"WHEN " + status + " IN ('ok', 'failed') AND " + resolvedType + numericType + " AND " + peakEnabledType + " = 'true' THEN " +
+		"CASE WHEN " + billingScope + " = 'token' THEN " + dynamicRate + " ELSE NULL END " +
+		"WHEN " + status + " IN ('ok', 'failed') AND " + legacySnapshot + " AND " + effectiveType + numericType + " THEN CAST(" + effectiveJSON + " AS REAL) END"
+}
+
 func upstreamBillingRateSortExpression(extra string) string {
 	status := extra + " #>> '{upstream_billing_probe,status}'"
 	effectiveJSON := extra + " #> '{upstream_billing_probe,data,effective_rate_multiplier}'"
@@ -1328,9 +1683,15 @@ func (r *accountRepository) ListOAuthRefreshCandidatePage(ctx context.Context, o
 			AND type = 'oauth'`
 	}
 	if options.RequireRefreshToken {
-		query += `
+		if r.sqlite {
+			query += `
+			AND json_extract(credentials, '$.refresh_token') IS NOT NULL
+			AND btrim(credentials->>'refresh_token') <> ''`
+		} else {
+			query += `
 			AND credentials ? 'refresh_token'
 			AND btrim(credentials->>'refresh_token') <> ''`
+		}
 	}
 	if options.ExcludeRetryCooldown {
 		query += `
@@ -1343,7 +1704,19 @@ func (r *accountRepository) ListOAuthRefreshCandidatePage(ctx context.Context, o
 		ORDER BY id ASC
 		LIMIT $3`
 
-	rows, err := r.sql.QueryContext(ctx, query, pq.Array(options.Platforms), options.AfterID, options.Limit)
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if r.sqlite {
+		query, args, bindErr := bindArrayArgsForSQLite(query, []any{options.Platforms, options.AfterID, options.Limit})
+		if bindErr != nil {
+			return nil, bindErr
+		}
+		rows, err = r.sql.QueryContext(ctx, query, args...)
+	} else {
+		rows, err = r.sql.QueryContext(ctx, query, pq.Array(options.Platforms), options.AfterID, options.Limit)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1428,6 +1801,9 @@ func (r *accountRepository) BatchUpdateLastUsed(ctx context.Context, updates map
 	if len(updates) == 0 {
 		return nil
 	}
+	if r.sqlite {
+		return r.batchUpdateLastUsedSQLite(ctx, updates)
+	}
 
 	ids := make([]int64, 0, len(updates))
 	args := make([]any, 0, len(updates)*2+1)
@@ -1459,6 +1835,33 @@ func (r *accountRepository) BatchUpdateLastUsed(ctx context.Context, updates map
 	return nil
 }
 
+func (r *accountRepository) batchUpdateLastUsedSQLite(ctx context.Context, updates map[int64]time.Time) error {
+	if r.db == nil {
+		return errors.New("account repository database not configured")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for id, ts := range updates {
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE accounts SET last_used_at = ?, updated_at = NOW() WHERE id = ? AND deleted_at IS NULL",
+			ts, id); err != nil {
+			return err
+		}
+	}
+	lastUsedPayload := make(map[string]int64, len(updates))
+	for id, ts := range updates {
+		lastUsedPayload[strconv.FormatInt(id, 10)] = ts.Unix()
+	}
+	if err := enqueueSchedulerOutbox(ctx, tx, service.SchedulerOutboxEventAccountLastUsed, nil, nil,
+		map[string]any{"last_used": lastUsedPayload}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (r *accountRepository) SetError(ctx context.Context, id int64, errorMsg string) error {
 	_, err := r.client.Account.Update().
 		Where(dbaccount.IDEQ(id)).
@@ -1482,6 +1885,9 @@ func (r *accountRepository) SetGrokCredentialErrorIfMatch(
 	snapshot service.GrokCredentialMutationSnapshot,
 	errorMsg string,
 ) (bool, error) {
+	if r.sqlite {
+		return r.setGrokCredentialErrorIfMatchSQLite(ctx, id, snapshot, errorMsg)
+	}
 	result, err := r.sql.ExecContext(ctx, `
 		WITH updated AS (
 		UPDATE accounts AS a
@@ -1524,6 +1930,66 @@ func (r *accountRepository) SetGrokCredentialErrorIfMatch(
 	return true, nil
 }
 
+func (r *accountRepository) setGrokCredentialErrorIfMatchSQLite(
+	ctx context.Context,
+	id int64,
+	snapshot service.GrokCredentialMutationSnapshot,
+	errorMsg string,
+) (bool, error) {
+	if r.db == nil {
+		return false, errors.New("account repository database not configured")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE accounts
+		SET status = ?,
+			error_message = ?,
+			schedulable = 0,
+			updated_at = NOW()
+		WHERE id = ?
+			AND deleted_at IS NULL
+			AND status = ?
+			AND platform = ?
+			AND type = ?
+			AND schedulable IS TRUE
+			AND (temp_unschedulable_until IS NULL OR temp_unschedulable_until <= NOW())
+			AND (rate_limit_reset_at IS NULL OR rate_limit_reset_at <= NOW())
+			AND (overload_until IS NULL OR overload_until <= NOW())
+			AND (auto_pause_on_expired IS NOT TRUE OR expires_at IS NULL OR expires_at > NOW())
+			AND credentials = ?
+			AND proxy_id IS ?
+			AND (? <> ? OR (
+				proxy_id IS NOT NULL AND NOT EXISTS (
+					SELECT 1 FROM proxies p WHERE p.id = accounts.proxy_id AND p.deleted_at IS NULL
+				)
+			))
+	`, service.StatusError, errorMsg, id, service.StatusActive, service.PlatformGrok, service.AccountTypeOAuth,
+		snapshot.CredentialsJSON, snapshot.ProxyID, errorMsg, string(service.GrokCredentialReasonProxyInvalid))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	if err := enqueueSchedulerOutbox(ctx, tx, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	r.syncSchedulerAccountSnapshotDetached(ctx, id)
+	return true, nil
+}
+
 // SetGrokOAuthErrorIfCredentialsUnchanged atomically quarantines a structurally
 // invalid Grok OAuth account only if it is still active and its complete JSONB
 // credential document matches the state observed by reconciliation. Exact
@@ -1541,6 +2007,9 @@ func (r *accountRepository) SetGrokOAuthErrorIfCredentialsUnchanged(
 	expectedJSON, err := json.Marshal(normalizeJSONMap(expectedCredentials))
 	if err != nil {
 		return false, err
+	}
+	if r.sqlite {
+		return r.setGrokOAuthErrorIfCredentialsUnchangedSQLite(ctx, id, expectedJSON, errorMsg)
 	}
 	result, err := r.sql.ExecContext(ctx, `
 		WITH updated AS (
@@ -1584,6 +2053,56 @@ func (r *accountRepository) SetGrokOAuthErrorIfCredentialsUnchanged(
 	return true, nil
 }
 
+func (r *accountRepository) setGrokOAuthErrorIfCredentialsUnchangedSQLite(
+	ctx context.Context,
+	id int64,
+	expectedJSON []byte,
+	errorMsg string,
+) (bool, error) {
+	if r.db == nil {
+		return false, errors.New("account repository database not configured")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE accounts
+		SET status = ?,
+			error_message = ?,
+			schedulable = 0,
+			updated_at = NOW()
+		WHERE id = ?
+			AND deleted_at IS NULL
+			AND platform = ?
+			AND type = ?
+			AND status = ?
+			AND credentials = ?
+			AND NULLIF(BTRIM(credentials->>'refresh_token'), '') IS NULL
+	`, service.StatusError, errorMsg, id, service.PlatformGrok, service.AccountTypeOAuth,
+		service.StatusActive, string(expectedJSON))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	if err := enqueueSchedulerOutbox(ctx, tx, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	r.syncSchedulerAccountSnapshotDetached(ctx, id)
+	return true, nil
+}
+
 // UpdateGrokOAuthCredentialsIfUnchanged persists provider-issued replacement
 // credentials only while the complete Grok OAuth credential document and
 // proxy still match the fresh snapshot used by the upstream refresh call. The
@@ -1606,6 +2125,9 @@ func (r *accountRepository) UpdateGrokOAuthCredentialsIfUnchanged(
 	credentialsJSON, err := json.Marshal(normalizeJSONMap(credentials))
 	if err != nil {
 		return false, err
+	}
+	if r.sqlite {
+		return r.updateGrokOAuthCredentialsIfUnchangedSQLite(ctx, id, expectedJSON, expectedProxyID, credentialsJSON)
 	}
 	result, err := r.sql.ExecContext(ctx, `
 		WITH updated AS (
@@ -1645,6 +2167,54 @@ func (r *accountRepository) UpdateGrokOAuthCredentialsIfUnchanged(
 	return true, nil
 }
 
+func (r *accountRepository) updateGrokOAuthCredentialsIfUnchangedSQLite(
+	ctx context.Context,
+	id int64,
+	expectedJSON []byte,
+	expectedProxyID *int64,
+	credentialsJSON []byte,
+) (bool, error) {
+	if r.db == nil {
+		return false, errors.New("account repository database not configured")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE accounts
+		SET credentials = ?,
+			updated_at = NOW()
+		WHERE id = ?
+			AND deleted_at IS NULL
+			AND platform = ?
+			AND type = ?
+			AND credentials = ?
+			AND proxy_id IS ?
+	`, string(credentialsJSON), id, service.PlatformGrok, service.AccountTypeOAuth,
+		string(expectedJSON), expectedProxyID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	if err := enqueueSchedulerOutbox(ctx, tx, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	r.syncSchedulerAccountSnapshotDetached(ctx, id)
+	return true, nil
+}
+
 // SetGrokOAuthRefreshErrorIfCredentialsUnchanged is the background-refresh
 // counterpart to reconciliation's stricter missing-refresh-token mutation. It
 // matches the complete credential document used by the failed upstream attempt
@@ -1662,6 +2232,9 @@ func (r *accountRepository) SetGrokOAuthRefreshErrorIfCredentialsUnchanged(
 	expectedJSON, err := json.Marshal(normalizeJSONMap(expectedCredentials))
 	if err != nil {
 		return false, err
+	}
+	if r.sqlite {
+		return r.setGrokOAuthRefreshErrorIfCredentialsUnchangedSQLite(ctx, id, expectedJSON, expectedProxyID, errorMsg)
 	}
 	result, err := r.sql.ExecContext(ctx, `
 		WITH updated AS (
@@ -1706,6 +2279,57 @@ func (r *accountRepository) SetGrokOAuthRefreshErrorIfCredentialsUnchanged(
 	return true, nil
 }
 
+func (r *accountRepository) setGrokOAuthRefreshErrorIfCredentialsUnchangedSQLite(
+	ctx context.Context,
+	id int64,
+	expectedJSON []byte,
+	expectedProxyID *int64,
+	errorMsg string,
+) (bool, error) {
+	if r.db == nil {
+		return false, errors.New("account repository database not configured")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE accounts
+		SET status = ?,
+			error_message = ?,
+			schedulable = 0,
+			updated_at = NOW()
+		WHERE id = ?
+			AND deleted_at IS NULL
+			AND platform = ?
+			AND type = ?
+			AND status = ?
+			AND credentials = ?
+			AND proxy_id IS ?
+	`, service.StatusError, errorMsg, id, service.PlatformGrok, service.AccountTypeOAuth,
+		service.StatusActive, string(expectedJSON), expectedProxyID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	if err := enqueueSchedulerOutbox(ctx, tx, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	r.syncSchedulerAccountSnapshotDetached(ctx, id)
+	return true, nil
+}
+
 // SetGrokOAuthRefreshTempUnschedulableIfCredentialsUnchanged applies a bounded
 // transient refresh quarantine only while the active Grok OAuth credential
 // document still matches the exact upstream attempt.
@@ -1723,6 +2347,9 @@ func (r *accountRepository) SetGrokOAuthRefreshTempUnschedulableIfCredentialsUnc
 	expectedJSON, err := json.Marshal(normalizeJSONMap(expectedCredentials))
 	if err != nil {
 		return false, err
+	}
+	if r.sqlite {
+		return r.setGrokOAuthRefreshTempUnschedulableIfCredentialsUnchangedSQLite(ctx, id, expectedJSON, expectedProxyID, until, reason)
 	}
 	result, err := r.sql.ExecContext(ctx, `
 		WITH updated AS (
@@ -1762,6 +2389,58 @@ func (r *accountRepository) SetGrokOAuthRefreshTempUnschedulableIfCredentialsUnc
 	}
 	if rowsAffected == 0 {
 		return false, nil
+	}
+	r.syncSchedulerAccountSnapshotDetached(ctx, id)
+	return true, nil
+}
+
+func (r *accountRepository) setGrokOAuthRefreshTempUnschedulableIfCredentialsUnchangedSQLite(
+	ctx context.Context,
+	id int64,
+	expectedJSON []byte,
+	expectedProxyID *int64,
+	until time.Time,
+	reason string,
+) (bool, error) {
+	if r.db == nil {
+		return false, errors.New("account repository database not configured")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE accounts
+		SET temp_unschedulable_until = ?,
+			temp_unschedulable_reason = ?,
+			updated_at = NOW()
+		WHERE id = ?
+			AND deleted_at IS NULL
+			AND platform = ?
+			AND type = ?
+			AND status = ?
+			AND credentials = ?
+			AND proxy_id IS ?
+			AND (temp_unschedulable_until IS NULL OR temp_unschedulable_until < ?)
+	`, until, reason, id, service.PlatformGrok, service.AccountTypeOAuth,
+		service.StatusActive, string(expectedJSON), expectedProxyID, until)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	if err := enqueueSchedulerOutbox(ctx, tx, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
 	}
 	r.syncSchedulerAccountSnapshotDetached(ctx, id)
 	return true, nil
@@ -1871,7 +2550,7 @@ func (r *accountRepository) AddToGroup(ctx context.Context, accountID, groupID i
 		defer func() { _ = tx.Rollback() }()
 		client = tx.Client()
 	}
-	if err := lockLiveGroups(ctx, client, []int64{groupID}); err != nil {
+	if err := lockLiveGroups(ctx, client, r.sqlite, []int64{groupID}); err != nil {
 		return err
 	}
 	_, err = client.AccountGroup.Create().
@@ -1947,7 +2626,7 @@ func (r *accountRepository) BindGroups(ctx context.Context, accountID int64, gro
 		// 已处于外部事务中（ErrTxStarted），复用当前 client
 		txClient = r.client
 	}
-	if err := lockLiveGroups(ctx, txClient, groupIDs); err != nil {
+	if err := lockLiveGroups(ctx, txClient, r.sqlite, groupIDs); err != nil {
 		return err
 	}
 
@@ -2070,18 +2749,30 @@ func (r *accountRepository) ListSchedulableCapacityByGroupIDs(ctx context.Contex
 		return rows, nil
 	}
 
+	extraExpr := "COALESCE(a.extra, '{}'::jsonb)::text"
+	groupCondition := "ag.group_id = ANY($1)"
+	args := []any{pq.Array(groupIDs), service.StatusActive, time.Now()}
+	if r.sqlite {
+		extraExpr = "COALESCE(a.extra, '{}')"
+		groupCondition = "ag.group_id IN (SELECT value FROM json_each($1))"
+		encoded, encodeErr := jsonArrayArg(groupIDs)
+		if encodeErr != nil {
+			return nil, encodeErr
+		}
+		args = []any{encoded, service.StatusActive, time.Now()}
+	}
 	rows, err := r.sql.QueryContext(ctx, `
 		SELECT
 			ag.group_id,
 			a.id AS account_id,
 			a.concurrency,
-			COALESCE(a.extra, '{}'::jsonb)::text AS extra,
+			`+extraExpr+` AS extra,
 			a.session_window_start,
 			a.session_window_end,
 			COALESCE(a.session_window_status, '') AS session_window_status
 		FROM account_groups ag
 		JOIN accounts a ON a.id = ag.account_id
-		WHERE ag.group_id = ANY($1)
+		WHERE `+groupCondition+`
 			AND a.deleted_at IS NULL
 			AND a.status = $2
 			AND a.schedulable = TRUE
@@ -2090,7 +2781,7 @@ func (r *accountRepository) ListSchedulableCapacityByGroupIDs(ctx context.Contex
 			AND (a.overload_until IS NULL OR a.overload_until <= $3)
 			AND (a.rate_limit_reset_at IS NULL OR a.rate_limit_reset_at <= $3)
 		ORDER BY ag.group_id ASC, ag.priority ASC, a.priority ASC, a.id ASC
-	`, pq.Array(groupIDs), service.StatusActive, time.Now())
+	`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2430,21 +3121,40 @@ func (r *accountRepository) SetModelRateLimit(ctx context.Context, id int64, sco
 	}
 
 	client := clientFromContext(ctx, r.client)
-	result, err := client.ExecContext(
-		ctx,
-		`UPDATE accounts SET 
-			extra = jsonb_set(
-				jsonb_set(COALESCE(extra, '{}'::jsonb), '{model_rate_limits}'::text[], COALESCE(extra->'model_rate_limits', '{}'::jsonb), true),
-				ARRAY['model_rate_limits', $1]::text[],
-				$2::jsonb,
-				true
-			),
-			updated_at = NOW()
-		WHERE id = $3 AND deleted_at IS NULL`,
-		scope,
-		raw,
-		id,
-	)
+	var result sql.Result
+	if r.sqlite {
+		mergePayload, marshalErr := json.Marshal(map[string]any{
+			"model_rate_limits": map[string]any{scope: payload},
+		})
+		if marshalErr != nil {
+			return marshalErr
+		}
+		result, err = client.ExecContext(
+			ctx,
+			`UPDATE accounts SET
+				extra = json_patch(COALESCE(extra, '{}'), json(?)),
+				updated_at = NOW()
+			WHERE id = ? AND deleted_at IS NULL`,
+			string(mergePayload),
+			id,
+		)
+	} else {
+		result, err = client.ExecContext(
+			ctx,
+			`UPDATE accounts SET
+				extra = jsonb_set(
+					jsonb_set(COALESCE(extra, '{}'::jsonb), '{model_rate_limits}'::text[], COALESCE(extra->'model_rate_limits', '{}'::jsonb), true),
+					ARRAY['model_rate_limits', $1]::text[],
+					$2::jsonb,
+					true
+				),
+				updated_at = NOW()
+			WHERE id = $3 AND deleted_at IS NULL`,
+			scope,
+			raw,
+			id,
+		)
+	}
 	if err != nil {
 		return err
 	}
@@ -2512,6 +3222,9 @@ func (r *accountRepository) SetGrokCredentialTempUnschedulableIfMatch(
 	until time.Time,
 	reason string,
 ) (bool, error) {
+	if r.sqlite {
+		return r.setGrokCredentialTempUnschedulableIfMatchSQLite(ctx, id, snapshot, until, reason)
+	}
 	result, err := r.sql.ExecContext(ctx, `
 		WITH updated AS (
 		UPDATE accounts AS a
@@ -2544,6 +3257,64 @@ func (r *accountRepository) SetGrokCredentialTempUnschedulableIfMatch(
 	}
 	affected, err := result.RowsAffected()
 	if err != nil || affected == 0 {
+		return false, err
+	}
+	r.syncSchedulerAccountSnapshotDetached(ctx, id)
+	return true, nil
+}
+
+func (r *accountRepository) setGrokCredentialTempUnschedulableIfMatchSQLite(
+	ctx context.Context,
+	id int64,
+	snapshot service.GrokCredentialMutationSnapshot,
+	until time.Time,
+	reason string,
+) (bool, error) {
+	if r.db == nil {
+		return false, errors.New("account repository database not configured")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE accounts
+		SET temp_unschedulable_until = CASE
+				WHEN temp_unschedulable_until IS NULL OR temp_unschedulable_until < ? THEN ?
+				ELSE temp_unschedulable_until
+			END,
+			temp_unschedulable_reason = ?,
+			updated_at = NOW()
+		WHERE id = ?
+			AND deleted_at IS NULL
+			AND status = ?
+			AND platform = ?
+			AND type = ?
+			AND schedulable IS TRUE
+			AND (temp_unschedulable_until IS NULL OR temp_unschedulable_until <= NOW())
+			AND (rate_limit_reset_at IS NULL OR rate_limit_reset_at <= NOW())
+			AND (overload_until IS NULL OR overload_until <= NOW())
+			AND (auto_pause_on_expired IS NOT TRUE OR expires_at IS NULL OR expires_at > NOW())
+			AND credentials = ?
+			AND proxy_id IS ?
+	`, until, until, reason, id, service.StatusActive, service.PlatformGrok, service.AccountTypeOAuth,
+		snapshot.CredentialsJSON, snapshot.ProxyID)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if affected == 0 {
+		return false, nil
+	}
+	if err := enqueueSchedulerOutbox(ctx, tx, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
 		return false, err
 	}
 	r.syncSchedulerAccountSnapshotDetached(ctx, id)
@@ -2690,6 +3461,9 @@ func (r *accountRepository) SetSchedulable(ctx context.Context, id int64, schedu
 }
 
 func (r *accountRepository) AutoPauseExpiredAccounts(ctx context.Context, now time.Time) (int64, error) {
+	if r.sqlite {
+		return r.autoPauseExpiredAccountsSQLite(ctx, now)
+	}
 	rows, err := r.sql.QueryContext(ctx, `
 		UPDATE accounts
 		SET schedulable = FALSE,
@@ -2730,6 +3504,85 @@ func (r *accountRepository) AutoPauseExpiredAccounts(ctx context.Context, now ti
 	return int64(len(accountIDs)), nil
 }
 
+func (r *accountRepository) autoPauseExpiredAccountsSQLite(ctx context.Context, now time.Time) (int64, error) {
+	if r.db == nil {
+		return 0, errors.New("account repository database not configured")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id
+		FROM accounts
+		WHERE deleted_at IS NULL
+			AND schedulable = TRUE
+			AND auto_pause_on_expired = TRUE
+			AND expires_at IS NOT NULL
+			AND expires_at <= ?
+		ORDER BY id
+	`, now)
+	if err != nil {
+		return 0, err
+	}
+	accountIDs := make([]int64, 0)
+	for rows.Next() {
+		var accountID int64
+		if err := rows.Scan(&accountID); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		accountIDs = append(accountIDs, accountID)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	if len(accountIDs) == 0 {
+		return 0, tx.Commit()
+	}
+
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(accountIDs)), ",")
+	args := make([]any, 0, len(accountIDs)+1)
+	args = append(args, now)
+	for _, id := range accountIDs {
+		args = append(args, id)
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE accounts
+		SET schedulable = FALSE,
+			updated_at = NOW()
+		WHERE deleted_at IS NULL
+			AND schedulable = TRUE
+			AND auto_pause_on_expired = TRUE
+			AND expires_at IS NOT NULL
+			AND expires_at <= ?
+			AND id IN (`+placeholders+`)
+	`, args...)
+	if err != nil {
+		return 0, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if affected > 0 {
+		payload := map[string]any{"account_ids": accountIDs}
+		if err := enqueueSchedulerOutbox(ctx, tx, service.SchedulerOutboxEventAccountBulkChanged, nil, nil, payload); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return affected, nil
+}
+
 func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates map[string]any) error {
 	updates = stripCodexFingerprintSeedFromExtraUpdate(updates)
 	if len(updates) == 0 {
@@ -2767,9 +3620,18 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 	if service.ShouldEnsureCodexFingerprintSeedForExtraUpdates(updates) {
 		extraExpression = ensureCodexFingerprintSeedSQL(extraExpression)
 	}
+	if r.sqlite {
+		extraExpression = "json_patch(COALESCE(extra, '{}'), json(?))"
+		if clearProbeSnapshot {
+			extraExpression = "json_remove(" + extraExpression + ", '$.upstream_billing_probe')"
+		}
+		if service.ShouldEnsureCodexFingerprintSeedForExtraUpdates(updates) {
+			extraExpression = ensureCodexFingerprintSeedSQLSQLite(extraExpression)
+		}
+	}
 	result, err := client.ExecContext(
 		ctx,
-		"UPDATE accounts SET extra = "+extraExpression+", updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL",
+		"UPDATE accounts SET extra = "+extraExpression+", updated_at = NOW() WHERE id = "+sqlitePlaceholderOrDollar(r.sqlite, 2)+" AND deleted_at IS NULL",
 		string(payload), id,
 	)
 
@@ -2821,28 +3683,16 @@ func (r *accountRepository) UpdateUpstreamBillingProbeSnapshot(
 	if snapshot.Status != service.UpstreamBillingProbeStatusOK {
 		rateMultiplier = nil
 	}
-	if dbent.TxFromContext(ctx) == nil {
-		tx, err := r.client.Tx(ctx)
-		if errors.Is(err, dbent.ErrTxStarted) {
-			return r.updateUpstreamBillingProbeSnapshotInTx(ctx, account, snapshot, rateMultiplier)
-		}
-		if err != nil {
-			return err
-		}
-		defer func() { _ = tx.Rollback() }()
-
-		if err := r.updateUpstreamBillingProbeSnapshotInTx(dbent.NewTxContext(ctx, tx), account, snapshot, rateMultiplier); err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-		// The durable outbox event is committed with the snapshot. This direct
-		// cache write only reduces visibility latency on the current instance.
+	owned := false
+	err := NewTransactionRunner(r.client).WithinTransaction(ctx, func(txctx context.Context) error {
+		owned = transactionClientFromContext(ctx) == nil && dbent.TxFromContext(txctx) != nil
+		return r.updateUpstreamBillingProbeSnapshotInTx(txctx, account, snapshot, rateMultiplier)
+	})
+	if err == nil && owned {
+		// Borrowed transactions publish via their committed outbox, never early.
 		r.syncSchedulerAccountSnapshot(ctx, account.ID)
-		return nil
 	}
-	return r.updateUpstreamBillingProbeSnapshotInTx(ctx, account, snapshot, rateMultiplier)
+	return err
 }
 
 func (r *accountRepository) updateUpstreamBillingProbeSnapshotInTx(
@@ -2895,6 +3745,10 @@ func (r *accountRepository) updateUpstreamBillingProbeSnapshotInTx(
 	if account.ProxyID != nil {
 		proxyID = *account.ProxyID
 	}
+	if r.sqlite {
+		return r.updateUpstreamBillingProbeSnapshotSQLite(ctx, client, account, string(payload), string(credentials), proxyID,
+			string(expectedSnapshotJSON), string(expectedEnabledJSON), string(expectedRateSyncEnabledJSON), rateMultiplier)
+	}
 	result, err := client.ExecContext(ctx, `
 		UPDATE accounts
 		SET
@@ -2930,16 +3784,109 @@ func (r *accountRepository) updateUpstreamBillingProbeSnapshotInTx(
 	return enqueueSchedulerOutbox(ctx, client, service.SchedulerOutboxEventAccountChanged, &account.ID, nil, nil)
 }
 
+func (r *accountRepository) updateUpstreamBillingProbeSnapshotSQLite(
+	ctx context.Context,
+	client *dbent.Client,
+	account *service.Account,
+	payload string,
+	credentials string,
+	proxyID any,
+	expectedSnapshotJSON string,
+	expectedEnabledJSON string,
+	expectedRateSyncEnabledJSON string,
+	rateMultiplier *float64,
+) error {
+	// Read raw JSON on the already-owned connection. Comparing decoded numbers
+	// via float64 would lose identity information and rewriting extra would
+	// round unrelated business values.
+	rows, err := client.QueryContext(ctx, `SELECT credentials,
+		COALESCE(extra -> 'upstream_billing_probe', 'null'),
+		COALESCE(extra -> 'upstream_billing_probe_enabled', 'null'),
+		COALESCE(extra -> 'upstream_billing_rate_sync_enabled', 'null')
+		FROM accounts WHERE id=? AND platform=? AND type=? AND proxy_id IS ? AND deleted_at IS NULL`,
+		account.ID, account.Platform, account.Type, proxyID)
+	if err != nil {
+		return err
+	}
+	current := make([]string, 4)
+	if !rows.Next() {
+		err := rows.Err()
+		_ = rows.Close()
+		if err != nil {
+			return err
+		}
+		return service.ErrUpstreamBillingProbeIdentityChanged
+	}
+	err = rows.Scan(&current[0], &current[1], &current[2], &current[3])
+	closeErr := rows.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	for i, expected := range []string{credentials, expectedSnapshotJSON, expectedEnabledJSON, expectedRateSyncEnabledJSON} {
+		equal, err := probeJSONEqual(current[i], expected)
+		if err != nil {
+			return err
+		}
+		if !equal {
+			return service.ErrUpstreamBillingProbeIdentityChanged
+		}
+	}
+	rateMultiplierArg := any(nil)
+	if rateMultiplier != nil {
+		rateMultiplierArg = *rateMultiplier
+	}
+	result, err := client.ExecContext(ctx, `
+		UPDATE accounts
+		SET
+			extra = json_set(COALESCE(extra, '{}'), '$.upstream_billing_probe', json_extract(?, '$.upstream_billing_probe')),
+			rate_multiplier = CASE
+				WHEN ? IS NOT NULL
+					AND json_type(extra, '$.upstream_billing_probe_enabled') = 'true'
+					AND json_type(extra, '$.upstream_billing_rate_sync_enabled') = 'true'
+				THEN ?
+				ELSE rate_multiplier
+			END,
+			updated_at = NOW()
+		WHERE id = ?
+			AND platform = ?
+			AND type = ?
+			AND CAST(credentials AS TEXT) = ?
+			AND proxy_id IS ?
+			AND COALESCE(extra -> 'upstream_billing_probe', 'null') = ?
+			AND COALESCE(extra -> 'upstream_billing_probe_enabled', 'null') = ?
+			AND COALESCE(extra -> 'upstream_billing_rate_sync_enabled', 'null') = ?
+			AND deleted_at IS NULL
+	`, payload, rateMultiplierArg, rateMultiplierArg, account.ID, account.Platform, account.Type, current[0], proxyID,
+		current[1], current[2], current[3])
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return service.ErrUpstreamBillingProbeIdentityChanged
+	}
+	return enqueueSchedulerOutbox(ctx, client, service.SchedulerOutboxEventAccountChanged, &account.ID, nil, nil)
+}
+
 func lockAndMatchProbeProxyIdentity(ctx context.Context, client *dbent.Client, account *service.Account) (bool, error) {
 	if account.ProxyID == nil {
 		return true, nil
 	}
-	rows, err := client.QueryContext(ctx, `
+	query := `
 		SELECT protocol, host, port, COALESCE(username, ''), COALESCE(password, ''), status
 		FROM proxies
 		WHERE id = $1 AND deleted_at IS NULL
-		FOR SHARE
-	`, *account.ProxyID)
+	`
+	if client.Driver().Dialect() == dialect.Postgres {
+		query += " FOR SHARE"
+	}
+	rows, err := client.QueryContext(ctx, query, *account.ProxyID)
 	if err != nil {
 		return false, err
 	}
@@ -3757,6 +4704,9 @@ func (r *accountRepository) ListDueUpstreamBillingProbeAccounts(ctx context.Cont
 	if r.sql == nil {
 		return nil, errors.New("account repository SQL executor not configured")
 	}
+	if r.sqlite {
+		return r.listDueSQLiteUpstreamBillingProbeAccounts(ctx, now, limit)
+	}
 
 	rows, err := r.sql.QueryContext(ctx, `
 		WITH candidates AS (
@@ -3838,6 +4788,72 @@ func (r *accountRepository) ListDueUpstreamBillingProbeAccounts(ctx context.Cont
 		return []service.Account{}, nil
 	}
 
+	accounts, err := r.GetByIDs(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]service.Account, 0, len(accounts))
+	for _, account := range accounts {
+		if account != nil {
+			out = append(out, *account)
+		}
+	}
+	return out, nil
+}
+
+func (r *accountRepository) listDueSQLiteUpstreamBillingProbeAccounts(ctx context.Context, now time.Time, limit int) ([]service.Account, error) {
+	rows, err := r.sql.QueryContext(ctx, `
+		WITH candidates AS (
+			SELECT
+				id,
+				json_extract(extra, '$.upstream_billing_probe.status') AS probe_status,
+				json_extract(extra, '$.upstream_billing_probe.next_probe_at') AS next_probe_at,
+				pg_rfc3339_micros(json_extract(extra, '$.upstream_billing_probe.next_probe_at')) AS parsed_next_probe_at
+			FROM accounts
+			WHERE deleted_at IS NULL
+				AND status = 'active'
+				AND type = 'apikey'
+				AND json_type(extra, '$.upstream_billing_probe_enabled') = 'true'
+		)
+		SELECT id
+		FROM candidates
+		WHERE probe_status NOT IN ('ok', 'unsupported', 'failed')
+			OR probe_status IS NULL
+			OR next_probe_at IS NULL
+			OR parsed_next_probe_at IS NULL
+			OR parsed_next_probe_at <= ?
+		ORDER BY
+			CASE
+				WHEN probe_status NOT IN ('ok', 'unsupported', 'failed')
+					OR probe_status IS NULL
+					OR next_probe_at IS NULL
+					OR parsed_next_probe_at IS NULL
+				THEN 0
+				ELSE 1
+			END ASC,
+			parsed_next_probe_at ASC NULLS FIRST,
+			id ASC
+		LIMIT ?
+	`, now.UTC().UnixMicro(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	ids := make([]int64, 0, limit)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return []service.Account{}, nil
+	}
 	accounts, err := r.GetByIDs(ctx, ids)
 	if err != nil {
 		return nil, err
@@ -3945,6 +4961,9 @@ const nextWeeklyResetAtExpr = `(
 // 日/周额度在周期过期时自动重置为 0 再递增。
 // 支持滚动窗口（rolling）和固定时间（fixed）两种重置模式。
 func (r *accountRepository) IncrementQuotaUsed(ctx context.Context, id int64, amount float64) error {
+	if r.sqlite {
+		return r.incrementQuotaUsedSQLite(ctx, id, amount)
+	}
 	rows, err := r.sql.QueryContext(ctx,
 		`UPDATE accounts SET extra = (
 			COALESCE(extra, '{}'::jsonb)
@@ -4014,9 +5033,133 @@ func (r *accountRepository) IncrementQuotaUsed(ctx context.Context, id int64, am
 	return nil
 }
 
+func (r *accountRepository) incrementQuotaUsedSQLite(ctx context.Context, id int64, amount float64) error {
+	if r.db == nil {
+		return errors.New("account repository database not configured")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var extraRaw []byte
+	if err := tx.QueryRowContext(ctx, `
+		SELECT extra FROM accounts WHERE id = ? AND deleted_at IS NULL
+	`, id).Scan(&extraRaw); err != nil {
+		if err == sql.ErrNoRows {
+			return service.ErrAccountNotFound
+		}
+		return err
+	}
+	extra := map[string]any{}
+	if len(extraRaw) > 0 {
+		if err := json.Unmarshal(extraRaw, &extra); err != nil {
+			return err
+		}
+	}
+	nowText := nowSQLiteUTC()
+	nowParsed, _ := parseSQLiteTime(nowText)
+
+	used := quotaExtraFloat(extra, "quota_used")
+	extra["quota_used"] = used + amount
+	limit := quotaExtraFloat(extra, "quota_limit")
+
+	dailyLimit := quotaExtraFloat(extra, "quota_daily_limit")
+	dailyUsed := quotaExtraFloat(extra, "quota_daily_used")
+	if dailyLimit > 0 {
+		if quotaWindowExpired(extra, "quota_daily_reset_mode", "quota_daily_reset_at", "quota_daily_start", 24*time.Hour, nowParsed) {
+			dailyUsed = amount
+			extra["quota_daily_start"] = nowText
+			if quotaMode(extra, "quota_daily_reset_mode") == "fixed" {
+				extra["quota_daily_reset_at"] = nextQuotaResetAt(extra, "quota_daily", nowParsed).Format(time.RFC3339)
+			}
+		} else {
+			dailyUsed += amount
+			if _, ok := extra["quota_daily_start"]; !ok {
+				extra["quota_daily_start"] = nowText
+			}
+		}
+		extra["quota_daily_used"] = dailyUsed
+	}
+	weeklyLimit := quotaExtraFloat(extra, "quota_weekly_limit")
+	weeklyUsed := quotaExtraFloat(extra, "quota_weekly_used")
+	if weeklyLimit > 0 {
+		if quotaWindowExpired(extra, "quota_weekly_reset_mode", "quota_weekly_reset_at", "quota_weekly_start", 7*24*time.Hour, nowParsed) {
+			weeklyUsed = amount
+			extra["quota_weekly_start"] = nowText
+			if quotaMode(extra, "quota_weekly_reset_mode") == "fixed" {
+				extra["quota_weekly_reset_at"] = nextQuotaResetAt(extra, "quota_weekly", nowParsed).Format(time.RFC3339)
+			}
+		} else {
+			weeklyUsed += amount
+			if _, ok := extra["quota_weekly_start"]; !ok {
+				extra["quota_weekly_start"] = nowText
+			}
+		}
+		extra["quota_weekly_used"] = weeklyUsed
+	}
+	encoded, err := json.Marshal(extra)
+	if err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE accounts SET extra = ?, updated_at = NOW() WHERE id = ? AND deleted_at IS NULL
+	`, string(encoded), id)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return service.ErrAccountNotFound
+	}
+	newUsed := quotaExtraFloat(extra, "quota_used")
+	if limit > 0 && newUsed >= limit && (newUsed-amount) < limit {
+		if err := enqueueSchedulerOutbox(ctx, tx, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // ResetQuotaUsedAndClearRateLimitCooldown resets all quota dimensions and the
 // account-level cooldown in one statement. Other scheduler blocking state is preserved.
 func (r *accountRepository) ResetQuotaUsedAndClearRateLimitCooldown(ctx context.Context, id int64) error {
+	if r.sqlite {
+		result, err := r.sql.ExecContext(ctx, `
+			UPDATE accounts
+			SET extra = json_remove(
+					json_patch(
+						COALESCE(extra, '{}'),
+						'{"quota_used":0,"quota_daily_used":0,"quota_weekly_used":0}'
+					),
+					'$.quota_daily_start', '$.quota_weekly_start',
+					'$.quota_daily_reset_at', '$.quota_weekly_reset_at'
+				),
+				rate_limited_at = NULL,
+				rate_limit_reset_at = NULL,
+				updated_at = NOW()
+			WHERE id = ? AND deleted_at IS NULL`,
+			id)
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			return service.ErrAccountNotFound
+		}
+		if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
+			logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue quota reset failed: account=%d err=%v", id, err)
+		}
+		r.syncSchedulerAccountSnapshot(ctx, id)
+		return nil
+	}
 	result, err := r.sql.ExecContext(ctx,
 		`UPDATE accounts SET extra = (
 			COALESCE(extra, '{}'::jsonb)
@@ -4048,12 +5191,21 @@ func (r *accountRepository) ResetQuotaUsedAndClearRateLimitCooldown(ctx context.
 // 若影响行数为 0，则返回 ErrAccountNotInFallback（账号存在但不在 fallback 状态）。
 func (r *accountRepository) RevertProxyFallback(ctx context.Context, accountID int64) error {
 	// Probe snapshots belong to the network identity; invalidate only on a real proxy change.
-	res, err := r.sql.ExecContext(ctx, `
+	query := `
 		UPDATE accounts SET
 			extra=CASE WHEN type='apikey' AND proxy_id IS DISTINCT FROM proxy_fallback_origin_id
 				THEN extra - 'upstream_billing_probe' ELSE extra END,
 			proxy_id=proxy_fallback_origin_id, proxy_fallback_origin_id=NULL, updated_at=NOW()
-		WHERE id=$1 AND proxy_fallback_origin_id IS NOT NULL AND deleted_at IS NULL`, accountID)
+		WHERE id=$1 AND proxy_fallback_origin_id IS NOT NULL AND deleted_at IS NULL`
+	if r.sqlite {
+		query = `
+		UPDATE accounts SET
+			extra=CASE WHEN type='apikey' AND proxy_id IS NOT proxy_fallback_origin_id
+				THEN json_remove(COALESCE(extra, '{}'), '$.upstream_billing_probe') ELSE extra END,
+			proxy_id=proxy_fallback_origin_id, proxy_fallback_origin_id=NULL, updated_at=NOW()
+		WHERE id=? AND proxy_fallback_origin_id IS NOT NULL AND deleted_at IS NULL`
+	}
+	res, err := r.sql.ExecContext(ctx, query, accountID)
 	if err != nil {
 		return err
 	}

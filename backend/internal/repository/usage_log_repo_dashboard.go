@@ -243,11 +243,17 @@ func (r *usageLogRepository) fillDashboardUsageStatsAggregated(ctx context.Conte
 		FROM usage_dashboard_daily
 		WHERE bucket_date = $1::date
 	`
+	var todayArg any = todayUTC
+	if isSQLiteDB(r.db) {
+		todayStatsQuery = `SELECT total_requests,input_tokens,output_tokens,cache_creation_tokens,cache_read_tokens,
+			total_cost,actual_cost,account_cost,active_users FROM usage_dashboard_daily WHERE bucket_date=$1`
+		todayArg = todayUTC.In(timezone.Location()).Format("2006-01-02")
+	}
 	if err := scanSingleRow(
 		ctx,
 		r.sql,
 		todayStatsQuery,
-		[]any{todayUTC},
+		[]any{todayArg},
 		&stats.TodayRequests,
 		&stats.TodayInputTokens,
 		&stats.TodayOutputTokens,
@@ -270,6 +276,9 @@ func (r *usageLogRepository) fillDashboardUsageStatsAggregated(ctx context.Conte
 		WHERE bucket_start = $1
 	`
 	hourStart := now.In(timezone.Location()).Truncate(time.Hour)
+	if isSQLiteDB(r.db) {
+		hourlyActiveQuery = `SELECT active_users FROM usage_dashboard_hourly WHERE pg_rfc3339_micros(bucket_start)=pg_rfc3339_micros($1)`
+	}
 	if err := scanSingleRow(ctx, r.sql, hourlyActiveQuery, []any{hourStart}, &stats.HourlyActiveUsers); err != nil {
 		if err != sql.ErrNoRows {
 			return err
@@ -280,6 +289,9 @@ func (r *usageLogRepository) fillDashboardUsageStatsAggregated(ctx context.Conte
 }
 
 func (r *usageLogRepository) fillDashboardUsageStatsFromUsageLogs(ctx context.Context, stats *DashboardStats, startUTC, endUTC, todayUTC, now time.Time) error {
+	if isSQLiteDB(r.db) {
+		return r.fillDashboardUsageStatsSQLite(ctx, stats, startUTC, endUTC, todayUTC, now)
+	}
 	todayEnd := todayUTC.Add(24 * time.Hour)
 	combinedStatsQuery := `
 		WITH scoped AS (

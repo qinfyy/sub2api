@@ -9,6 +9,7 @@ import (
 	dbent "github.com/Wei-Shaw/sub2api/ent"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
 	"github.com/lib/pq"
+	sqlite "modernc.org/sqlite"
 )
 
 // clientFromContext 从 context 中获取事务 client，如果不存在则返回默认 client。
@@ -24,8 +25,8 @@ import (
 //	    return client.SomeEntity.Create().Save(ctx)
 //	}
 func clientFromContext(ctx context.Context, defaultClient *dbent.Client) *dbent.Client {
-	if tx := dbent.TxFromContext(ctx); tx != nil {
-		return tx.Client()
+	if client := transactionClientFromContext(ctx); client != nil {
+		return client
 	}
 	return defaultClient
 }
@@ -86,6 +87,10 @@ func isUniqueConstraintViolation(err error) bool {
 	var pgErr *pq.Error
 	if errors.As(err, &pgErr) {
 		return pgErr.Code == "23505"
+	}
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		return classifyPersistenceError(err) == persistenceUnique
 	}
 
 	// 回退到错误消息检测（兼容其他场景）。

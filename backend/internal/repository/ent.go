@@ -53,6 +53,13 @@ func openSQLiteDriver(cfg *config.Config) (*entsql.Driver, error) {
 	if err := cfg.Database.ResolveSQLitePath("."); err != nil {
 		return nil, err
 	}
+	if err := validateExistingSQLiteFile(cfg.Database.Path); err != nil {
+		return nil, err
+	}
+	registerSQLiteCompatFunctions()
+	if err := registerSQLiteDomainFunctions(); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(filepath.Dir(cfg.Database.Path), 0o750); err != nil {
 		return nil, fmt.Errorf("create sqlite database directory: %w", err)
 	}
@@ -64,19 +71,18 @@ func openSQLiteDriver(cfg *config.Config) (*entsql.Driver, error) {
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
 	db.SetConnMaxIdleTime(0)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := checkSQLiteDomainFunctions(ctx, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return entsql.OpenDB(dialect.SQLite, db), nil
 }
 
-// initSQLiteSchema creates the Ent-managed schema plus the table that has no
-// Ent entity (durable key/value state used by the memory cache backend).
-func initSQLiteSchema(ctx context.Context, client *ent.Client, db *sql.DB) error {
-	if err := client.Schema.Create(ctx); err != nil {
-		return fmt.Errorf("create sqlite schema: %w", err)
-	}
-	if err := initSQLiteKVSchema(ctx, db); err != nil {
-		return err
-	}
-	return applySQLiteMigrationsFS(ctx, db)
+// Ent describes the models; reviewed SQL, not runtime schema inference, owns DDL.
+func initSQLiteSchema(ctx context.Context, _ *ent.Client, db *sql.DB) error {
+	return applySQLiteV1Schema(ctx, db)
 }
 
 func initSQLiteKVSchema(ctx context.Context, db *sql.DB) error {
@@ -221,8 +227,7 @@ func InitEnt(cfg *config.Config) (*ent.Client, *sql.DB, error) {
 		return applyMigrationsFS(ctx, drv.DB(), migrations.FS)
 	}
 	if cfg.Database.IsSQLite() {
-		// SQLite schema is owned by Ent; the PostgreSQL SQL migrations are not
-		// replayed because they contain dialect-specific DDL.
+		// SQLite has its own reviewed migration history; PG SQL is never translated.
 		migrate = func(ctx context.Context) error {
 			client := ent.NewClient(ent.Driver(drv))
 			// The client shares the driver opened above, so it must not be

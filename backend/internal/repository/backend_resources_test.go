@@ -35,7 +35,6 @@ func TestBackendResourcesSQLiteMemoryLifecycle(t *testing.T) {
 	t.Cleanup(closeResources)
 	require.Nil(t, r.Redis)
 	require.Same(t, r.SQL, r.State.DB)
-	require.False(t, r.State.owned)
 	require.NotNil(t, r.memory)
 	require.EqualValues(t, 512*1024*1024, r.memory.maxBytes)
 	require.NoError(t, r.SQL.Ping())
@@ -62,19 +61,18 @@ func TestBackendResourcesFailureReleasesSQLiteGuard(t *testing.T) {
 	require.NoError(t, ReleaseSingleInstanceGuard(guard))
 }
 
-func TestDurableStateUsesSeparateSQLiteForPostgres(t *testing.T) {
-	cfg := config.NewDefaultConfig()
-	cfg.Redis.Type = config.CacheTypeMemory
-	cfg.Redis.Memory.PersistencePath = filepath.Join(t.TempDir(), "cache.db")
-	state, guard, err := openDurableStateDB(cfg, nil)
+func TestDurableStateRequiresAndBorrowsPrimaryDatabase(t *testing.T) {
+	state, err := openDurableStateDB(nil)
+	require.Error(t, err)
+	require.Nil(t, state)
+	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
-	defer func() { _ = state.DB.Close(); _ = ReleaseSingleInstanceGuard(guard) }()
-	require.True(t, state.owned)
-	require.True(t, isSQLiteDB(state.DB))
-	_, err = state.DB.Exec(`INSERT INTO kv_store(key,value) VALUES('test',X'00')`)
+	state, err = openDurableStateDB(db)
 	require.NoError(t, err)
-	_, _, err = openDurableStateDB(cfg, nil)
-	require.ErrorIs(t, err, ErrSingleInstanceViolation)
+	require.Same(t, db, state.DB)
+	mock.ExpectClose()
+	require.NoError(t, db.Close())
+	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestSQLiteRedisAlsoRequiresFileGuard(t *testing.T) {

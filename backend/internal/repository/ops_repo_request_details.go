@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/dbtime"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 )
 
@@ -87,18 +88,18 @@ func (r *opsRepository) ListRequestDetails(ctx context.Context, filter *service.
 	cte := `
 WITH combined AS (
   SELECT
-    'success'::TEXT AS kind,
+    CAST('success' AS TEXT) AS kind,
     ul.created_at AS created_at,
     ul.request_id AS request_id,
     COALESCE(NULLIF(g.platform, ''), NULLIF(a.platform, ''), '') AS platform,
     ul.model AS model,
     ul.duration_ms AS duration_ms,
     ul.first_token_ms AS first_token_ms,
-    NULL::INT AS status_code,
-    NULL::BIGINT AS error_id,
-    NULL::TEXT AS phase,
-    NULL::TEXT AS severity,
-    NULL::TEXT AS message,
+    CAST(NULL AS INT) AS status_code,
+    CAST(NULL AS BIGINT) AS error_id,
+    CAST(NULL AS TEXT) AS phase,
+    CAST(NULL AS TEXT) AS severity,
+    CAST(NULL AS TEXT) AS message,
     ul.user_id AS user_id,
     ul.api_key_id AS api_key_id,
     ul.account_id AS account_id,
@@ -107,12 +108,12 @@ WITH combined AS (
   FROM usage_logs ul
   LEFT JOIN groups g ON g.id = ul.group_id
   LEFT JOIN accounts a ON a.id = ul.account_id
-  WHERE ul.created_at >= $1 AND ul.created_at < $2
+  WHERE ` + opsTimePredicate("ul.created_at", ">=", 1, isSQLiteDB(r.db)) + ` AND ` + opsTimePredicate("ul.created_at", "<", 2, isSQLiteDB(r.db)) + `
 
   UNION ALL
 
   SELECT
-    'error'::TEXT AS kind,
+    CAST('error' AS TEXT) AS kind,
     o.created_at AS created_at,
     COALESCE(NULLIF(o.request_id,''), NULLIF(o.client_request_id,''), '') AS request_id,
     COALESCE(NULLIF(o.platform, ''), NULLIF(g.platform, ''), NULLIF(a.platform, ''), '') AS platform,
@@ -132,7 +133,7 @@ WITH combined AS (
   FROM ops_error_logs o
   LEFT JOIN groups g ON g.id = o.group_id
   LEFT JOIN accounts a ON a.id = o.account_id
-  WHERE o.created_at >= $1 AND o.created_at < $2
+  WHERE ` + opsTimePredicate("o.created_at", ">=", 1, isSQLiteDB(r.db)) + ` AND ` + opsTimePredicate("o.created_at", "<", 2, isSQLiteDB(r.db)) + `
     AND COALESCE(o.status_code, 0) >= 400
 )
 `
@@ -237,7 +238,7 @@ LIMIT $%d OFFSET $%d
 
 		if err := rows.Scan(
 			&kind,
-			&createdAt,
+			dbtime.Dest(&createdAt),
 			&requestID,
 			&platform,
 			&model,

@@ -27,12 +27,14 @@ type sqlExecutor interface {
 type groupRepository struct {
 	client *dbent.Client
 	sql    sqlExecutor
+	db     *sql.DB
+	sqlite bool
 }
 
 // lockLiveGroups makes account-group inserts participate in the same row-lock
 // protocol as guarded group deletion. FOR SHARE conflicts with the deleter's
 // FOR UPDATE lock, and READ COMMITTED rechecks deleted_at after any wait.
-func lockLiveGroups(ctx context.Context, exec sqlExecutor, groupIDs []int64) error {
+func lockLiveGroups(ctx context.Context, exec sqlExecutor, sqlite bool, groupIDs []int64) error {
 	if len(groupIDs) == 0 {
 		return nil
 	}
@@ -40,14 +42,36 @@ func lockLiveGroups(ctx context.Context, exec sqlExecutor, groupIDs []int64) err
 	for _, id := range groupIDs {
 		unique[id] = struct{}{}
 	}
-	rows, err := exec.QueryContext(ctx, `/* account_group_live_group_lock */
+	query := `/* account_group_live_group_lock */
 		SELECT id FROM groups
 		WHERE id = ANY($1) AND deleted_at IS NULL
 		ORDER BY id
-		FOR SHARE`, pq.Array(groupIDs))
+		FOR SHARE`
+	args := []any{pq.Array(groupIDs)}
+	if sqlite {
+		// SQLite 没有行级共享锁；单写进程模型下条件读即可满足原子性要求。
+		query = `/* account_group_live_group_lock */
+			SELECT id FROM groups
+			WHERE id = ANY($1) AND deleted_at IS NULL
+			ORDER BY id`
+		boundQuery, boundArgs, err := bindArrayArgsForSQLite(query, []any{groupIDs})
+		if err != nil {
+			return err
+		}
+		rows, err := exec.QueryContext(ctx, boundQuery, boundArgs...)
+		if err != nil {
+			return err
+		}
+		return countLockedGroups(rows, len(unique))
+	}
+	rows, err := exec.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
+	return countLockedGroups(rows, len(unique))
+}
+
+func countLockedGroups(rows *sql.Rows, expected int) error {
 	defer func() { _ = rows.Close() }()
 	locked := 0
 	for rows.Next() {
@@ -56,7 +80,7 @@ func lockLiveGroups(ctx context.Context, exec sqlExecutor, groupIDs []int64) err
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	if locked != len(unique) {
+	if locked != expected {
 		return service.ErrGroupNotFound
 	}
 	return nil
@@ -73,7 +97,8 @@ func NewAdminGroupRepository(client *dbent.Client, sqlDB *sql.DB) service.AdminG
 }
 
 func newGroupRepositoryWithSQL(client *dbent.Client, sqlq sqlExecutor) *groupRepository {
-	return &groupRepository{client: client, sql: sqlq}
+	db, _ := sqlq.(*sql.DB)
+	return &groupRepository{client: client, sql: sqlq, db: db, sqlite: isSQLiteDB(db)}
 }
 
 func (r *groupRepository) Create(ctx context.Context, groupIn *service.Group) error {
@@ -800,11 +825,20 @@ func (r *groupRepository) ExistsByIDs(ctx context.Context, ids []int64) (map[int
 		return result, nil
 	}
 
-	rows, err := r.sql.QueryContext(ctx, `
+	query := `
 		SELECT id
 		FROM groups
 		WHERE id = ANY($1) AND deleted_at IS NULL
-	`, pq.Array(uniqueIDs))
+	`
+	args := []any{arrayArg(r.sqlite, uniqueIDs)}
+	if r.sqlite {
+		boundQuery, boundArgs, err := bindArrayArgsForSQLite(query, args)
+		if err != nil {
+			return nil, err
+		}
+		query, args = boundQuery, boundArgs
+	}
+	rows, err := r.sql.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -825,6 +859,16 @@ func (r *groupRepository) ExistsByIDs(ctx context.Context, ids []int64) (map[int
 
 func (r *groupRepository) GetAccountCount(ctx context.Context, groupID int64) (total int64, active int64, err error) {
 	var rateLimited int64
+	if r.sqlite {
+		query := fmt.Sprintf(`SELECT
+			SUM(CASE WHEN a.deleted_at IS NULL THEN 1 ELSE 0 END),
+			SUM(CASE WHEN %s THEN 1 ELSE 0 END),
+			SUM(CASE WHEN %s THEN 1 ELSE 0 END)
+		FROM account_groups ag JOIN accounts a ON a.id = ag.account_id
+		WHERE ag.group_id = ?`, sqliteGroupAccountAvailableSQL, sqliteGroupAccountTemporarilyLimitedSQL)
+		err = scanSingleRow(ctx, r.sql, query, []any{groupID}, &total, &active, &rateLimited)
+		return
+	}
 	err = scanSingleRow(ctx, r.sql,
 		fmt.Sprintf(`SELECT
 			COUNT(*) FILTER (WHERE a.deleted_at IS NULL),
@@ -852,6 +896,21 @@ func (r *groupRepository) DeleteCascade(ctx context.Context, id int64) ([]int64,
 	return r.deleteCascade(ctx, id, false)
 }
 
+// softDeleteGroupChild 对分组关联表做软删除。表名由调用方以字面量传入，
+// 不来自外部输入，因此拼接是安全的；SQLite 下用参数绑定当前时间。
+func softDeleteGroupChild(ctx context.Context, exec sqlExecutor, sqlite bool, table string, groupID int64) error {
+	if sqlite {
+		_, err := exec.ExecContext(ctx,
+			"UPDATE "+table+" SET deleted_at = $1 WHERE group_id = $2 AND deleted_at IS NULL",
+			nowSQLiteUTC(), groupID)
+		return err
+	}
+	_, err := exec.ExecContext(ctx,
+		"UPDATE "+table+" SET deleted_at = NOW() WHERE group_id = $1 AND deleted_at IS NULL",
+		groupID)
+	return err
+}
+
 func (r *groupRepository) DeleteCascadeIfEmpty(ctx context.Context, id int64) ([]int64, error) {
 	return r.deleteCascade(ctx, id, true)
 }
@@ -874,7 +933,11 @@ func (r *groupRepository) deleteCascade(ctx context.Context, id int64, requireEm
 
 	// Lock the group row to avoid concurrent writes while we cascade.
 	// 这里使用 exec.QueryContext 手动扫描，确保同一事务内加锁并能区分"未找到"与其他错误。
-	rows, err := exec.QueryContext(ctx, "SELECT id, subscription_type FROM groups WHERE id = $1 AND deleted_at IS NULL FOR UPDATE", id)
+	lockQuery := "SELECT id, subscription_type FROM groups WHERE id = $1 AND deleted_at IS NULL FOR UPDATE"
+	if r.sqlite {
+		lockQuery = "SELECT id, subscription_type FROM groups WHERE id = $1 AND deleted_at IS NULL"
+	}
+	rows, err := exec.QueryContext(ctx, lockQuery, id)
 	if err != nil {
 		return nil, err
 	}
@@ -932,7 +995,7 @@ func (r *groupRepository) deleteCascade(ctx context.Context, id int64, requireEm
 		}
 
 		// 软删除订阅：设置 deleted_at 而非硬删除
-		if _, err := exec.ExecContext(ctx, "UPDATE user_subscriptions SET deleted_at = NOW() WHERE group_id = $1 AND deleted_at IS NULL", id); err != nil {
+		if err := softDeleteGroupChild(ctx, exec, r.sqlite, "user_subscriptions", id); err != nil {
 			return nil, err
 		}
 	}
@@ -949,7 +1012,7 @@ func (r *groupRepository) deleteCascade(ctx context.Context, id int64, requireEm
 	}
 
 	// 4. Soft-delete composite model routes owned by this group.
-	if _, err := exec.ExecContext(ctx, "UPDATE composite_model_routes SET deleted_at = NOW() WHERE group_id = $1 AND deleted_at IS NULL", id); err != nil {
+	if err := softDeleteGroupChild(ctx, exec, r.sqlite, "composite_model_routes", id); err != nil {
 		return nil, err
 	}
 
@@ -998,23 +1061,58 @@ const (
 				)`
 )
 
+// SQLite 没有 NOW()，用当前 UTC 时间比较；时间列由应用统一写成 RFC3339
+// 文本，字符串比较与时间比较同序。
+var (
+	sqliteNowExpr = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+
+	sqliteGroupAccountAvailableSQL = strings.ReplaceAll(
+		groupAccountAvailableSQL,
+		"NOW()",
+		sqliteNowExpr,
+	)
+	sqliteGroupAccountTemporarilyLimitedSQL = strings.ReplaceAll(
+		groupAccountTemporarilyLimitedSQL,
+		"NOW()",
+		sqliteNowExpr,
+	)
+)
+
 func (r *groupRepository) loadAccountCounts(ctx context.Context, groupIDs []int64) (counts map[int64]groupAccountCounts, err error) {
 	counts = make(map[int64]groupAccountCounts, len(groupIDs))
 	if len(groupIDs) == 0 {
 		return counts, nil
 	}
 
-	rows, err := r.sql.QueryContext(
-		ctx,
-		fmt.Sprintf(`SELECT ag.group_id,
+	queryTemplate := `SELECT ag.group_id,
 			COUNT(*) FILTER (WHERE a.deleted_at IS NULL) AS total,
 			COUNT(*) FILTER (WHERE %s) AS active,
 			COUNT(*) FILTER (WHERE %s) AS rate_limited
 		FROM account_groups ag
 		JOIN accounts a ON a.id = ag.account_id
 		WHERE ag.group_id = ANY($1)
-		GROUP BY ag.group_id`, groupAccountAvailableSQL, groupAccountTemporarilyLimitedSQL),
-		pq.Array(groupIDs),
+		GROUP BY ag.group_id`
+	args := []any{pq.Array(groupIDs)}
+	query := fmt.Sprintf(queryTemplate, groupAccountAvailableSQL, groupAccountTemporarilyLimitedSQL)
+	if r.sqlite {
+		queryTemplate = `SELECT ag.group_id,
+			SUM(CASE WHEN a.deleted_at IS NULL THEN 1 ELSE 0 END) AS total,
+			SUM(CASE WHEN %s THEN 1 ELSE 0 END) AS active,
+			SUM(CASE WHEN %s THEN 1 ELSE 0 END) AS rate_limited
+		FROM account_groups ag
+		JOIN accounts a ON a.id = ag.account_id
+		WHERE ag.group_id = ANY($1)
+		GROUP BY ag.group_id`
+		query = fmt.Sprintf(queryTemplate, sqliteGroupAccountAvailableSQL, sqliteGroupAccountTemporarilyLimitedSQL)
+		query, args, err = bindArrayArgsForSQLite(query, []any{groupIDs})
+		if err != nil {
+			return nil, err
+		}
+	}
+	rows, err := r.sql.QueryContext(
+		ctx,
+		query,
+		args...,
 	)
 	if err != nil {
 		return nil, err
@@ -1047,11 +1145,16 @@ func (r *groupRepository) GetAccountIDsByGroupIDs(ctx context.Context, groupIDs 
 		return nil, nil
 	}
 
-	rows, err := r.sql.QueryContext(
-		ctx,
-		"SELECT DISTINCT account_id FROM account_groups WHERE group_id = ANY($1) ORDER BY account_id",
-		pq.Array(groupIDs),
-	)
+	query := "SELECT DISTINCT account_id FROM account_groups WHERE group_id = ANY($1) ORDER BY account_id"
+	args := []any{arrayArg(r.sqlite, groupIDs)}
+	if r.sqlite {
+		boundQuery, boundArgs, err := bindArrayArgsForSQLite(query, args)
+		if err != nil {
+			return nil, err
+		}
+		query, args = boundQuery, boundArgs
+	}
+	rows, err := r.sql.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1087,8 +1190,35 @@ func (r *groupRepository) BindAccountsToGroup(ctx context.Context, groupID int64
 		defer func() { _ = tx.Rollback() }()
 		exec = tx.Client()
 	}
-	if err := lockLiveGroups(ctx, exec, []int64{groupID}); err != nil {
+	if err := lockLiveGroups(ctx, exec, r.sqlite, []int64{groupID}); err != nil {
 		return err
+	}
+
+	if r.sqlite {
+		args := make([]any, 0, len(accountIDs)*3)
+		now := nowSQLiteUTC()
+		placeholders := make([]string, 0, len(accountIDs))
+		for _, accountID := range accountIDs {
+			placeholders = append(placeholders, "(?, ?, 50, ?)")
+			args = append(args, accountID, groupID, now)
+		}
+		if _, err := exec.ExecContext(ctx,
+			`INSERT INTO account_groups (account_id, group_id, priority, created_at) VALUES `+
+				strings.Join(placeholders, ", ")+
+				` ON CONFLICT (account_id, group_id) DO NOTHING`,
+			args...,
+		); err != nil {
+			return err
+		}
+		if tx != nil {
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+		}
+		if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventGroupChanged, nil, &groupID, nil); err != nil {
+			logger.LegacyPrintf("repository.group", "[SchedulerOutbox] enqueue bind accounts to group failed: group=%d err=%v", groupID, err)
+		}
+		return nil
 	}
 
 	// 使用 INSERT ... ON CONFLICT DO NOTHING 忽略已存在的绑定
@@ -1141,13 +1271,16 @@ func (r *groupRepository) UpdateSortOrders(ctx context.Context, updates []servic
 
 	// 与旧实现保持一致：任何不存在/已删除的分组都返回 not found，且不执行更新。
 	var existingCount int
-	if err := scanSingleRow(
-		ctx,
-		r.sql,
-		`SELECT COUNT(*) FROM groups WHERE deleted_at IS NULL AND id = ANY($1)`,
-		[]any{pq.Array(groupIDs)},
-		&existingCount,
-	); err != nil {
+	countQuery := `SELECT COUNT(*) FROM groups WHERE deleted_at IS NULL AND id = ANY($1)`
+	countArgs := []any{arrayArg(r.sqlite, groupIDs)}
+	if r.sqlite {
+		boundQuery, boundArgs, err := bindArrayArgsForSQLite(countQuery, countArgs)
+		if err != nil {
+			return err
+		}
+		countQuery, countArgs = boundQuery, boundArgs
+	}
+	if err := scanSingleRow(ctx, r.sql, countQuery, countArgs, &existingCount); err != nil {
 		return err
 	}
 	if existingCount != len(groupIDs) {
@@ -1158,9 +1291,45 @@ func (r *groupRepository) UpdateSortOrders(ctx context.Context, updates []servic
 	caseClauses := make([]string, 0, len(groupIDs))
 	placeholder := 1
 	for _, id := range groupIDs {
-		caseClauses = append(caseClauses, fmt.Sprintf("WHEN $%d THEN $%d", placeholder, placeholder+1))
+		if r.sqlite {
+			caseClauses = append(caseClauses, "WHEN ? THEN ?")
+		} else {
+			caseClauses = append(caseClauses, fmt.Sprintf("WHEN $%d THEN $%d", placeholder, placeholder+1))
+		}
 		args = append(args, id, sortOrderByID[id])
 		placeholder += 2
+	}
+	if r.sqlite {
+		groupIDsJSON, err := json.Marshal(groupIDs)
+		if err != nil {
+			return fmt.Errorf("marshal group ids: %w", err)
+		}
+		args = append(args, string(groupIDsJSON))
+		query := fmt.Sprintf(`
+			UPDATE groups
+			SET sort_order = CASE id
+				%s
+				ELSE sort_order
+			END
+			WHERE deleted_at IS NULL AND id IN (SELECT value FROM json_each(?))
+		`, strings.Join(caseClauses, "\n\t\t\t"))
+		result, err := r.sql.ExecContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected != int64(len(groupIDs)) {
+			return service.ErrGroupNotFound
+		}
+		for _, id := range groupIDs {
+			if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventGroupChanged, nil, &id, nil); err != nil {
+				logger.LegacyPrintf("repository.group", "[SchedulerOutbox] enqueue group sort update failed: group=%d err=%v", id, err)
+			}
+		}
+		return nil
 	}
 	args = append(args, pq.Array(groupIDs))
 

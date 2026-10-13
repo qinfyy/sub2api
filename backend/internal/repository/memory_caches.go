@@ -148,7 +148,7 @@ func NewMemoryGatewayCache(core *memoryCacheCore, dbs ...*sql.DB) service.Gatewa
 	core = memoryAssertCore(core)
 	c := &memoryGatewayCache{core: core}
 	if len(dbs) > 0 && dbs[0] != nil {
-		c.state = &memoryKVBackend{core: core, db: dbs[0]}
+		c.state = newMemoryKVBackend(core, dbs[0])
 	}
 	return c
 }
@@ -1351,12 +1351,16 @@ func (c *memoryDashboardStatsCache) DeleteDashboardStats(ctx context.Context) er
 // memoryKVBackend 是持久状态的 SQLite 写穿后端。
 // 键空间与 Redis 版保持一致（因此进程内互相兼容），值统一以 JSON BLOB 落库。
 type memoryKVBackend struct {
-	core *memoryCacheCore
-	db   memoryKVStore
+	core  *memoryCacheCore
+	db    memoryKVStore
+	state *entDurableState
 }
 
 // 保留给 kv_store 的写穿接口，便于与其他持久化缓存共享实现细节。
 func (b *memoryKVBackend) put(ctx context.Context, key string, value []byte, ttl time.Duration) error {
+	if b.state != nil {
+		return b.state.put(ctx, key, value, ttl)
+	}
 	if b.db == nil {
 		return nil
 	}
@@ -1377,6 +1381,9 @@ func (b *memoryKVBackend) put(ctx context.Context, key string, value []byte, ttl
 }
 
 func (b *memoryKVBackend) delete(ctx context.Context, keys ...string) error {
+	if b.state != nil {
+		return b.state.delete(ctx, keys...)
+	}
 	if b.db == nil || len(keys) == 0 {
 		return nil
 	}
@@ -1392,6 +1399,9 @@ func (b *memoryKVBackend) delete(ctx context.Context, keys ...string) error {
 
 // Durable state is authoritative in SQL: a cached token must never survive revocation.
 func (b *memoryKVBackend) get(ctx context.Context, key string) ([]byte, error) {
+	if b.state != nil {
+		return b.state.get(ctx, key)
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1459,6 +1469,9 @@ func (b *memoryKVBackend) remove(ctx context.Context, key string) error {
 }
 
 func (b *memoryKVBackend) consume(ctx context.Context, key string) ([]byte, error) {
+	if b.state != nil {
+		return b.state.consume(ctx, key)
+	}
 	if b.db == nil {
 		mutex := memoryLockKey("consume:" + key)
 		defer memoryUnlock(mutex)
@@ -1489,6 +1502,9 @@ func (b *memoryKVBackend) consume(ctx context.Context, key string) ([]byte, erro
 
 // addMember 往持久集合里追加一个成员（刷新令牌的 token 集合用）。
 func (b *memoryKVBackend) addMember(ctx context.Context, key string, member string, ttl time.Duration) error {
+	if b.state != nil {
+		return b.state.addMember(ctx, key, member, ttl)
+	}
 	mutex := memoryLockKey("set:" + key)
 	defer memoryUnlock(mutex)
 	values, err := b.members(ctx, key)
@@ -1597,7 +1613,7 @@ type memoryRefreshTokenCache struct {
 // db 非 nil 时刷新令牌、用户令牌集合、家族令牌集合都会写穿 kv_store。
 func NewMemoryRefreshTokenCache(core *memoryCacheCore, db *sql.DB) service.RefreshTokenCache {
 	return &memoryRefreshTokenCache{
-		backend: &memoryKVBackend{core: memoryAssertCore(core), db: memoryKVStoreFromDB(db)},
+		backend: newMemoryKVBackend(core, db),
 	}
 }
 
@@ -1634,6 +1650,9 @@ func (c *memoryRefreshTokenCache) DeleteRefreshToken(ctx context.Context, tokenH
 }
 
 func (c *memoryRefreshTokenCache) DeleteUserRefreshTokens(ctx context.Context, userID int64) error {
+	if c.backend.state != nil {
+		return c.backend.state.deleteSetMembers(ctx, userRefreshTokensKey(userID), refreshTokenKey(""))
+	}
 	mutex := memoryLockKey("set:" + userRefreshTokensKey(userID))
 	defer memoryUnlock(mutex)
 	tokenHashes, err := c.GetUserTokenHashes(ctx, userID)
@@ -1658,6 +1677,9 @@ func (c *memoryRefreshTokenCache) DeleteUserRefreshTokens(ctx context.Context, u
 }
 
 func (c *memoryRefreshTokenCache) DeleteTokenFamily(ctx context.Context, familyID string) error {
+	if c.backend.state != nil {
+		return c.backend.state.deleteSetMembers(ctx, tokenFamilyKey(familyID), refreshTokenKey(""))
+	}
 	mutex := memoryLockKey("set:" + tokenFamilyKey(familyID))
 	defer memoryUnlock(mutex)
 	tokenHashes, err := c.GetFamilyTokenHashes(ctx, familyID)
@@ -1735,7 +1757,7 @@ type memoryPluginKVStore struct {
 // NewMemoryPluginKVStore 返回单实例语义的 PluginKVStore。
 func NewMemoryPluginKVStore(core *memoryCacheCore, db *sql.DB) service.PluginKVStore {
 	return &memoryPluginKVStore{
-		backend: &memoryKVBackend{core: memoryAssertCore(core), db: memoryKVStoreFromDB(db)},
+		backend: newMemoryKVBackend(core, db),
 	}
 }
 
@@ -1779,6 +1801,16 @@ func (s *memoryPluginKVStore) List(ctx context.Context, pluginKey, namespace, ke
 		return nil, nil
 	}
 	internalPrefix := s.namespacePrefix(pluginKey, namespace)
+	if s.backend.state != nil {
+		keys, err := s.backend.state.list(ctx, internalPrefix+keyPrefix, limit)
+		if err != nil {
+			return nil, fmt.Errorf("list plugin kv: %w", err)
+		}
+		for i := range keys {
+			keys[i] = strings.TrimPrefix(keys[i], internalPrefix)
+		}
+		return keys, nil
+	}
 	if s.backend.db != nil {
 		prefix := internalPrefix + keyPrefix
 		// Range bounds avoid LIKE wildcards and allow the primary-key index to be used.
@@ -1840,7 +1872,7 @@ type memoryPasskeySessionStore struct {
 // db 非 nil 时会话也写入 kv_store：认证跨实例升级窗口内仍可用。
 func NewMemoryPasskeySessionStore(core *memoryCacheCore, db *sql.DB) service.PasskeySessionStore {
 	return &memoryPasskeySessionStore{
-		backend: &memoryKVBackend{core: memoryAssertCore(core), db: memoryKVStoreFromDB(db)},
+		backend: newMemoryKVBackend(core, db),
 	}
 }
 
@@ -1902,7 +1934,7 @@ type memoryImageTaskStore struct {
 // NewMemoryImageTaskStore 返回单实例语义的 ImageTaskStore。
 func NewMemoryImageTaskStore(core *memoryCacheCore, db *sql.DB) service.ImageTaskStore {
 	return &memoryImageTaskStore{
-		backend: &memoryKVBackend{core: memoryAssertCore(core), db: memoryKVStoreFromDB(db)},
+		backend: newMemoryKVBackend(core, db),
 	}
 }
 

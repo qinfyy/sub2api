@@ -117,11 +117,11 @@ func validateSSLMode(mode string) bool {
 // TestDatabaseRequest represents database test request
 type TestDatabaseRequest struct {
 	Type     string `json:"type"`
-	Host     string `json:"host" binding:"required"`
-	Port     int    `json:"port" binding:"required"`
-	User     string `json:"user" binding:"required"`
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	User     string `json:"user"`
 	Password string `json:"password"`
-	DBName   string `json:"dbname" binding:"required"`
+	DBName   string `json:"dbname"`
 	SSLMode  string `json:"sslmode"`
 	Path     string `json:"path"`
 }
@@ -133,7 +133,16 @@ func testDatabase(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "Invalid request: "+err.Error())
 		return
 	}
-	if strings.EqualFold(strings.TrimSpace(req.Type), "sqlite") {
+	req.Type = strings.ToLower(strings.TrimSpace(req.Type))
+	if req.Type != "" && req.Type != config.DatabaseTypePostgres && req.Type != config.DatabaseTypeSQLite {
+		response.Error(c, http.StatusBadRequest, "Invalid database type (must be 'postgres' or 'sqlite')")
+		return
+	}
+	if req.Type == config.DatabaseTypeSQLite {
+		if strings.TrimSpace(req.Path) == "" {
+			response.Error(c, http.StatusBadRequest, "SQLite database path is required")
+			return
+		}
 		cfg := &DatabaseConfig{Type: req.Type, Path: strings.TrimSpace(req.Path)}
 		if err := TestDatabaseConnection(cfg); err != nil {
 			response.Error(c, http.StatusBadRequest, "Connection failed: "+err.Error())
@@ -188,13 +197,14 @@ func testDatabase(c *gin.Context) {
 
 // TestRedisRequest represents Redis test request
 type TestRedisRequest struct {
-	Type      string `json:"type"`
-	Host      string `json:"host" binding:"required"`
-	Port      int    `json:"port" binding:"required"`
-	Username  string `json:"username"`
-	Password  string `json:"password"`
-	DB        int    `json:"db"`
-	EnableTLS bool   `json:"enable_tls"`
+	Type      string                   `json:"type"`
+	Host      string                   `json:"host"`
+	Port      int                      `json:"port"`
+	Username  string                   `json:"username"`
+	Password  string                   `json:"password"`
+	DB        int                      `json:"db"`
+	EnableTLS bool                     `json:"enable_tls"`
+	Memory    config.MemoryCacheConfig `json:"memory"`
 }
 
 // testRedis tests Redis connection
@@ -204,7 +214,16 @@ func testRedis(c *gin.Context) {
 		response.Error(c, http.StatusBadRequest, "Invalid request: "+err.Error())
 		return
 	}
-	if strings.EqualFold(strings.TrimSpace(req.Type), "memory") {
+	req.Type = strings.ToLower(strings.TrimSpace(req.Type))
+	if req.Type != "" && req.Type != config.CacheTypeRedis && req.Type != config.CacheTypeMemory {
+		response.Error(c, http.StatusBadRequest, "Invalid cache type (must be 'redis' or 'memory')")
+		return
+	}
+	if req.Type == config.CacheTypeMemory {
+		if req.Memory.MaxCapacityMB < 0 || req.Memory.GCIntervalSeconds < 0 {
+			response.Error(c, http.StatusBadRequest, "Memory capacity and GC interval must not be negative")
+			return
+		}
 		response.Success(c, gin.H{"message": "In-memory cache requires no external service"})
 		return
 	}
@@ -318,6 +337,10 @@ func install(c *gin.Context) {
 
 	// Redis validation
 	if req.Redis.Type == config.CacheTypeMemory {
+		if req.Redis.Memory.MaxCapacityMB < 0 || req.Redis.Memory.GCIntervalSeconds < 0 {
+			response.Error(c, http.StatusBadRequest, "Memory capacity and GC interval must not be negative")
+			return
+		}
 		if req.Redis.Memory.MaxCapacityMB <= 0 {
 			req.Redis.Memory.MaxCapacityMB = 512
 		}

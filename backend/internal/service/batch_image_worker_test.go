@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,6 +72,22 @@ func TestBatchImageWorker_RequeuesWhenJobLockNotAcquired(t *testing.T) {
 	require.Empty(t, queue.acked)
 }
 
+func TestBatchImageWorker_CancelsProcessingWhenHeartbeatFails(t *testing.T) {
+	queue := newFakeBatchImageQueue("imgbatch_worker_heartbeat")
+	queue.heartbeatErr = errors.New("lease lost")
+	processor := &blockingHeartbeatBatchImageProcessor{}
+	worker := NewBatchImageWorker(queue, processor, BatchImageWorkerOptions{
+		JobLockTTL:          3 * time.Second,
+		StaleActiveAfter:    3 * time.Second,
+		ReserveBlockTimeout: time.Second,
+	})
+
+	err := worker.RunOnce(context.Background())
+	require.NoError(t, err)
+	require.True(t, processor.cancelled.Load(), "heartbeat failure must cancel processing")
+	require.Len(t, queue.requeued, 1)
+}
+
 func TestNewBatchImageWorkerOptionsFromConfig_UsesFiniteReserveTimeout(t *testing.T) {
 	opts := NewBatchImageWorkerOptionsFromConfig(nil)
 	require.Equal(t, defaultBatchImageWorkerReserveBlockTimeout, opts.ReserveBlockTimeout)
@@ -83,6 +100,7 @@ type fakeBatchImageQueue struct {
 	acked        []string
 	requeued     []fakeBatchImageRequeue
 	releaseCount int
+	heartbeatErr error
 }
 
 type fakeBatchImageRequeue struct {
@@ -116,7 +134,7 @@ func (q *fakeBatchImageQueue) Ack(_ context.Context, batchID string) error {
 }
 
 func (q *fakeBatchImageQueue) Heartbeat(context.Context, string) error {
-	return nil
+	return q.heartbeatErr
 }
 
 func (q *fakeBatchImageQueue) MoveDueDelayedToReady(context.Context, int) (int, error) {
@@ -154,4 +172,14 @@ type fakeBatchImageProcessor struct {
 func (p *fakeBatchImageProcessor) Process(_ context.Context, batchID string) (BatchImageProcessResult, error) {
 	p.processed = append(p.processed, batchID)
 	return p.result, p.err
+}
+
+type blockingHeartbeatBatchImageProcessor struct {
+	cancelled atomic.Bool
+}
+
+func (p *blockingHeartbeatBatchImageProcessor) Process(ctx context.Context, _ string) (BatchImageProcessResult, error) {
+	<-ctx.Done()
+	p.cancelled.Store(true)
+	return BatchImageProcessResult{}, ctx.Err()
 }

@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/dbtime"
 )
 
 const (
@@ -78,17 +80,21 @@ type JobRepository interface {
 }
 
 type PostgreSQLRepository struct {
-	db    *sql.DB
-	clock Clock
+	db     *sql.DB
+	clock  Clock
+	sqlite bool
 }
 
 func NewPostgreSQLRepository(db *sql.DB) *PostgreSQLRepository {
-	return &PostgreSQLRepository{db: db, clock: realClock{}}
+	return &PostgreSQLRepository{db: db, clock: realClock{}, sqlite: isSQLiteAuditDB(db)}
 }
 
 func (r *PostgreSQLRepository) CreateStagingWithCapacity(ctx context.Context, snapshot PromptSnapshot, configVersion int64, maxAttempts, capacity int) (*Job, error) {
 	if r == nil || r.db == nil {
 		return nil, errors.New("prompt audit database unavailable")
+	}
+	if r.sqlite {
+		return r.createStagingSQLite(ctx, snapshot, configVersion, maxAttempts, capacity)
 	}
 	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -141,6 +147,9 @@ func (r *PostgreSQLRepository) MarkStagingFailed(ctx context.Context, jobID int6
 }
 
 func (r *PostgreSQLRepository) ClaimNextJob(ctx context.Context, now time.Time) (*Job, bool, error) {
+	if r.sqlite {
+		return r.claimNextSQLite(ctx, now)
+	}
 	row := r.db.QueryRowContext(ctx, `
 		WITH candidate AS (
 			SELECT id FROM prompt_audit_jobs
@@ -187,7 +196,7 @@ func (r *PostgreSQLRepository) Complete(ctx context.Context, job *Job, result *N
 	}
 	var event *Event
 	if shouldStorePromptAuditEvent(result.Decision, storePassEvents) {
-		event, err = insertEvent(ctx, tx, job.ID, job.Snapshot.Redacted(), job.ConfigVersion, result)
+		event, err = insertEvent(ctx, tx, job.ID, job.Snapshot.Redacted(), job.ConfigVersion, result, r.sqlite)
 		if err != nil {
 			return nil, err
 		}
@@ -221,6 +230,9 @@ func (r *PostgreSQLRepository) Fail(ctx context.Context, jobID, claimVersion int
 func (r *PostgreSQLRepository) ReclaimStale(ctx context.Context, stagingBefore, processingBefore time.Time, limit int) (int64, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
+	}
+	if r.sqlite {
+		return r.reclaimStaleSQLite(ctx, stagingBefore, processingBefore, limit)
 	}
 	result, err := r.db.ExecContext(ctx, `
 		WITH stale AS (
@@ -293,7 +305,7 @@ func (r *PostgreSQLRepository) RecordBlocking(ctx context.Context, snapshot Prom
 	}
 	var event *Event
 	if shouldStorePromptAuditEvent(result.Decision, storePassEvents) {
-		event, err = insertEvent(ctx, tx, job.ID, snapshot.Redacted(), configVersion, result)
+		event, err = insertEvent(ctx, tx, job.ID, snapshot.Redacted(), configVersion, result, r.sqlite)
 		if err != nil {
 			return nil, err
 		}
@@ -334,7 +346,7 @@ func insertJob(ctx context.Context, queryer sqlQueryer, snapshot PromptSnapshot,
 	return scanJob(row)
 }
 
-func insertEvent(ctx context.Context, queryer sqlQueryer, jobID int64, snapshot PromptSnapshot, configVersion int64, result *NormalizedResult) (*Event, error) {
+func insertEvent(ctx context.Context, queryer sqlQueryer, jobID int64, snapshot PromptSnapshot, configVersion int64, result *NormalizedResult, sqlite ...bool) (*Event, error) {
 	categories, _ := json.Marshal(result.Categories)
 	matched, _ := json.Marshal(result.MatchedScanners)
 	scores, _ := json.Marshal(result.ScannerScores)
@@ -343,6 +355,12 @@ func insertEvent(ctx context.Context, queryer sqlQueryer, jobID int64, snapshot 
 		evidence[key] = RedactPreview(value, 160)
 	}
 	evidenceJSON, _ := json.Marshal(evidence)
+	jsonParams := "$20::jsonb,$21::jsonb,$22::jsonb,$23::jsonb"
+	var categoriesArg, matchedArg, scoresArg, evidenceArg any = categories, matched, scores, evidenceJSON
+	if len(sqlite) > 0 && sqlite[0] {
+		jsonParams = "$20,$21,$22,$23"
+		categoriesArg, matchedArg, scoresArg, evidenceArg = string(categories), string(matched), string(scores), string(evidenceJSON)
+	}
 	row := queryer.QueryRowContext(ctx, `
 		INSERT INTO prompt_audit_events (
 			job_id,request_id,user_id,username_snapshot,user_email_snapshot,api_key_id,api_key_name_snapshot,
@@ -351,13 +369,13 @@ func insertEvent(ctx context.Context, queryer sqlQueryer, jobID int64, snapshot 
 			scanner_backend,scanner_version,guard_endpoint_id,policy_id,policy_version,config_version,chunk_total,latency_ms,
 			full_prompt
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-			$20::jsonb,$21::jsonb,$22::jsonb,$23::jsonb,$24,$25,$26,$27,$28,$29,$30,$31,$32)
+			`+jsonParams+`,$24,$25,$26,$27,$28,$29,$30,$31,$32)
 		RETURNING `+eventDetailColumns("prompt_audit_events"),
 		jobID, snapshot.RequestID, nullableID(snapshot.UserID), snapshot.UsernameSnapshot, snapshot.UserEmailSnapshot,
 		nullableID(snapshot.APIKeyID), snapshot.APIKeyNameSnapshot, snapshot.GroupID, snapshot.GroupName,
 		snapshot.Provider, snapshot.Endpoint, snapshot.Protocol, snapshot.Model, snapshot.PromptHash,
 		snapshot.RedactedPreview, normalizeStage(snapshot.Stage), string(result.Decision), string(result.RiskLevel),
-		string(result.Action), categories, matched, scores, evidenceJSON, result.ScannerBackend, result.ScannerVersion,
+		string(result.Action), categoriesArg, matchedArg, scoresArg, evidenceArg, result.ScannerBackend, result.ScannerVersion,
 		result.GuardEndpointID, result.PolicyID, result.PolicyVersion, configVersion, result.ChunkTotal, result.LatencyMS,
 		snapshot.FullPrompt)
 	return scanEvent(row, true)
@@ -368,15 +386,15 @@ type rowScanner interface{ Scan(...any) error }
 func scanJob(row rowScanner) (*Job, error) {
 	job := &Job{}
 	var userID, apiKeyID, groupID sql.NullInt64
-	var processingStarted, processed sql.NullTime
+	var processingStarted, processed dbtime.NullTime
 	err := row.Scan(
 		&job.ID, &job.Snapshot.RequestID, &userID, &job.Snapshot.UsernameSnapshot, &job.Snapshot.UserEmailSnapshot,
 		&apiKeyID, &job.Snapshot.APIKeyNameSnapshot, &groupID, &job.Snapshot.GroupName, &job.Snapshot.Provider,
 		&job.Snapshot.Endpoint, &job.Snapshot.Protocol, &job.Snapshot.Model, &job.Snapshot.PromptHash,
 		&job.Snapshot.RedactedPreview, &job.Snapshot.PromptLength, &job.Snapshot.MessageCount, &job.Snapshot.Stage,
 		&job.ExecutionMode, &job.ConfigVersion, &job.Status, &job.Attempts, &job.MaxAttempts, &job.ClaimVersion,
-		&job.NextAttemptAt, &processingStarted, &processed, &job.LastErrorCode, &job.LastErrorMessage,
-		&job.CreatedAt, &job.UpdatedAt,
+		dbtime.Dest(&job.NextAttemptAt), &processingStarted, &processed, &job.LastErrorCode, &job.LastErrorMessage,
+		dbtime.Dest(&job.CreatedAt), dbtime.Dest(&job.UpdatedAt),
 	)
 	if err != nil {
 		return nil, err

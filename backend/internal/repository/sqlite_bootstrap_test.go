@@ -2,21 +2,19 @@ package repository
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
-	"testing/fstest"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	sqlitev1 "github.com/Wei-Shaw/sub2api/migrations/sqlite_v1"
 	"github.com/stretchr/testify/require"
 )
 
 func TestInitEntSQLiteRunsIncrementalMigrationsAndReopens(t *testing.T) {
-	previous := sqliteIncrementalMigrationsFS
-	sqliteIncrementalMigrationsFS = fstest.MapFS{
-		"001_bootstrap_test.sql": {Data: []byte("CREATE TABLE bootstrap_probe (value TEXT NOT NULL)")},
-	}
-	t.Cleanup(func() { sqliteIncrementalMigrationsFS = previous })
+	files, err := loadSQLiteMigrationFiles(sqlitev1.FS)
+	require.NoError(t, err)
 
 	cfg := config.NewDefaultConfig()
 	cfg.Database.Type = config.DatabaseTypeSQLite
@@ -34,12 +32,15 @@ func TestInitEntSQLiteRunsIncrementalMigrationsAndReopens(t *testing.T) {
 		var foreignKeys int
 		require.NoError(t, db.QueryRow("PRAGMA foreign_keys").Scan(&foreignKeys))
 		require.Equal(t, 1, foreignKeys)
+		var synchronous int
+		require.NoError(t, db.QueryRow("PRAGMA synchronous").Scan(&synchronous))
+		require.Equal(t, 2, synchronous)
 		require.Equal(t, 1, db.Stats().MaxOpenConnections)
-		_, err = db.ExecContext(context.Background(), "INSERT INTO bootstrap_probe VALUES (?)", "ok")
+		_, err = db.ExecContext(context.Background(), "INSERT INTO kv_store(key,value,updated_at) VALUES(?,?,?)", fmt.Sprintf("bootstrap-%d", attempt), []byte("ok"), nowSQLiteUTC())
 		require.NoError(t, err)
 		var count int
 		require.NoError(t, db.QueryRow("SELECT COUNT(*) FROM ent_schema_versions").Scan(&count))
-		require.Equal(t, 1, count)
+		require.Equal(t, len(files), count)
 		require.NoError(t, db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name = 'schema_migrations'").Scan(&count))
 		require.Zero(t, count)
 		require.NoError(t, client.Close())

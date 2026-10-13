@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/dbtime"
 	"github.com/lib/pq"
 )
 
@@ -70,7 +71,7 @@ func (r *PostgreSQLRepository) ListEvents(ctx context.Context, filter EventFilte
 	if pageSize > 100 {
 		pageSize = 100
 	}
-	where, args := buildEventWhere(filter, 1)
+	where, args := buildEventWhere(filter, 1, r.sqlite)
 	var total int64
 	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM prompt_audit_events e`+where, args...).Scan(&total); err != nil {
 		return nil, err
@@ -127,7 +128,13 @@ func (r *PostgreSQLRepository) DeleteEventsByIDs(ctx context.Context, ids []int6
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	rows, err := tx.QueryContext(ctx, `DELETE FROM prompt_audit_events WHERE id=ANY($1) RETURNING job_id`, pq.Array(ids))
+	query := `DELETE FROM prompt_audit_events WHERE id=ANY($1) RETURNING job_id`
+	var idsArg any = pq.Array(ids)
+	if r.sqlite {
+		query = `DELETE FROM prompt_audit_events WHERE id IN (SELECT value FROM json_each($1)) RETURNING job_id`
+		idsArg = auditIDList(ids)
+	}
+	rows, err := tx.QueryContext(ctx, query, idsArg)
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +142,7 @@ func (r *PostgreSQLRepository) DeleteEventsByIDs(ctx context.Context, ids []int6
 	if err != nil {
 		return nil, err
 	}
-	deletedJobs, err := deleteOrphanJobs(ctx, tx, jobIDs)
+	deletedJobs, err := r.deleteOrphanJobs(ctx, tx, jobIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -149,12 +156,16 @@ func (r *PostgreSQLRepository) PreviewDelete(ctx context.Context, filter EventFi
 	if err := validateDeleteFilter(filter); err != nil {
 		return nil, err
 	}
-	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	opts := &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}
+	if r.sqlite {
+		opts = nil
+	}
+	tx, err := r.db.BeginTx(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	where, args := buildEventWhere(filter, 1)
+	where, args := buildEventWhere(filter, 1, r.sqlite)
 	var count, maxID int64
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(e.id),0) FROM prompt_audit_events e`+where, args...).Scan(&count, &maxID); err != nil {
 		return nil, err
@@ -183,17 +194,22 @@ func (r *PostgreSQLRepository) DeleteEventsByFilter(ctx context.Context, filter 
 		if err != nil {
 			return nil, err
 		}
-		where, args := buildEventWhere(filter, 1)
+		where, args := buildEventWhere(filter, 1, r.sqlite)
 		maxIndex := len(args) + 1
 		limitIndex := maxIndex + 1
 		args = append(args, snapshotMaxID, batchSize)
-		rows, err := tx.QueryContext(ctx, `
+		query := `
 			WITH selected AS (
-				SELECT e.id FROM prompt_audit_events e`+where+
-			fmt.Sprintf(` AND e.id <= $%d ORDER BY e.id LIMIT $%d FOR UPDATE SKIP LOCKED`, maxIndex, limitIndex)+`
+				SELECT e.id FROM prompt_audit_events e` + where +
+			fmt.Sprintf(` AND e.id <= $%d ORDER BY e.id LIMIT $%d FOR UPDATE SKIP LOCKED`, maxIndex, limitIndex) + `
 			), deleted AS (
 				DELETE FROM prompt_audit_events e USING selected s WHERE e.id=s.id RETURNING e.job_id
-			) SELECT job_id FROM deleted`, args...)
+			) SELECT job_id FROM deleted`
+		if r.sqlite {
+			query = `DELETE FROM prompt_audit_events WHERE id IN (SELECT e.id FROM prompt_audit_events e` + where +
+				fmt.Sprintf(` AND e.id <= $%d ORDER BY e.id LIMIT $%d) RETURNING job_id`, maxIndex, limitIndex)
+		}
+		rows, err := tx.QueryContext(ctx, query, args...)
 		if err != nil {
 			_ = tx.Rollback()
 			return nil, err
@@ -203,7 +219,7 @@ func (r *PostgreSQLRepository) DeleteEventsByFilter(ctx context.Context, filter 
 			_ = tx.Rollback()
 			return nil, err
 		}
-		deletedJobs, err := deleteOrphanJobs(ctx, tx, jobIDs)
+		deletedJobs, err := r.deleteOrphanJobs(ctx, tx, jobIDs)
 		if err != nil {
 			_ = tx.Rollback()
 			return nil, err
@@ -262,7 +278,8 @@ func canonicalEventFilter(filter EventFilter) EventFilter {
 	return filter
 }
 
-func buildEventWhere(filter EventFilter, firstIndex int) (string, []any) {
+func buildEventWhere(filter EventFilter, firstIndex int, dialect ...bool) (string, []any) {
+	sqlite := len(dialect) > 0 && dialect[0]
 	filter = canonicalEventFilter(filter)
 	clauses := []string{" WHERE TRUE"}
 	args := make([]any, 0, 12)
@@ -300,12 +317,25 @@ func buildEventWhere(filter EventFilter, firstIndex int) (string, []any) {
 		// The clause has six placeholders but add only supplied one. Rebuild it with one shared placeholder.
 		clauses[len(clauses)-1] = fmt.Sprintf(` AND (e.request_id ILIKE $%[1]d OR e.prompt_hash ILIKE $%[1]d OR e.redacted_preview ILIKE $%[1]d
 			OR e.username_snapshot ILIKE $%[1]d OR e.user_email_snapshot ILIKE $%[1]d OR e.api_key_name_snapshot ILIKE $%[1]d)`, firstIndex+len(args)-1)
+		if sqlite {
+			clauses[len(clauses)-1] = fmt.Sprintf(` AND (lower(e.request_id) LIKE lower($%[1]d) OR lower(e.prompt_hash) LIKE lower($%[1]d)
+				OR lower(e.redacted_preview) LIKE lower($%[1]d) OR lower(e.username_snapshot) LIKE lower($%[1]d)
+				OR lower(e.user_email_snapshot) LIKE lower($%[1]d) OR lower(e.api_key_name_snapshot) LIKE lower($%[1]d))`, firstIndex+len(args)-1)
+		}
 	}
 	if filter.StartAt != nil {
-		add(" AND e.created_at >= $%d", filter.StartAt.UTC())
+		if sqlite {
+			add(" AND pg_rfc3339_micros(e.created_at) >= pg_rfc3339_micros($%d)", filter.StartAt.UTC())
+		} else {
+			add(" AND e.created_at >= $%d", filter.StartAt.UTC())
+		}
 	}
 	if filter.EndAt != nil {
-		add(" AND e.created_at <= $%d", filter.EndAt.UTC())
+		if sqlite {
+			add(" AND pg_rfc3339_micros(e.created_at) <= pg_rfc3339_micros($%d)", filter.EndAt.UTC())
+		} else {
+			add(" AND e.created_at <= $%d", filter.EndAt.UTC())
+		}
 	}
 	return strings.Join(clauses, ""), args
 }
@@ -337,7 +367,7 @@ func scanEvent(row rowScanner, withFullPrompt ...bool) (*Event, error) {
 		&event.Snapshot.PromptHash, &event.Snapshot.RedactedPreview, &event.Snapshot.Stage, &event.Decision,
 		&event.RiskLevel, &event.Action, &categories, &matched, &scores, &evidence, &event.ScannerBackend,
 		&event.ScannerVersion, &event.GuardEndpointID, &event.PolicyID, &event.PolicyVersion,
-		&event.ConfigVersion, &event.ChunkTotal, &event.LatencyMS, &event.CreatedAt}
+		&event.ConfigVersion, &event.ChunkTotal, &event.LatencyMS, dbtime.Dest(&event.CreatedAt)}
 	if len(withFullPrompt) > 0 && withFullPrompt[0] {
 		dest = append(dest, &event.Snapshot.FullPrompt)
 	}
@@ -384,4 +414,11 @@ func deleteOrphanJobs(ctx context.Context, tx *sql.Tx, jobIDs []int64) (int64, e
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+func (r *PostgreSQLRepository) deleteOrphanJobs(ctx context.Context, tx *sql.Tx, ids []int64) (int64, error) {
+	if r.sqlite {
+		return deleteOrphanJobsSQLite(ctx, tx, ids)
+	}
+	return deleteOrphanJobs(ctx, tx, ids)
 }
