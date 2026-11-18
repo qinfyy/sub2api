@@ -564,7 +564,7 @@ export default {
     pollEvery: '{n}s 轮询',
     updatedAt: '更新于 {time}',
     relativeSecondsAgo: '{n} 秒前',
-    relativeMinutesAgo: '{n} 分钟前',
+    relativeMinutesAgo: '{n}分钟前',
     relativeHoursAgo: '{n} 小时前',
     relativeDaysAgo: '{n} 天前'
   },

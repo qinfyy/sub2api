@@ -24,7 +24,11 @@ vi.mock('@/composables/useClipboard', () => ({
 vi.mock('vue-i18n', async () => {
   const actual = await vi.importActual<typeof import('vue-i18n')>('vue-i18n')
   const messages: Record<string, string> = {
-    'admin.accounts.imagePromptDefault': 'Generate a cute orange cat astronaut sticker on a clean pastel background.'
+    'admin.accounts.imagePromptDefault': 'Generate a cute orange cat astronaut sticker on a clean pastel background.',
+    'admin.accounts.startingTestForAccount': '开始测试账号：{name}',
+    'admin.accounts.testAccountTypeLabel': '账号类型：{type}',
+    'admin.accounts.connectedToApi': '已连接到 API',
+    'admin.accounts.usingModel': '使用模型：{model}'
   }
   return {
     ...actual,
@@ -36,7 +40,11 @@ vi.mock('vue-i18n', async () => {
         if (key === 'admin.accounts.imagePreviewAlt' && params?.index) {
           return `test-image-${params.index}`
         }
-        return messages[key] || key
+        const message = messages[key] || key
+        return Object.entries(params || {}).reduce(
+          (formatted, [name, value]) => formatted.replace(`{${name}}`, String(value)),
+          message
+        )
       }
     })
   }
@@ -142,6 +150,13 @@ describe('AccountTestModal', () => {
       model_id: 'gemini-3.1-flash-image',
       prompt: 'draw a tiny orange cat astronaut'
     })
+
+    const outputLines = (wrapper.vm as any).outputLines.map((line: { text: string }) => line.text)
+    expect(outputLines).toContain('开始测试账号：Gemini Image Test')
+    expect(outputLines).toContain('账号类型：apikey')
+    expect(outputLines).toContain('已连接到 API')
+    expect(outputLines).toContain('使用模型：gemini-2.5-flash-image')
+    expect(outputLines.every((line: string) => !line.endsWith('\\'))).toBe(true)
 
     const preview = wrapper.find('img[alt="test-image-1"]')
     expect(preview.exists()).toBe(true)
